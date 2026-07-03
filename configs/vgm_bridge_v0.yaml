@@ -1,0 +1,72 @@
+common:
+  # Full video length is 1 + num_video_frames.
+  # For V0, 16 target frames gives 17 total frames, which gives more than
+  # one middle latent slice after WAN VAE temporal compression.
+  num_video_frames: 16
+  video_height: 384
+  video_width: 320
+
+  global_downsample_rate: 3
+
+dataset:
+  # Pure video bridge dataset. Each leaf directory can be either a root itself
+  # or nested under one of these roots, and should look like:
+  #   <leaf>/videos/<episode>.mp4
+  #   <leaf>/umt5_wan/<episode>.pt   # optional if require_language_embedding=false
+  type: "video_bridge"
+  dataset_dir:
+    - "/share/dataset/preprocess/pretrain"
+    - "/share/dataset/preprocess/egodexresized_human_1"
+    - "/share/dataset/preprocess/0710_aloha_3"
+    - "/share/dataset/preprocess/0902_aloha_3"
+    - "/share/dataset/preprocess/0820_aloha_3"
+    - "/share/dataset/preprocess/0910retry_aloha_3"
+    - "/share/dataset/preprocess/robotwin2_copy/clean"
+    - "/share/dataset/preprocess/robotwin2_copy/randomized"
+  max_episodes: null
+  require_language_embedding: true
+  video_extensions: [".mp4"]
+  cache_scan: true
+
+training_mode: "vgm_bridge_v0"
+
+model:
+  wan:
+    config_path: "/share/home/bhz/pretrained_models/Wan2.2-TI2V-5B"
+    checkpoint_path: "/share/home/bhz/pretrained_models/Wan2.2-TI2V-5B"
+    vae_path: "/share/home/bhz/pretrained_models/Wan2.2-TI2V-5B/Wan2.2_VAE.pth"
+    precision: "bfloat16"
+
+training:
+  batch_size: 1
+  max_steps: 500000
+  learning_rate: 1.0e-5
+  weight_decay: 0.01
+
+  scheduler_type: "diffusers_cosine"
+  warmup_steps: 1000
+  lr_schedule_steps: 500000
+  min_lr: 1.0e-6
+
+  grad_clip_norm: 0.5
+  use_amp: true
+  find_unused_parameters: false
+
+system:
+  checkpoint_dir: "./checkpoints"
+  log_level: "INFO"
+  log_interval: 1
+  save_interval: 10000
+  val_interval: 1000000000
+  num_workers: 16
+  pin_memory: true
+
+logging:
+  report_to: "wandb"
+  wandb_project: "motus"
+  tensorboard_log_dir: "tensorboard_logs"
+  run_name: "vgm_bridge_v0"
+
+resume:
+  checkpoint_path: null
+  reset_scheduler: false
