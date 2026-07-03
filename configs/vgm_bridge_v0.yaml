@@ -9,21 +9,20 @@ common:
   global_downsample_rate: 3
 
 dataset:
-  # Pure video bridge dataset. For LIBERO upright, each task directory is
-  # LeRobot parquet format:
-  #   <task>/data/chunk-000/episode_000000.parquet
-  #   <task>/meta/*.jsonl
+  # Pure video bridge dataset. This uses the standard LeRobot v3 LIBERO
+  # layout:
+  #   data/chunk-000/file-000.parquet
+  #   meta/episodes/chunk-000/file-000.parquet
+  #   videos/observation.images.image/chunk-000/file-000.mp4
+  #   videos/observation.images.image2/chunk-000/file-000.mp4
   type: "video_bridge"
   dataset_dir:
-    - "/mnt/workspace1/users/niejunnan/datasets/libero_lerobot_upright/libero_10"
-    - "/mnt/workspace1/users/niejunnan/datasets/libero_lerobot_upright/libero_goal"
-    - "/mnt/workspace1/users/niejunnan/datasets/libero_lerobot_upright/libero_object"
-    - "/mnt/workspace1/users/niejunnan/datasets/libero_lerobot_upright/libero_spatial"
+    - "/mnt/workspace/users/niejunnan/lerobot_datasets/lerobot/libero"
   max_episodes: null
   require_language_embedding: false
-  data_format: "lerobot_parquet"
-  image_column: "image"
-  image_columns: ["image", "wrist_image"]
+  data_format: "lerobot_v3_video"
+  image_column: "observation.images.image"
+  image_columns: ["observation.images.image", "observation.images.image2"]
   view_layout: "vertical"
   video_extensions: [".mp4"]
   cache_scan: false

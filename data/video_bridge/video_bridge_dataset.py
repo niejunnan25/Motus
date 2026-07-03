@@ -43,6 +43,14 @@ def _has_lerobot_parquet_layout(directory: Path) -> bool:
     return (directory / "data").exists() and (directory / "meta").exists()
 
 
+def _has_lerobot_v3_video_layout(directory: Path) -> bool:
+    return (
+        (directory / "data").exists()
+        and (directory / "meta" / "episodes").exists()
+        and (directory / "videos").exists()
+    )
+
+
 def _find_lerobot_parquet_dirs(root: Path) -> List[Path]:
     """Recursively find LeRobot task directories with data/ and meta/ subdirectories."""
     results: List[Path] = []
@@ -54,6 +62,22 @@ def _find_lerobot_parquet_dirs(root: Path) -> List[Path]:
             current = root / file
             if current.is_dir():
                 results += _find_lerobot_parquet_dirs(current)
+    except Exception as exc:
+        logger.warning("Failed scanning %s: %s", root, exc)
+    return results
+
+
+def _find_lerobot_v3_video_dirs(root: Path) -> List[Path]:
+    """Recursively find LeRobot v3 roots with metadata plus external videos."""
+    results: List[Path] = []
+    try:
+        if _has_lerobot_v3_video_layout(root):
+            results.append(root)
+            return results
+        for file in os.listdir(root):
+            current = root / file
+            if current.is_dir():
+                results += _find_lerobot_v3_video_dirs(current)
     except Exception as exc:
         logger.warning("Failed scanning %s: %s", root, exc)
     return results
@@ -110,9 +134,16 @@ class VideoBridgeDataset(data.Dataset):
     """
     Pure video dataset for first/last-frame bridge training.
 
-    Expected leaf layout:
+    Supported layouts:
       <leaf>/videos/<episode>.mp4
       <leaf>/umt5_wan/<episode>.pt   optional unless require_language_embedding=True
+
+    LeRobot parquet layout:
+      <task>/data/chunk-000/episode_000000.parquet with image bytes columns.
+
+    LeRobot v3 video layout:
+      <root>/meta/episodes/chunk-000/file-000.parquet
+      <root>/videos/<video_key>/chunk-000/file-000.mp4
     """
 
     def __init__(
@@ -207,6 +238,9 @@ class VideoBridgeDataset(data.Dataset):
         if self.data_format in ("auto", "lerobot_parquet"):
             cur_episodes.extend(self._scan_lerobot_parquet_root(root))
 
+        if self.data_format in ("auto", "lerobot_v3_video"):
+            cur_episodes.extend(self._scan_lerobot_v3_video_root(root))
+
         if not cur_episodes:
             logger.warning("No valid video bridge episodes found under %s", root)
 
@@ -278,6 +312,66 @@ class VideoBridgeDataset(data.Dataset):
                         "episode_name": f"{leaf_dir.name}/{parquet_path.stem}",
                     }
                 )
+
+        return cur_episodes
+
+    def _scan_lerobot_v3_video_root(self, root: Path) -> List[Dict[str, Any]]:
+        cur_episodes: List[Dict[str, Any]] = []
+        if self.require_language_embedding:
+            logger.warning("LeRobot v3 video scan ignores roots requiring language embeddings: %s", root)
+            return cur_episodes
+
+        leaf_dirs = _find_lerobot_v3_video_dirs(root)
+        if not leaf_dirs:
+            return cur_episodes
+
+        import pandas as pd
+
+        pbar = tqdm(leaf_dirs)
+        for leaf_dir in pbar:
+            pbar.set_description(f"Scanning LeRobot v3 videos {leaf_dir}")
+            episode_files = sorted((leaf_dir / "meta" / "episodes").glob("chunk-*/file-*.parquet"))
+            for episode_file in episode_files:
+                episodes_df = pd.read_parquet(episode_file)
+                for _, row in episodes_df.iterrows():
+                    video_paths = []
+                    missing_video = False
+                    for video_key in self.image_columns:
+                        chunk_col = f"videos/{video_key}/chunk_index"
+                        file_col = f"videos/{video_key}/file_index"
+                        if chunk_col not in episodes_df.columns or file_col not in episodes_df.columns:
+                            raise KeyError(
+                                f"Missing LeRobot v3 metadata columns {chunk_col!r}/{file_col!r} in {episode_file}"
+                            )
+
+                        chunk_index = int(row[chunk_col])
+                        file_index = int(row[file_col])
+                        video_path = (
+                            leaf_dir
+                            / "videos"
+                            / video_key
+                            / f"chunk-{chunk_index:03d}"
+                            / f"file-{file_index:03d}.mp4"
+                        )
+                        if not video_path.exists():
+                            logger.warning("Skipping episode with missing video: %s", video_path)
+                            missing_video = True
+                            break
+                        video_paths.append(str(video_path))
+
+                    if missing_video:
+                        continue
+
+                    episode_index = int(row["episode_index"])
+                    cur_episodes.append(
+                        {
+                            "format": "lerobot_v3_video",
+                            "video_paths": video_paths,
+                            "num_frames": int(row["length"]),
+                            "root": str(leaf_dir),
+                            "episode_name": f"{leaf_dir.name}/episode_{episode_index:06d}",
+                        }
+                    )
 
         return cur_episodes
 
@@ -372,6 +466,44 @@ class VideoBridgeDataset(data.Dataset):
         frames_np = np.stack(frames, axis=0)
         return torch.from_numpy(frames_np).permute(0, 3, 1, 2).float() / 255.0
 
+    def _load_video_frames_pyav(self, video_path: str, frame_indices: List[int]) -> List[np.ndarray]:
+        import av
+
+        wanted = set(frame_indices)
+        max_index = max(wanted)
+        decoded: Dict[int, np.ndarray] = {}
+        container = av.open(video_path)
+        try:
+            stream = container.streams.video[0]
+            for frame_idx, frame in enumerate(container.decode(stream)):
+                if frame_idx in wanted:
+                    decoded[frame_idx] = frame.to_ndarray(format="rgb24")
+                if frame_idx >= max_index:
+                    break
+        finally:
+            container.close()
+
+        missing = [idx for idx in frame_indices if idx not in decoded]
+        if missing:
+            raise ValueError(f"Failed to decode frames {missing} from {video_path}")
+        return [decoded[idx] for idx in frame_indices]
+
+    def _load_lerobot_v3_video_frames(self, episode: Dict[str, Any], frame_indices: List[int]) -> torch.Tensor:
+        view_batches = [
+            self._load_video_frames_pyav(video_path, frame_indices)
+            for video_path in episode["video_paths"]
+        ]
+
+        frames = []
+        for frame_pos in range(len(frame_indices)):
+            frame_np = self._compose_lerobot_views([view_frames[frame_pos] for view_frames in view_batches])
+            if self.video_size is not None and frame_np.shape[:2] != tuple(self.video_size):
+                frame_np = resize_with_padding(frame_np, self.video_size)
+            frames.append(frame_np)
+
+        frames_np = np.stack(frames, axis=0)
+        return torch.from_numpy(frames_np).permute(0, 3, 1, 2).float() / 255.0
+
     def __getitem__(self, idx: int) -> Optional[Dict[str, Any]]:
         if not self.episodes:
             return None
@@ -381,6 +513,8 @@ class VideoBridgeDataset(data.Dataset):
             try:
                 if episode.get("format", "video") == "lerobot_parquet":
                     total_frames = self._parquet_frame_count(episode["parquet_path"])
+                elif episode.get("format") == "lerobot_v3_video":
+                    total_frames = episode["num_frames"]
                 else:
                     total_frames = get_video_frame_count(episode["video_path"])
 
@@ -389,6 +523,8 @@ class VideoBridgeDataset(data.Dataset):
 
                 if episode.get("format", "video") == "lerobot_parquet":
                     frames = self._load_lerobot_parquet_frames(episode["parquet_path"], frame_indices)
+                elif episode.get("format") == "lerobot_v3_video":
+                    frames = self._load_lerobot_v3_video_frames(episode, frame_indices)
                 else:
                     frames = load_video_frames(episode["video_path"], frame_indices, self.video_size)
 
@@ -399,7 +535,7 @@ class VideoBridgeDataset(data.Dataset):
                     "video_frames": frames[1:],
                     "language_embedding": language_embedding,
                     "episode_name": episode["episode_name"],
-                    "video_path": episode.get("video_path", episode.get("parquet_path")),
+                    "video_path": episode.get("video_path", episode.get("parquet_path", episode.get("video_paths"))),
                 }
             except Exception as exc:
                 logger.warning(
