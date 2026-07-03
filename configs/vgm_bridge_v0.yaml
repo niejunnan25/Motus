@@ -38,13 +38,13 @@ model:
 
 training:
   batch_size: 1
-  max_steps: 500000
+  max_steps: 50000
   learning_rate: 1.0e-5
   weight_decay: 0.01
 
   scheduler_type: "diffusers_cosine"
   warmup_steps: 1000
-  lr_schedule_steps: 500000
+  lr_schedule_steps: 50000
   min_lr: 1.0e-6
 
   grad_clip_norm: 0.5
@@ -55,7 +55,7 @@ system:
   checkpoint_dir: "./checkpoints"
   log_level: "INFO"
   log_interval: 1
-  save_interval: 10000
+  save_interval: 5000
   val_interval: 1000000000
   num_workers: 16
   pin_memory: true
@@ -64,7 +64,7 @@ logging:
   report_to: "wandb"
   wandb_project: "motus"
   tensorboard_log_dir: "tensorboard_logs"
-  run_name: "vgm_bridge_v0"
+  run_name: "vgm_bridge_v0_lerobot_video_448x224_50k"
 
 resume:
   checkpoint_path: null
