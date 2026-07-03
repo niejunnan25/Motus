@@ -322,6 +322,8 @@ def create_train_dataloader(config: OmegaConf, rank: int, world_size: int) -> Da
         max_episodes=config.dataset.get("max_episodes", None),
         require_language_embedding=config.dataset.get("require_language_embedding", False),
         video_extensions=list(config.dataset.get("video_extensions", [".mp4"])),
+        data_format=config.dataset.get("data_format", "auto"),
+        image_column=config.dataset.get("image_column", "image"),
         cache_scan=config.dataset.get("cache_scan", True),
         val=False,
     )
