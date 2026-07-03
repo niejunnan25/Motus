@@ -127,6 +127,8 @@ class VideoBridgeDataset(data.Dataset):
         video_extensions: Optional[List[str]] = None,
         data_format: str = "auto",
         image_column: str = "image",
+        image_columns: Optional[List[str]] = None,
+        view_layout: str = "single",
         cache_scan: bool = True,
         val: bool = False,
         **kwargs: Any,
@@ -144,6 +146,8 @@ class VideoBridgeDataset(data.Dataset):
         self.video_extensions = tuple(video_extensions or [".mp4"])
         self.data_format = data_format
         self.image_column = image_column
+        self.image_columns = list(image_columns) if image_columns else [image_column]
+        self.view_layout = view_layout
         self.cache_scan = bool(cache_scan)
         self.val = val
 
@@ -153,17 +157,19 @@ class VideoBridgeDataset(data.Dataset):
 
         logger.info(
             "VideoBridgeDataset initialized with %s episodes from %s roots; "
-            "data_format=%s, image_column=%s, require_language_embedding=%s",
+            "data_format=%s, image_columns=%s, view_layout=%s, require_language_embedding=%s",
             len(self.episodes),
             len(self.dataset_dir),
             self.data_format,
-            self.image_column,
+            self.image_columns,
+            self.view_layout,
             self.require_language_embedding,
         )
 
     def _scan_all_episodes(self) -> List[Dict[str, Any]]:
         episodes: List[Dict[str, Any]] = []
-        cache_suffix = f"{self.data_format}.{self.image_column}"
+        image_key = "-".join(self.image_columns)
+        cache_suffix = f"{self.data_format}.{image_key}.{self.view_layout}"
         if self.require_language_embedding:
             cache_suffix += ".lang"
 
@@ -331,13 +337,34 @@ class VideoBridgeDataset(data.Dataset):
 
         raise TypeError(f"Unsupported LeRobot image cell type in {parquet_path}: {type(cell)}")
 
+    def _compose_lerobot_views(self, view_frames: List[np.ndarray]) -> np.ndarray:
+        if len(view_frames) == 1 or self.view_layout == "single":
+            return view_frames[0]
+
+        if self.view_layout not in ("vertical", "horizontal"):
+            raise ValueError(f"Unsupported view_layout={self.view_layout!r}; expected single/vertical/horizontal")
+
+        target_h = max(frame.shape[0] for frame in view_frames)
+        target_w = max(frame.shape[1] for frame in view_frames)
+        aligned = [
+            frame if frame.shape[:2] == (target_h, target_w) else resize_with_padding(frame, (target_h, target_w))
+            for frame in view_frames
+        ]
+
+        axis = 0 if self.view_layout == "vertical" else 1
+        return np.concatenate(aligned, axis=axis)
+
     def _load_lerobot_parquet_frames(self, parquet_path: str, frame_indices: List[int]) -> torch.Tensor:
         import pandas as pd
 
-        df = pd.read_parquet(parquet_path, columns=[self.image_column])
+        df = pd.read_parquet(parquet_path, columns=self.image_columns)
         frames = []
         for idx in frame_indices:
-            frame_np = self._decode_lerobot_image_cell(df[self.image_column].iloc[idx], parquet_path)
+            view_frames = [
+                self._decode_lerobot_image_cell(df[column].iloc[idx], parquet_path)
+                for column in self.image_columns
+            ]
+            frame_np = self._compose_lerobot_views(view_frames)
             if self.video_size is not None and frame_np.shape[:2] != tuple(self.video_size):
                 frame_np = resize_with_padding(frame_np, self.video_size)
             frames.append(frame_np)

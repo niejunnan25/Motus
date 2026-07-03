@@ -3,8 +3,8 @@ common:
   # For V0, 16 target frames gives 17 total frames, which gives more than
   # one middle latent slice after WAN VAE temporal compression.
   num_video_frames: 16
-  video_height: 384
-  video_width: 320
+  video_height: 448
+  video_width: 224
 
   global_downsample_rate: 3
 
@@ -23,6 +23,8 @@ dataset:
   require_language_embedding: false
   data_format: "lerobot_parquet"
   image_column: "image"
+  image_columns: ["image", "wrist_image"]
+  view_layout: "vertical"
   video_extensions: [".mp4"]
   cache_scan: false
 
