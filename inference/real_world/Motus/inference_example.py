@@ -97,7 +97,10 @@ import numpy as np
 from PIL import Image
 import yaml
 
-# Add project root to import model
+# Add project root to import model.
+# 在完整仓库里运行时，下面的 sys.path 会让 `from models.motus`
+# 解析到仓库根目录的 `models/`。推理目录里也带了一份 `models/`
+# 拷贝，更像是用于部署打包的副本；顺调用链阅读时先以根目录版本为准。
 PROJ_ROOT = str(Path(__file__).resolve().parents[3])
 if PROJ_ROOT not in sys.path:
     sys.path.insert(0, PROJ_ROOT)
@@ -113,6 +116,10 @@ def load_yaml_config(path: str) -> Dict[str, Any]:
 
 
 def load_image_as_tensor(image_path: str, size_hw: tuple[int, int]) -> torch.Tensor:
+    # 输入图片会被 resize 成模型配置的 (H, W)，并归一化到 [0, 1]。
+    # 输出维度:
+    #   tensor: [B=1, C=3, H, W]
+    # 注意: README 要求这里的单张图通常已经是三视角拼接图，不是三张图分别输入。
     img = Image.open(image_path).convert("RGB")
     img = img.resize((size_hw[1], size_hw[0]), Image.BICUBIC)  # (W,H)
     arr = np.array(img).astype(np.float32) / 255.0
@@ -121,6 +128,26 @@ def load_image_as_tensor(image_path: str, size_hw: tuple[int, int]) -> torch.Ten
 
 
 def build_vlm_inputs(processor, instruction: str, image: Image.Image, device: torch.device) -> Dict[str, torch.Tensor]:
+    # 给 Qwen3-VL 准备图文输入。这里的 VLM 输入只用于 understanding token，
+    # 和 WAN 的 T5 文本条件是两套不同的文本/视觉入口。
+    #
+    # 这里的 processor 只做 tokenizer + 图像预处理，不会运行 Qwen3-VL 的视觉神经网络。
+    # 图像部分会被 resize/normalize，并切成 Qwen3-VL ViT 要吃的 patch 向量:
+    #   N_img_patches = grid_t * grid_h * grid_w
+    #   C_patch = C_rgb * temporal_patch_size * patch_size * patch_size
+    # 对 Qwen3-VL-2B-Instruct:
+    #   patch_size=16, temporal_patch_size=2, merge_size=2, C_rgb=3
+    #   因此 C_patch = 3 * 2 * 16 * 16 = 1536
+    # 如果输入图像保持为 Motus real-world 配置的 H=384, W=320:
+    #   grid_t=1, grid_h=384/16=24, grid_w=320/16=20
+    #   pixel_values: [24*20=480, 1536]
+    #   后续进入 Qwen3-VL vision tower 后会按 merge_size^2=4 合并为 120 个 image token。
+    #
+    # 典型输出维度:
+    #   input_ids:      [B=1, L_u]，文本 token + image placeholder token
+    #   attention_mask: [B=1, L_u]
+    #   pixel_values:   [N_img_patches, C_patch]，展平后的 patch 像素/归一化值，不是 embedding
+    #   image_grid_thw: [num_images, 3]，每张图的 T/H/W patch 网格
     messages = [
         {
             'role': 'user',
@@ -144,7 +171,9 @@ def build_vlm_inputs(processor, instruction: str, image: Image.Image, device: to
 
 
 def save_frame_grid(condition_frame: torch.Tensor, predicted_frames: torch.Tensor, save_path: str) -> None:
-    # condition_frame: [C,H,W]; predicted_frames: [T,C,H,W]
+    # condition_frame: [C=3, H, W]
+    # predicted_frames: [T_pred, C=3, H, W]
+    # 这里只是可视化，把条件帧和预测帧横向拼成一张图，不参与模型推理。
     cf = (condition_frame.detach().cpu().float().clamp(0,1).permute(1,2,0).numpy()*255).astype(np.uint8)
     frames = []
     T = predicted_frames.shape[0]
@@ -159,6 +188,15 @@ def save_frame_grid(condition_frame: torch.Tensor, predicted_frames: torch.Tenso
 def create_motus_from_yaml(config_dict: Dict[str, Any], device: torch.device) -> Motus:
     common = config_dict['common']
     model_cfg = config_dict['model']
+
+    # 从 YAML 汇总 MotusConfig。和维度最相关的字段:
+    #   action_state_dim/state_dim: 机器人状态维度，常见为 14
+    #   action_dim:                每个动作 token 的原始维度，常见为 14
+    #   action_expert_dim:         ActionExpert hidden size，常见为 1024
+    #   und_expert_hidden_size:    UnderstandingExpert hidden size，常见为 512
+    #   num_video_frames:          预测的未来视频帧数
+    #   video_action_freq_ratio:   每个视频帧对应多少个 action step
+    #   action_chunk_size = num_video_frames * video_action_freq_ratio
     mc = MotusConfig(
         wan_checkpoint_path=model_cfg['wan']['checkpoint_path'],
         vae_path=model_cfg['wan']['vae_path'],
@@ -223,8 +261,12 @@ def main():
 
     # Prepare inputs
     H, W = cfg['common']['video_height'], cfg['common']['video_width']
+    # first_frame 是模型的条件图像:
+    #   first_frame: [B=1, C=3, H, W]，数值范围 [0, 1]
     first_frame = load_image_as_tensor(args.image, (H, W)).to(device)  # [1,C,H,W]
     state_dim = int(cfg['common']['state_dim'])
+    # 无真实机器人环境时用零状态占位:
+    #   state: [B=1, state_dim]，常见 state_dim=14
     state = torch.zeros((1, state_dim), dtype=torch.bfloat16, device=device)  # no env, zero state
 
     # Build VLM inputs
@@ -234,6 +276,9 @@ def main():
     vlm_inputs = build_vlm_inputs(processor, args.instruction, first_frame_pil, device)
 
     # Build T5 embeddings
+    # language_embeddings 给 WAN cross-attention 使用:
+    #   单样本通常是 List[Tensor]，其中每个 Tensor: [L_t5<=512, C_t5=4096]
+    #   进入模型后会 padding/truncate 到 [B, 512, 4096]，再投影到 [B, 512, 3072]。
     if args.use_t5:
         t5_ckpt = os.path.join(args.wan_path, 'Wan2.2-TI2V-5B', 'models_t5_umt5-xxl-enc-bf16.pth')
         t5_tokenizer = os.path.join(args.wan_path, 'Wan2.2-TI2V-5B', 'google/umt5-xxl')
@@ -262,6 +307,13 @@ def main():
             raise ValueError("Unsupported t5_embeds format, expected Tensor or List[Tensor]")
 
     # Inference
+    # 这里进入真正的模型调用链:
+    #   Motus.inference_step
+    #     -> VideoModule.prepare_input
+    #     -> ActionExpert.input_encoder
+    #     -> UndModule.extract_und_features
+    #     -> VideoModule.process_joint_attention
+    #     -> modified WAN WanSelfAttention.forward
     with torch.no_grad():
         predicted_frames, predicted_actions = model.inference_step(
             first_frame=first_frame,
@@ -272,6 +324,9 @@ def main():
         )
 
     # Save frames grid
+    # model.inference_step 返回:
+    #   predicted_frames:  [B=1, C=3, T_pred, H, W] 或 [B=1, T_pred, C=3, H, W]，下面兼容两种排布
+    #   predicted_actions: [B=1, action_chunk_size, action_dim]
     # Convert predicted_frames to [T,C,H,W]
     if predicted_frames.dim() == 5 and predicted_frames.shape[1] != 3:
         frames_vis = predicted_frames.squeeze(0)  # [T,C,H,W]

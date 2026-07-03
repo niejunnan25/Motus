@@ -149,20 +149,29 @@ class StateActionEncoder(nn.Module):
         B = state_tokens.shape[0]
         chunk_size = state_tokens.shape[1] + action_tokens.shape[1]
         
-        # Encode state tokens: direct encoding without squeeze/unsqueeze
+        # 中文维度说明:
+        #   state_tokens:  [B, 1, state_dim=14]
+        #   action_tokens: [B, action_chunk_size, action_dim=14]
+        #   registers:     [B, num_registers=4, C_action=1024]，finetune 模式使用
+        #
+        # 状态和动作先分别用 MLP 投到 action expert hidden size:
+        #   state_encoded:  [B, 1, 1024]
+        #   action_encoded: [B, action_chunk_size, 1024]
         state_encoded = self.state_encoder(state_tokens)  # [B, 1, dim]
         
-        # Encode action tokens: direct encoding
         action_encoded = self.action_encoder(action_tokens)  # [B, action_chunk_size, dim]
         
-        # Concatenate state and action encodings
+        # 拼成 action token 序列:
+        #   encoded before registers: [B, 1 + action_chunk_size, 1024]
         encoded = torch.cat([state_encoded, action_encoded], dim=1)  # [B, chunk_size, dim]
         
-        # Optionally concatenate registers
+        # register tokens 是可学习的全局槽位，帮助 action token 在 MoT attention 里汇聚全局信息:
+        #   encoded after registers: [B, 1 + action_chunk_size + num_registers, 1024]
         if registers is not None:
             encoded = torch.cat([encoded, registers], dim=1)  # [B, chunk_size + num_registers, dim]
         
-        # Add positional embeddings to all tokens (including registers)
+        # 给 state/action/register 都加 1D 位置编码，输出就是 action_tokens:
+        #   output: [B, L_a, 1024]
         seq_len = encoded.shape[1]
         encoded = encoded + self.pos_embedding[:, :seq_len, :]
         
@@ -204,6 +213,9 @@ class ActionEncoder(nn.Module):
 
     def forward(self, state_tokens: torch.Tensor, action_tokens: torch.Tensor, registers: torch.Tensor = None) -> torch.Tensor:
         # state_tokens is ignored for action-only mode
+        # pretrain 模式没有真实机器人 state，只编码 action 或 latent action:
+        #   action_tokens: [B, action_chunk_size, action_dim]
+        #   output:        [B, L_a, C_action=1024]
         action_encoded = self.action_encoder(action_tokens)  # [B, chunk_size, dim]
         encoded = action_encoded
         if registers is not None:
@@ -233,6 +245,18 @@ class ActionExpertBlock(nn.Module):
         self.norm2 = WanLayerNorm(config.dim, eps=config.eps)  # For FFN
         
         # WAN-side action projections and norms (MoT: action -> WAN head space for trimodal joint attention)
+        # 中文维度说明:
+        #   action expert hidden size: C_action=1024
+        #   WAN hidden size:           C_wan=3072
+        #   WAN attention heads:       n=24, d=128, C_wan=n*d
+        #
+        # 这里不直接把 action token 投成 [B, L_a, 3072]，而是一次性投成 Q/K/V 的多头形状:
+        #   input action token: [B, L_a, 1024]
+        #   wan_action_qkv:    [3, n=24, 1024, d=128]
+        #   einsum result:     [3, B, L_a, n=24, d=128]
+        #
+        # attention 结束后，WAN head space 会被 flatten 成 [B, L_a, 3072]，
+        # 再用 wan_action_o 投回 [B, L_a, 1024]。
         self.wan_num_heads = wan_config['num_heads']
         self.wan_head_dim = wan_config['head_dim']
         self.wan_dim = wan_config['dim']
@@ -297,7 +321,11 @@ class ActionDecoder(nn.Module):
         Returns:
             Action predictions [B, chunk_size, action_dim]
         """
-        # WAN Head-style modulation using time_emb
+        # WAN Head-style modulation using time_emb:
+        #   x:        [B, L_a, C_action=1024]
+        #   time_emb: [B, L_a, C_action=1024]
+        #   output:   [B, L_a, action_dim=14]
+        # 调用方会把 state token 和 register token 对应的位置切掉，只保留动作 chunk。
         with torch.amp.autocast('cuda', dtype=torch.float32):
             e0, e1 = (self.modulation.unsqueeze(0) + time_emb.unsqueeze(2)).chunk(2, dim=2)
         z = self.norm(x) * (1 + e1.squeeze(2)) + e0.squeeze(2)

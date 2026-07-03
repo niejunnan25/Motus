@@ -84,6 +84,19 @@ class UndExpertBlock(nn.Module):
         self.norm2 = WanLayerNorm(config.dim, eps=config.eps)  # For FFN
         
         # WAN-side understanding projections and norms (MoT: understanding -> WAN head space for trimodal joint attention)
+        # 中文维度说明:
+        #   Qwen3-VL last hidden: [B, L_u, C_vlm=2048]
+        #   vlm_adapter 后:       [B, L_u, C_und=512]
+        #   WAN hidden size:      C_wan=3072
+        #   WAN attention heads:  n=24, d=128, C_wan=n*d
+        #
+        # 本 block 只负责把 understanding token 做成 WAN self-attention 可接收的 Q/K/V:
+        #   input und token: [B, L_u, 512]
+        #   wan_und_qkv:    [3, n=24, 512, d=128]
+        #   einsum result:  [3, B, L_u, n=24, d=128]
+        #
+        # attention 输出会先 flatten 成 [B, L_u, 3072]，
+        # 再通过 wan_und_o 投回 [B, L_u, 512]。
         self.wan_num_heads = wan_config['num_heads']
         self.wan_head_dim = wan_config['head_dim']
         self.wan_dim = wan_config['dim']
@@ -122,6 +135,7 @@ class UndExpert(nn.Module):
         self.freq_dim = 256  # Sinusoidal embedding dimension
         
         # VLM adapter - adapts from VLM dimension to understanding expert dimension
+        #   [B, L_u, C_vlm=2048] -> [B, L_u, C_und=512]
         self.vlm_adapter = self.build_condition_adapter(
             config.vlm_projector_type,
             config.vlm_input_dim,

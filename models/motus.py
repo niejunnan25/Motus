@@ -103,10 +103,15 @@ class VideoModule(nn.Module):
 
     def prepare_input(self, noisy_video_latent: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Prepare video tokens from pre-processed noisy latent."""
-        # Through patch_embedding: 48 -> 3072 channels
+        # 中文维度说明:
+        #   noisy_video_latent: [B, 48, T_lat, H_lat, W_lat]
+        #   WAN patch_embedding 是 Conv3d，patch_size 通常为 (1, 2, 2)，通道从 48 投到 WAN hidden dim。
+        #   video_patched: [B, C_wan=3072, T_lat, H_lat/2, W_lat/2]
         video_patched = self.video_model.wan_model.patch_embedding(noisy_video_latent)
 
-        # Flatten and convert to tokens
+        # 展平成 video token 序列:
+        #   L_v = T_lat * (H_lat/2) * (W_lat/2)
+        #   video_features: [B, L_v, C_wan=3072]
         video_features = video_patched.flatten(2).transpose(1, 2)
 
         # Calculate sequence length and padding
@@ -143,7 +148,9 @@ class VideoModule(nn.Module):
             # New format: torch.Tensor [B, seq_len, dim] - already padded by collate_fn
             t5_context_raw = language_embeddings
         
-        # Convert via text_embedding layer (4096 -> 3072)
+        # T5 文本条件给 WAN 的 cross-attention 使用:
+        #   t5_context_raw: [B, text_len=512, C_t5=4096]
+        #   t5_context:     [B, text_len=512, C_wan=3072]
         t5_context = self.video_model.wan_model.text_embedding(t5_context_raw)
 
         return t5_context
@@ -157,6 +164,10 @@ class VideoModule(nn.Module):
             bt = t_video.size(0)
             t_flat = t_video.flatten()
             
+            # WAN 的扩散时间嵌入:
+            #   t_video:     [B, L_v]
+            #   t_emb:       [B, L_v, C_wan=3072]，用于最后 video head
+            #   t_emb_proj:  [B, L_v, 6, C_wan=3072]，6 组 AdaLN 参数控制 attention/FFN
             t_emb = self.video_model.wan_model.time_embedding(
                 sinusoidal_embedding_1d(self.video_model.wan_model.freq_dim, t_flat).unflatten(0, (bt, seq_len)).float()
             )
@@ -217,11 +228,22 @@ class VideoModule(nn.Module):
         """Trimodal joint self-attention: WAN + Action + Understanding via WAN self-attn (MoT)."""
         wan_layer = self.video_model.wan_model.blocks[layer_idx]
 
+        # MoT 的核心入口。进入本函数时三路 token 的典型维度是:
+        #   video_tokens:  [B, L_v, C_wan=3072]
+        #   action_tokens: [B, L_a, C_action=1024]
+        #   und_tokens:    [B, L_u, C_und=512]
+        #
+        # 目标: 把 action/understanding token 临时投影到 WAN attention head 空间:
+        #   WAN head 数 n=24, head_dim d=128, 因此 C_wan = n * d = 3072
+        # 然后三路 token 共同做一次 self-attention，再分别投回各自 hidden size。
+
         # AdaLN params (already computed)
         v_mod = video_adaln_modulation
         a_mod = action_adaln_modulation
 
         # Pre-attn normalization with AdaLN
+        #   norm_video:  [B, L_v, 3072]
+        #   norm_action: [B, L_a, 1024]
         norm_video = wan_layer.norm1(video_tokens).float() * (1 + v_mod[1].squeeze(2)) + v_mod[0].squeeze(2)
         norm_action = action_block.norm1(action_tokens) * (1 + a_mod[1].squeeze(2)) + a_mod[0].squeeze(2)
 
@@ -231,38 +253,55 @@ class VideoModule(nn.Module):
         n = self.video_model.wan_model.num_heads
         d = C // n
 
-        # Action heads for WAN space (1024 -> 24*128)
+        # Action heads for WAN space:
+        #   norm_action:                 [B, L_a, 1024]
+        #   wan_action_qkv:              [3, n=24, 1024, d=128]
+        #   a_qkv after einsum:          [3, B, L_a, n=24, d=128]
+        #   a_q/a_k/a_v used by WAN attn [B, L_a, n=24, d=128]
         a_qkv = torch.einsum("BTD,KNDE->KBTNE", norm_action, action_block.wan_action_qkv)
         a_q_h, a_k_h, a_v_h = a_qkv[0], a_qkv[1], a_qkv[2]
         a_q = action_block.wan_action_norm_q(a_q_h.flatten(-2)).view(B, L_a, n, d)
         a_k = action_block.wan_action_norm_k(a_k_h.flatten(-2)).view(B, L_a, n, d)
         a_v = a_v_h.view(B, L_a, n, d)
 
-        # Understanding Expert processing
+        # Understanding Expert processing:
+        #   und_tokens 来自冻结 Qwen3-VL 最后一层，再经过 adapter。
+        #   norm_und: [B, L_u, 512]
         norm_und = und_block.norm1(und_tokens)
         L_u = norm_und.shape[1]
         
-        # Understanding Expert heads for WAN space (2048 -> 24*128)
+        # Understanding heads for WAN space:
+        #   norm_und:                   [B, L_u, 512]
+        #   wan_und_qkv:                [3, n=24, 512, d=128]
+        #   u_qkv after einsum:         [3, B, L_u, n=24, d=128]
+        #   u_q/u_k/u_v used by WAN attn [B, L_u, n=24, d=128]
         u_qkv = torch.einsum("BTD,KNDE->KBTNE", norm_und, und_block.wan_und_qkv)
         u_q_h, u_k_h, u_v_h = u_qkv[0], u_qkv[1], u_qkv[2]
         u_q = und_block.wan_und_norm_q(u_q_h.flatten(-2)).view(B, L_u, n, d)
         u_k = und_block.wan_und_norm_k(u_k_h.flatten(-2)).view(B, L_u, n, d)
         u_v = u_v_h.view(B, L_u, n, d)
 
-        # Meta info for WAN attention
+        # WAN self-attention 看到的总长度:
+        #   L_total = L_v + L_a + L_u
+        #   seq_lens: [B]，每个样本都等于 L_total
         seq_lens = torch.full((B,), L_v + L_a + L_u, dtype=torch.long, device=self.device)
         freqs = self.video_model.wan_model.freqs
         if freqs.device != self.device:
             freqs = freqs.to(self.device)
 
-        # Call WAN self-attn with trimodal MoT
+        # Call WAN self-attn with trimodal MoT:
+        #   y:            [B, L_v, 3072]      video 分支输出，已经过 WAN self_attn.o
+        #   action_out_h: [B, L_a, n=24, d=128]
+        #   und_out_h:    [B, L_u, n=24, d=128]
         y, action_out_h, und_out_h = wan_layer.self_attn(
             norm_video, seq_lens, self.grid_sizes, freqs,
             action_q=a_q, action_k=a_k, action_v=a_v,
             und_q=u_q, und_k=u_k, und_v=u_v
         )
         
-        # Project Understanding Expert output
+        # 投回各自专家的 hidden size:
+        #   action_out_h.flatten(2): [B, L_a, 3072] -> action_out: [B, L_a, 1024]
+        #   und_out_h.flatten(2):    [B, L_u, 3072] -> und_out:    [B, L_u, 512]
         und_out = und_block.wan_und_o(und_out_h.flatten(2))
 
         # Project back and residual connections
@@ -323,10 +362,12 @@ class UndModule(nn.Module):
         with torch.no_grad():
             vlm_output = self.vlm_model.model.language_model(**vlm_kwargs)
 
-        # Extract last layer features directly
+        # Qwen3-VL 是冻结的，这里只拿最后一层 hidden states 当语义 token:
+        #   last_layer_features: [B, L_u, C_vlm=2048]
         last_layer_features = vlm_output.hidden_states[-1]  # [B, seq_len, vlm_dim]
 
-        # [B, seq_len, vlm_dim] -> [B, seq_len, und_dim]
+        # 通过 understanding expert 的 adapter 降维:
+        #   adapted_features: [B, L_u, C_und=512]
         adapted_features = self.und_expert.vlm_adapter(last_layer_features)
 
         return adapted_features
@@ -377,10 +418,27 @@ class UndModule(nn.Module):
             pixel_values_batch = vlm_inputs['pixel_values'].to(self.device)
             image_grid_thw_batch = vlm_inputs['image_grid_thw'].to(self.device)
 
-        # Get input embeddings
+        # Qwen3-VL 文本 token embedding:
+        #   input_ids_batch: [B, L_u]
+        #   inputs_embeds:   [B, L_u, C_vlm=2048]
         inputs_embeds = self.vlm_model.get_input_embeddings()(input_ids_batch)
 
-        # Process images - handle different return formats between Qwen2.5-VL and Qwen3-VL
+        # Qwen3-VL 图像 encoder 输出 image feature，随后塞回 <image> placeholder 的位置。
+        # 注意: 这里得到的是 VLM 自己的 token 序列，不是 WAN video token。
+        #
+        # processor(...) 传进来的 pixel_values 还不是 embedding，而是展平 patch:
+        #   pixel_values_batch: [sum_i grid_t_i*grid_h_i*grid_w_i, C_patch]
+        #   C_patch = 3 * temporal_patch_size * patch_size * patch_size
+        # Qwen3-VL-2B-Instruct 的 preprocessor_config:
+        #   patch_size=16, temporal_patch_size=2, merge_size=2 -> C_patch=1536
+        # 对 Motus real-world 常见 384x320 输入:
+        #   image_grid_thw: [[1, 24, 20]]
+        #   pixel_values:   [480, 1536]
+        #
+        # get_image_features 才真正运行 Qwen3-VL vision tower:
+        #   VisionPatchEmbed Conv3d: [480,1536] -> [480,C_vis=1024]
+        #   Vision blocks + PatchMerger(2x2): 480 patch -> 120 image tokens
+        #   image_embeds list item: [120, C_vlm=2048]
         image_embeds, deepstack_image_embeds = self.vlm_model.get_image_features(pixel_values_batch, image_grid_thw_batch)
 
         image_embeds = torch.cat(image_embeds, dim=0).to(self.device, self.dtype)
@@ -439,12 +497,16 @@ class ActionModule(nn.Module):
             bt = t.size(0)
             t_flat = t.flatten()
             
-            # Create sinusoidal embedding (same pattern as VideoModule)
+            # Action 分支也用扩散时间嵌入，结构对齐 WAN:
+            #   t:    [B, L_a]
+            #   a_e:  [B, L_a, C_action=1024]，给 action decoder/head 使用
             a_e = self.action_expert.time_embedding(
                 sinusoidal_embedding_1d(self.action_expert.freq_dim, t_flat).unflatten(0, (bt, seq_len)).float()
             )  # [B, seq_len, freq_dim]
             
-            # Project to AdaLN parameters (6 params: 3 for WAN-Action joint attn + 3 for FFN)
+            # 6 组 AdaLN 参数:
+            #   a_e0: [B, L_a, 6, C_action=1024]
+            #   前 3 组控制 MoT attention residual，后 3 组控制 action FFN。
             a_e0 = self.action_expert.time_projection(a_e).unflatten(2, (6, self.config.action_expert_dim))  # [B, seq_len, 6, dim]
             
             assert a_e.dtype == torch.float32 and a_e0.dtype == torch.float32
@@ -468,7 +530,9 @@ class ActionModule(nn.Module):
         # AdaLN params
         a_mod = action_adaln_modulation
 
-        # Apply FFN with AdaLN modulation (params 3,4,5 for FFN: α3, β3, γ3)
+        # Action expert 自己的 FFN，不和 video/understanding 共享参数:
+        #   action_tokens: [B, L_a, 1024] -> [B, L_a, 1024]
+        #   a_mod[3:6]:   每个都是 [B, L_a, 1, 1024]，squeeze 后用于 AdaLN/残差门控。
         ffn_input = action_block.norm2(action_tokens).float() * (1 + a_mod[4].squeeze(2)) + a_mod[3].squeeze(2)
         ffn_out = action_block.ffn(ffn_input)
         
@@ -848,6 +912,17 @@ class Motus(nn.Module):
         processed_t5_context = self.video_module.preprocess_t5_embeddings(language_embeddings)
 
         # 3. MoT forward
+        # 每一层的调用路径是:
+        #   Motus.training_step
+        #     -> VideoModule.process_joint_attention
+        #       -> modified WAN WanSelfAttention.forward
+        #     -> VideoModule.process_cross_attention  (只有 video token 看 T5 文本)
+        #     -> 三个专家各自 FFN
+        #
+        # 进入循环时:
+        #   video_tokens:  [B, L_v, 3072]
+        #   action_tokens: [B, L_a, 1024]
+        #   und_tokens:    [B, L_u, 512]
         with torch.autocast(device_type="cuda", dtype=self.video_model.precision):
             # Process through 30 layers - modality-grouped execution
             for layer_idx in range(self.config.num_layers):
@@ -855,23 +930,28 @@ class Motus(nn.Module):
                 video_adaln_modulation = self.video_module.compute_adaln_modulation(video_adaln_params, layer_idx)
                 action_adaln_modulation = self.action_module.compute_adaln_modulation(action_adaln_params, layer_idx)
                 
-                # Trimodal MoT: WAN + Action + Understanding Expert joint attention
+                # Trimodal MoT: 三路 token 在同一次 self-attention 里互相可见。
                 video_tokens, action_tokens, und_tokens = self.video_module.process_joint_attention(
                     video_tokens, action_tokens, video_adaln_modulation, action_adaln_modulation, layer_idx, 
                     self.action_expert.blocks[layer_idx],
                     und_tokens, self.und_expert.blocks[layer_idx]
                 )
 
-                # WAN cross
+                # WAN cross-attention:
+                #   只有 video_tokens 额外看 T5 context [B, 512, 3072]。
+                #   action/understanding 不直接走这一步，它们已经在上一行通过 MoT 间接拿到 video/text 信息。
                 video_tokens = self.video_module.process_cross_attention(video_tokens, video_adaln_params, layer_idx, processed_t5_context)
 
-                # FFNs: WAN, Action, Understanding (each processes their own FFN)
+                # FFNs: 三个专家各自处理自己的 token，不共享 FFN 参数。
                 video_tokens = self.video_module.process_ffn(video_tokens, video_adaln_modulation, layer_idx)
                 action_tokens = self.action_module.process_ffn(action_tokens, action_adaln_modulation, layer_idx)
                 und_tokens = self.und_module.process_ffn(und_tokens, layer_idx)
                 
         
             # 4. Heads + Losses
+            # Heads:
+            #   video_pred:       [B, 48, T_lat, H_lat, W_lat]，预测 video flow velocity
+            #   action_pred_full: [B, L_a, action_dim=14]，其中包含 state/register 位置，下面会切掉。
             video_pred = self.video_module.apply_output_head(video_tokens, video_head_time_emb)
             action_pred_full = self.action_expert.decoder(action_tokens, action_head_time_emb)
             up_len = action_pred_full.shape[1] - self.action_expert.config.num_registers
@@ -915,24 +995,35 @@ class Motus(nn.Module):
         Joint inference for video and action prediction.
         
         Args:
-            first_frame: Initial frame [B, C, H, W]
+            first_frame: Initial frame [B, C=3, H, W], range [0, 1]
             texts: Text instructions for VLM
             images: Optional images for VLM
-            state: Initial robot state [B, state_dim]
+            state: Initial robot state [B, state_dim=14]
             num_inference_steps: Number of denoising steps
-            language_embeddings: Pre-encoded T5 embeddings for WAN model
+            language_embeddings: Pre-encoded T5 embeddings for WAN model.
+                Usually List[Tensor], each Tensor is [L_t5<=512, C_t5=4096].
+            vlm_inputs: Qwen3-VL inputs containing input_ids/attention_mask/pixel_values/image_grid_thw.
             
         Returns:
-            Tuple of (predicted_frames, predicted_actions)
+            Tuple of:
+                predicted_frames: [B, C=3, T_pred, H, W], range [0, 1]
+                predicted_actions: [B, action_chunk_size, action_dim=14]
         """
         B = first_frame.shape[0]
 
+        # 推理入口统一 dtype/device:
+        #   language_embeddings: List[[L_t5, 4096]]
+        #   state: [B, 14]
+        #   first_frame: [B, 3, H, W]
         language_embeddings = [emb.to(self.device).to(self.dtype) for emb in language_embeddings]
         state = state.to(self.device).to(self.dtype)
         first_frame = first_frame.to(self.device).to(self.dtype)
 
         # 1. Video/Action latents init
-        # Condition frame encode
+        # Condition frame encode:
+        #   first_frame_norm: [B, 3, 1, H, W]，把单帧图像补上时间维度 T=1
+        #   condition_frame_latent: [B, C_latent=48, T_lat=1, H_lat, W_lat]
+        # WAN 2.2 VAE 会把像素空间图像压到 latent 空间，后续 diffusion 在 latent 空间做。
         first_frame_norm = (first_frame * 2.0 - 1.0).unsqueeze(2)   # [0,1] -> [-1,1], [B, C, 1, H, W]
         with torch.no_grad():
             condition_frame_latent = self.video_model.encode_video(first_frame_norm.to(self.dtype))   # [B, C', 1, H', W']
@@ -940,42 +1031,74 @@ class Motus(nn.Module):
         # Init video/action latents
         B, C_latent, f_latent, H_latent, W_latent = condition_frame_latent.shape
         num_total_latent_frames = 1 + self.config.num_video_frames // 4
+        # video_latent 是要生成的未来视频 latent:
+        #   video_latent: [B, 48, T_total_lat, H_lat, W_lat]
+        #   T_total_lat = 1 + num_video_frames // 4，其中第 0 帧固定为条件帧 latent。
         video_latent = torch.randn((B, C_latent, num_total_latent_frames, H_latent, W_latent), device=self.device, dtype=self.dtype)
         video_latent[:, :, 0:1] = condition_frame_latent
+        # action_latent 是要生成的动作 chunk:
+        #   action_chunk_size = num_video_frames * video_action_freq_ratio
+        #   action_latent: [B, action_chunk_size, action_dim=14]
         action_shape = (B, self.config.action_chunk_size, self.config.action_dim)
         action_latent = torch.randn(action_shape, device=self.device, dtype=self.dtype)
 
         # 2. Understanding Expert features and T5 context
         # Extract understanding features from VLM
+        # und_tokens 来自冻结 Qwen3-VL:
+        #   VLM hidden: [B, L_u, 2048] -> adapter -> und_tokens: [B, L_u, 512]
         und_tokens = self.und_module.extract_und_features(vlm_inputs)
 
         # T5 preprocess
+        # processed_t5_context 给 WAN cross-attention 使用:
+        #   language_embeddings -> [B, 512, 4096] -> text_embedding -> [B, 512, 3072]
         processed_t5_context = self.video_module.preprocess_t5_embeddings(language_embeddings)
 
         # 3. Denoising loop: from noise (t=1) to clean (t=0)
+        # 推理时和训练同一套 MoT forward，只是外层变成 Euler 积分:
+        #   video_latent/action_latent 从噪声开始
+        #   每一步预测 velocity
+        #   latent = latent + velocity * dt
         timesteps = torch.linspace(1.0, 0.0, num_inference_steps + 1, device=self.device, dtype=self.dtype)
         for i in range(num_inference_steps):
             # Timesteps
             t = timesteps[i]
             t_next = timesteps[i + 1]
             dt = t_next - t
+            # WAN/action 的时间嵌入使用 0..1000 尺度:
+            #   video_t_scaled/action_t_scaled: [B]
             video_t_scaled = (t * 1000).expand(B).to(self.dtype)
             action_t_scaled = (t * 1000).expand(B).to(self.dtype)
 
             # Tokens with Registers
+            # video latent -> WAN token:
+            #   video_latent: [B, 48, T_total_lat, H_lat, W_lat]
+            #   video_tokens: [B, L_v, 3072]
             video_tokens = self.video_module.prepare_input(video_latent.to(self.dtype))
+            # state token:
+            #   state: [B, 14] -> state_tokens: [B, 1, 14]
             state_tokens = state.unsqueeze(1).to(self.dtype)
             # Expand registers for batch
+            # registers 是 action expert 的可学习全局 token:
+            #   registers: [B, num_registers=4, 1024]
             registers = self.action_expert.registers.expand(B, -1, -1)  # [B, num_registers, dim]
+            # action latent + state + registers -> action token:
+            #   action_latent: [B, action_chunk_size, 14]
+            #   action_tokens: [B, L_a=1+action_chunk_size+num_registers, 1024]
             action_tokens = self.action_expert.input_encoder(state_tokens, action_latent, registers)
 
             # Note: Understanding tokens already extracted before the loop, will be updated in joint attention
+            # 这里每个 denoising step 重新从 VLM 抽一次 understanding token:
+            #   und_tokens: [B, L_u, 512]
             und_tokens = self.und_module.extract_und_features(vlm_inputs)  # [B, num_queries * num_layers, und_dim]
 
             
             # Trimodal MoT forward - joint denoising for WAN, Action, Understanding
             with torch.autocast(device_type="cuda", dtype=self.video_model.precision):
                 # Time embeddings
+                # video_head_time_emb: [B, L_v, 3072]
+                # video_adaln_params:  [B, L_v, 6, 3072]
+                # action_head_time_emb: [B, L_a, 1024]
+                # action_adaln_params:  [B, L_a, 6, 1024]
                 video_head_time_emb, video_adaln_params = self.video_module.get_time_embedding(video_t_scaled, video_tokens.shape[1])
                 action_head_time_emb, action_adaln_params = self.action_module.get_time_embedding(action_t_scaled, action_tokens.shape[1])
 
@@ -986,43 +1109,70 @@ class Motus(nn.Module):
                     action_adaln_modulation = self.action_module.compute_adaln_modulation(action_adaln_params, layer_idx)
                     
                     # Trimodal joint attention: WAN + Action + Understanding
+                    #   输入:
+                    #     video_tokens:  [B, L_v, 3072]
+                    #     action_tokens: [B, L_a, 1024]
+                    #     und_tokens:    [B, L_u, 512]
+                    #   内部会把 action/und 投到 WAN head space [B, L, 24, 128]，
+                    #   然后和 video token 一起做一次 self-attention。
                     video_tokens, action_tokens, und_tokens = self.video_module.process_joint_attention(
                         video_tokens, action_tokens, video_adaln_modulation, action_adaln_modulation, layer_idx, 
                         self.action_expert.blocks[layer_idx],
                         und_tokens, self.und_expert.blocks[layer_idx]
                     )
 
-                    # WAN cross-attention with T5 embeddings 
+                    # WAN cross-attention with T5 embeddings:
+                    #   video_tokens: [B, L_v, 3072]
+                    #   processed_t5_context: [B, 512, 3072]
+                    # 只有 video 分支直接看 T5，action/und 通过上一行 MoT 间接吸收信息。
                     video_tokens = self.video_module.process_cross_attention(
                         video_tokens, video_adaln_params, layer_idx, processed_t5_context
                     )
 
                     # FFNs: WAN, Action, Understanding
+                    #   三个专家各自 FFN，维度保持不变:
+                    #   video [B,L_v,3072], action [B,L_a,1024], und [B,L_u,512]
                     video_tokens = self.video_module.process_ffn(video_tokens, video_adaln_modulation, layer_idx)
                     action_tokens = self.action_module.process_ffn(action_tokens, action_adaln_modulation, layer_idx)
                     und_tokens = self.und_module.process_ffn(und_tokens, layer_idx)
 
                 # Heads (velocities)
+                # video_velocity 是 flow-matching 的速度场:
+                #   video_velocity: [B, 48, T_total_lat, H_lat, W_lat]
                 video_velocity = self.video_module.apply_output_head(video_tokens, video_head_time_emb)
                 # Use decoder with all tokens (including registers)
+                # action_pred_full 包含 state/register 对应位置:
+                #   action_pred_full: [B, L_a, 14]
                 action_pred_full = self.action_expert.decoder(action_tokens, action_head_time_emb)
                 # Extract middle action chunk (skip first state token and last register tokens)
+                # action_velocity 只保留真正动作 chunk:
+                #   action_velocity: [B, action_chunk_size, 14]
                 action_velocity = action_pred_full[:, 1:-self.action_expert.config.num_registers, :]
 
                 # Euler integration
+                # 从 t 到 t_next 做一步 Euler 更新:
+                #   video_latent/action_latent 维度不变
                 video_latent = video_latent + video_velocity * dt
                 action_latent = action_latent + action_velocity * dt
 
                 # Teacher Forcing
+                # 条件帧 latent 永远固定，不让模型改写第 0 帧。
                 video_latent[:, :, 0:1] = condition_frame_latent
 
         # 4. Decode outputs
         with torch.no_grad():
+            # VAE decode:
+            #   video_latent: [B, 48, T_total_lat, H_lat, W_lat]
+            #   decoded_frames: [B, 3, T_total_pixel, H, W]，范围约 [-1, 1]
             decoded_frames = self.video_model.decode_video(video_latent)
+            # 去掉条件帧，只返回预测未来帧:
+            #   predicted_frames: [B, 3, T_pred, H, W]，范围 [0, 1]
             predicted_frames = decoded_frames[:, :, 1:]  # Skip first frame (condition)
             predicted_frames = (predicted_frames + 1.0) / 2.0  # [-1,1] to [0,1]
             predicted_frames = torch.clamp(predicted_frames, 0, 1).float()
         
+        # action_latent 经过 denoising 后就是动作预测:
+        #   predicted_actions: [B, action_chunk_size, 14]
         predicted_actions = action_latent.float()  # [B, action_chunk_size, 14]
 
         return predicted_frames, predicted_actions

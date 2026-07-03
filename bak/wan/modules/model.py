@@ -184,6 +184,15 @@ class WanSelfAttention(nn.Module):
         """
         b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
 
+        # 中文维度说明:
+        #   x 是 video token，来自 WAN patch embedding: [B, L_v, C_wan=3072]
+        #   n = num_heads=24, d = head_dim=128, C_wan = n*d
+        #   action_q/k/v 进入这里前已经被 ActionExpert 投到: [B, L_a, n, d]
+        #   und_q/k/v    进入这里前已经被 UndExpert 投到:    [B, L_u, n, d]
+        #
+        # 标准 WAN 只处理 video token；Motus 在这个函数里额外拼接 action/understanding token，
+        # 所以 MoT 的实际拼接位置就在这里。
+
         # query, key, value function
         def qkv_fn(x):
             q = self.norm_q(self.q(x)).view(b, s, n, d)
@@ -198,6 +207,9 @@ class WanSelfAttention(nn.Module):
             L_x = q.size(1)
             
             # Apply RoPE only to video tokens (q, k)
+            #   q/k/v video: [B, L_v, n=24, d=128]
+            # 只有 video token 有 3D 时空网格位置，所以这里只给 video q/k 加 RoPE；
+            # action 和 understanding token 没有使用 WAN 的 3D RoPE。
             q_video_rope = rope_apply(q, grid_sizes, freqs)
             k_video_rope = rope_apply(k, grid_sizes, freqs)
             
@@ -224,11 +236,14 @@ class WanSelfAttention(nn.Module):
             else:
                 L_und = 0
             
-            # Concatenate all modalities
+            # Concatenate all modalities along sequence length:
+            #   q_cat/k_cat/v_cat: [B, L_v + L_a + L_u, n=24, d=128]
+            # 这一步让三种 token 在同一次 attention 里互相可见。
             q_cat = torch.cat(q_parts, dim=1)
             k_cat = torch.cat(k_parts, dim=1)
             v_cat = torch.cat(v_parts, dim=1)
 
+            # attn_out: [B, L_v + L_a + L_u, n=24, d=128]
             attn_out = flash_attention(
                 q=q_cat,
                 k=k_cat,
@@ -236,7 +251,10 @@ class WanSelfAttention(nn.Module):
                 k_lens=seq_lens,
                 window_size=self.window_size)
 
-            # Split outputs back to respective modalities
+            # Split outputs back to respective modalities:
+            #   x_out/video:  [B, L_v, n, d]
+            #   action_out:   [B, L_a, n, d]
+            #   und_out:      [B, L_u, n, d]
             x_out = attn_out[:, :L_x, :, :]
             outputs = [x_out]
             
@@ -254,7 +272,9 @@ class WanSelfAttention(nn.Module):
             else:
                 outputs.append(None)
 
-            # Project WAN branch; other branches returned in head shape for external projection
+            # Project WAN branch; other branches returned in head shape for external projection:
+            #   video: [B, L_v, n, d] -> flatten -> [B, L_v, 3072] -> self.o -> [B, L_v, 3072]
+            #   action/und 不在这里投回，交给 ActionExpert/UndExpert 的 wan_action_o/wan_und_o。
             x_out = x_out.flatten(2)
             x_out = self.o(x_out)
             outputs[0] = x_out
