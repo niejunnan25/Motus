@@ -1,31 +1,30 @@
 common:
   # Full video length is 1 + num_video_frames.
-  # For V0, 16 target frames gives 17 total frames, which gives more than
-  # one middle latent slice after WAN VAE temporal compression.
+  # Tail4 conditions the first sampled frame plus the final 4 sampled frames:
+  # condition_idx, condition_idx + 39, +42, +45, +48.
+  # The model learns to generate sampled frames +3 through +36.
   num_video_frames: 16
+  tail_condition_frames: 4
   video_height: 448
   video_width: 224
 
   global_downsample_rate: 3
 
 dataset:
-  # Pure video bridge dataset. This uses the standard LeRobot v3 LIBERO
-  # layout:
-  #   data/chunk-000/file-000.parquet
-  #   meta/episodes/chunk-000/file-000.parquet
-  #   videos/observation.images.image/chunk-000/file-000.mp4
-  #   videos/observation.images.image2/chunk-000/file-000.mp4
   type: "video_bridge"
   dataset_dir:
     - "/mnt/workspace/users/niejunnan/lerobot_datasets/lerobot/libero"
   max_episodes: null
-  require_language_embedding: false
+  require_language_embedding: true
   data_format: "lerobot_v3_video"
   image_column: "observation.images.image"
   image_columns: ["observation.images.image", "observation.images.image2"]
   view_layout: "vertical"
   video_extensions: [".mp4"]
   cache_scan: false
+
+  task_language_embedding_dir: "/mnt/workspace/users/niejunnan/lerobot_datasets/lerobot/libero/umt5_wan_tasks"
+  task_language_embedding_pattern: "task_{task_index:06d}.pt"
 
 training_mode: "vgm_bridge_v0"
 
@@ -37,8 +36,6 @@ model:
     precision: "bfloat16"
 
 training:
-  # Per-GPU micro batch. With 2 GPUs and no gradient accumulation, the
-  # effective global batch size is 8.
   batch_size: 4
   gradient_accumulation_steps: 1
   max_steps: 50004
@@ -67,7 +64,7 @@ logging:
   report_to: "wandb"
   wandb_project: "motus"
   tensorboard_log_dir: "tensorboard_logs"
-  run_name: "vgm_bridge_v0_lerobot_video_448x224_2gpu_gbs8_50k"
+  run_name: "vgm_bridge_v0_lerobot_video_448x224_tail4_lang_17f_2gpu_gbs8_50k"
 
 resume:
   checkpoint_path: null

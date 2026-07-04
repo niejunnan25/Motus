@@ -1,8 +1,8 @@
 common:
   # Full video length is 1 + num_video_frames.
-  # For V0, 16 target frames gives 17 total frames, which gives more than
-  # one middle latent slice after WAN VAE temporal compression.
-  num_video_frames: 16
+  # This 9-frame run uses first + 8 target frames:
+  # condition_idx, condition_idx + 3, ..., condition_idx + 24.
+  num_video_frames: 8
   video_height: 448
   video_width: 224
 
@@ -38,7 +38,8 @@ model:
 
 training:
   # Per-GPU micro batch. With 2 GPUs and no gradient accumulation, the
-  # effective global batch size is 8.
+  # effective global batch size is 8. Keep this matched to the 17-frame run
+  # so the main variable is the bridge length.
   batch_size: 4
   gradient_accumulation_steps: 1
   max_steps: 50004
@@ -67,7 +68,7 @@ logging:
   report_to: "wandb"
   wandb_project: "motus"
   tensorboard_log_dir: "tensorboard_logs"
-  run_name: "vgm_bridge_v0_lerobot_video_448x224_2gpu_gbs8_50k"
+  run_name: "vgm_bridge_v0_lerobot_video_448x224_9f_2gpu_gbs8_50k"
 
 resume:
   checkpoint_path: null

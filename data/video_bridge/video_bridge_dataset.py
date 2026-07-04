@@ -160,6 +160,8 @@ class VideoBridgeDataset(data.Dataset):
         image_column: str = "image",
         image_columns: Optional[List[str]] = None,
         view_layout: str = "single",
+        task_language_embedding_dir: Optional[str] = None,
+        task_language_embedding_pattern: str = "task_{task_index:06d}.pt",
         cache_scan: bool = True,
         val: bool = False,
         **kwargs: Any,
@@ -179,6 +181,8 @@ class VideoBridgeDataset(data.Dataset):
         self.image_column = image_column
         self.image_columns = list(image_columns) if image_columns else [image_column]
         self.view_layout = view_layout
+        self.task_language_embedding_dir = task_language_embedding_dir
+        self.task_language_embedding_pattern = task_language_embedding_pattern
         self.cache_scan = bool(cache_scan)
         self.val = val
 
@@ -205,7 +209,7 @@ class VideoBridgeDataset(data.Dataset):
             cache_suffix += ".lang"
 
         for root in self.dataset_dir:
-            cache_file = root / f"cached_video_bridge_episodes.{cache_suffix}.v1.pkl"
+            cache_file = root / f"cached_video_bridge_episodes.{cache_suffix}.v2.pkl"
             if self.cache_scan and cache_file.exists():
                 with open(cache_file, "rb") as file:
                     cached_episodes = pickle.load(file)
@@ -317,10 +321,6 @@ class VideoBridgeDataset(data.Dataset):
 
     def _scan_lerobot_v3_video_root(self, root: Path) -> List[Dict[str, Any]]:
         cur_episodes: List[Dict[str, Any]] = []
-        if self.require_language_embedding:
-            logger.warning("LeRobot v3 video scan ignores roots requiring language embeddings: %s", root)
-            return cur_episodes
-
         leaf_dirs = _find_lerobot_v3_video_dirs(root)
         if not leaf_dirs:
             return cur_episodes
@@ -330,6 +330,10 @@ class VideoBridgeDataset(data.Dataset):
         pbar = tqdm(leaf_dirs)
         for leaf_dir in pbar:
             pbar.set_description(f"Scanning LeRobot v3 videos {leaf_dir}")
+            load_task_language = self.require_language_embedding or self.task_language_embedding_dir is not None
+            task_text_by_index = self._load_lerobot_v3_task_texts(leaf_dir, pd) if load_task_language else {}
+            episode_task_by_index = self._load_lerobot_v3_episode_tasks(leaf_dir, pd) if load_task_language else {}
+            task_embedding_dir = self._resolve_task_language_embedding_dir(leaf_dir) if load_task_language else None
             episode_files = sorted((leaf_dir / "meta" / "episodes").glob("chunk-*/file-*.parquet"))
             for episode_file in episode_files:
                 episodes_df = pd.read_parquet(episode_file)
@@ -363,6 +367,21 @@ class VideoBridgeDataset(data.Dataset):
                         continue
 
                     episode_index = int(row["episode_index"])
+                    task_index = episode_task_by_index.get(episode_index)
+                    task_text = task_text_by_index.get(task_index) if task_index is not None else None
+                    lang_path = (
+                        self._task_language_embedding_path(task_embedding_dir, task_index)
+                        if task_embedding_dir is not None
+                        else None
+                    )
+                    if self.require_language_embedding and lang_path is None:
+                        logger.warning(
+                            "Skipping %s/episode_%06d because no task language embedding was found",
+                            leaf_dir.name,
+                            episode_index,
+                        )
+                        continue
+
                     cur_episodes.append(
                         {
                             "format": "lerobot_v3_video",
@@ -370,10 +389,82 @@ class VideoBridgeDataset(data.Dataset):
                             "num_frames": int(row["length"]),
                             "root": str(leaf_dir),
                             "episode_name": f"{leaf_dir.name}/episode_{episode_index:06d}",
+                            "episode_index": episode_index,
+                            "task_index": task_index,
+                            "task_text": task_text,
+                            "lang_path": str(lang_path) if lang_path is not None else None,
                         }
                     )
 
         return cur_episodes
+
+    def _load_lerobot_v3_task_texts(self, leaf_dir: Path, pd: Any) -> Dict[int, str]:
+        tasks_path = leaf_dir / "meta" / "tasks.parquet"
+        if not tasks_path.exists():
+            if self.require_language_embedding:
+                logger.warning("LeRobot v3 tasks parquet is missing: %s", tasks_path)
+            return {}
+
+        tasks_df = pd.read_parquet(tasks_path)
+        task_text_by_index: Dict[int, str] = {}
+        for row_index, row in tasks_df.iterrows():
+            if "task_index" in row:
+                task_index = int(row["task_index"])
+            else:
+                try:
+                    task_index = int(row_index)
+                except Exception:
+                    continue
+
+            task_text = None
+            for column in ("task", "text", "instruction", "language_instruction"):
+                if column in row and row[column] is not None:
+                    task_text = str(row[column])
+                    break
+            if task_text is None:
+                task_text = str(row_index)
+            task_text_by_index[task_index] = task_text
+
+        return task_text_by_index
+
+    def _load_lerobot_v3_episode_tasks(self, leaf_dir: Path, pd: Any) -> Dict[int, int]:
+        episode_task_by_index: Dict[int, int] = {}
+        data_files = sorted((leaf_dir / "data").glob("chunk-*/file-*.parquet"))
+        for data_file in data_files:
+            try:
+                df = pd.read_parquet(data_file, columns=["episode_index", "task_index"])
+            except Exception as exc:
+                if self.require_language_embedding:
+                    logger.warning("Failed reading task_index from %s: %s", data_file, exc)
+                continue
+            if df.empty:
+                continue
+            reduced = df.drop_duplicates(subset=["episode_index"], keep="first")
+            for _, row in reduced.iterrows():
+                episode_task_by_index[int(row["episode_index"])] = int(row["task_index"])
+        return episode_task_by_index
+
+    def _resolve_task_language_embedding_dir(self, leaf_dir: Path) -> Path:
+        if self.task_language_embedding_dir:
+            embedding_dir = Path(self.task_language_embedding_dir)
+            if not embedding_dir.is_absolute():
+                embedding_dir = leaf_dir / embedding_dir
+            return embedding_dir
+        return leaf_dir / "umt5_wan_tasks"
+
+    def _task_language_embedding_path(self, embedding_dir: Path, task_index: Optional[int]) -> Optional[Path]:
+        if task_index is None:
+            return None
+        try:
+            filename = self.task_language_embedding_pattern.format(task_index=int(task_index))
+        except Exception:
+            filename = f"task_{int(task_index):06d}.pt"
+        candidate = embedding_dir / filename
+        if candidate.exists():
+            return candidate
+        if self.require_language_embedding:
+            logger.warning("Missing task language embedding: %s", candidate)
+        return None
 
     def __len__(self) -> int:
         return len(self.episodes) * 100
@@ -390,6 +481,58 @@ class VideoBridgeDataset(data.Dataset):
         condition_idx = random.randint(0, max_cond)
         video_indices = [condition_idx + (i + 1) * step for i in range(self.num_video_frames)]
         return condition_idx, video_indices
+
+    def _episode_frame_count(self, episode: Dict[str, Any]) -> int:
+        if episode.get("format", "video") == "lerobot_parquet":
+            return self._parquet_frame_count(episode["parquet_path"])
+        if episode.get("format") == "lerobot_v3_video":
+            return int(episode["num_frames"])
+        return get_video_frame_count(episode["video_path"])
+
+    def _load_episode_frames(self, episode: Dict[str, Any], frame_indices: List[int]) -> torch.Tensor:
+        if episode.get("format", "video") == "lerobot_parquet":
+            return self._load_lerobot_parquet_frames(episode["parquet_path"], frame_indices)
+        if episode.get("format") == "lerobot_v3_video":
+            return self._load_lerobot_v3_video_frames(episode, frame_indices)
+        return load_video_frames(episode["video_path"], frame_indices, self.video_size)
+
+    def get_bridge_window(self, episode_index: int, condition_idx: Optional[int] = None) -> Dict[str, Any]:
+        """Load a deterministic first-last bridge window for evaluation."""
+        if not self.episodes:
+            raise IndexError("VideoBridgeDataset has no episodes")
+
+        episode = self.episodes[episode_index % len(self.episodes)]
+        total_frames = self._episode_frame_count(episode)
+        max_cond = total_frames - 1 - self.num_video_frames * self.global_downsample_rate
+        if max_cond < 0:
+            raise ValueError(
+                f"Video is too short: total_frames={total_frames}, "
+                f"needs at least {1 + self.num_video_frames * self.global_downsample_rate}"
+            )
+
+        if condition_idx is None:
+            condition_idx = max_cond // 2
+        condition_idx = int(max(0, min(condition_idx, max_cond)))
+        video_indices = [
+            condition_idx + (i + 1) * self.global_downsample_rate
+            for i in range(self.num_video_frames)
+        ]
+        frame_indices = [condition_idx] + video_indices
+        frames = self._load_episode_frames(episode, frame_indices)
+        language_embedding = self._load_language_embedding(episode.get("lang_path"))
+
+        return {
+            "first_frame": frames[0],
+            "video_frames": frames[1:],
+            "language_embedding": language_embedding,
+            "episode_name": episode["episode_name"],
+            "video_path": episode.get("video_path", episode.get("parquet_path", episode.get("video_paths"))),
+            "task_index": episode.get("task_index"),
+            "task_text": episode.get("task_text"),
+            "condition_idx": condition_idx,
+            "frame_indices": frame_indices,
+            "total_frames": total_frames,
+        }
 
     def _load_language_embedding(self, lang_path: Optional[str]) -> Optional[torch.Tensor]:
         if lang_path is None:
@@ -511,23 +654,11 @@ class VideoBridgeDataset(data.Dataset):
         for _ in range(20):
             episode = random.choice(self.episodes)
             try:
-                if episode.get("format", "video") == "lerobot_parquet":
-                    total_frames = self._parquet_frame_count(episode["parquet_path"])
-                elif episode.get("format") == "lerobot_v3_video":
-                    total_frames = episode["num_frames"]
-                else:
-                    total_frames = get_video_frame_count(episode["video_path"])
-
+                total_frames = self._episode_frame_count(episode)
                 condition_idx, video_indices = self._select_indices(total_frames)
                 frame_indices = [condition_idx] + video_indices
 
-                if episode.get("format", "video") == "lerobot_parquet":
-                    frames = self._load_lerobot_parquet_frames(episode["parquet_path"], frame_indices)
-                elif episode.get("format") == "lerobot_v3_video":
-                    frames = self._load_lerobot_v3_video_frames(episode, frame_indices)
-                else:
-                    frames = load_video_frames(episode["video_path"], frame_indices, self.video_size)
-
+                frames = self._load_episode_frames(episode, frame_indices)
                 language_embedding = self._load_language_embedding(episode.get("lang_path"))
 
                 return {
@@ -536,6 +667,8 @@ class VideoBridgeDataset(data.Dataset):
                     "language_embedding": language_embedding,
                     "episode_name": episode["episode_name"],
                     "video_path": episode.get("video_path", episode.get("parquet_path", episode.get("video_paths"))),
+                    "task_index": episode.get("task_index"),
+                    "task_text": episode.get("task_text"),
                 }
             except Exception as exc:
                 logger.warning(

@@ -282,6 +282,7 @@ def create_model_and_optimizer(config: OmegaConf) -> tuple[VGMBridgeStage1, torc
         video_height=config.common.video_height,
         video_width=config.common.video_width,
         batch_size=config.training.batch_size,
+        tail_condition_frames=config.common.get("tail_condition_frames", 1),
         load_pretrained_backbones=getattr(config.model, "load_pretrained_backbones", None),
     )
     model = VGMBridgeStage1(model_config)
@@ -326,6 +327,8 @@ def create_train_dataloader(config: OmegaConf, rank: int, world_size: int) -> Da
         image_column=config.dataset.get("image_column", "image"),
         image_columns=config.dataset.get("image_columns", None),
         view_layout=config.dataset.get("view_layout", "single"),
+        task_language_embedding_dir=config.dataset.get("task_language_embedding_dir", None),
+        task_language_embedding_pattern=config.dataset.get("task_language_embedding_pattern", "task_{task_index:06d}.pt"),
         cache_scan=config.dataset.get("cache_scan", True),
         val=False,
     )
