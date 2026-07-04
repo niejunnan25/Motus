@@ -1,5 +1,7 @@
 # VGM Bridge Stage1 Eval Assets
 
+See `docs/vgm_bridge_stage1_visualization.md` for the generation and comparison workflow.
+
 These images use the same LIBERO fixed window:
 
 - sample: `sample_000`
