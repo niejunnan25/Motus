@@ -33,7 +33,7 @@ class VGMBridgeStage1Config:
 
 
 class VGMBridgeStage1(nn.Module):
-    """V0 first-last-frame bridge training for the WAN video prior only."""
+    """Stage1 WAN video-prior training with first-frame and optional tail conditioning."""
 
     def __init__(self, config: VGMBridgeStage1Config):
         super().__init__()
@@ -41,8 +41,8 @@ class VGMBridgeStage1(nn.Module):
             raise RuntimeError("VGMBridgeStage1 requires CUDA; run this entrypoint on the training server.")
 
         self.config = config
-        if config.tail_condition_frames < 1:
-            raise ValueError("tail_condition_frames must be >= 1")
+        if config.tail_condition_frames < 0:
+            raise ValueError("tail_condition_frames must be >= 0")
         if config.tail_condition_frames > config.num_video_frames:
             raise ValueError("tail_condition_frames must be <= num_video_frames")
         self.dtype = {
@@ -122,7 +122,36 @@ class VGMBridgeStage1(nn.Module):
         pt, ph, pw = self.video_model.wan_model.patch_size
         return (t // pt) * (h // ph) * (w // pw)
 
-    def _known_endpoint_mask(self, latent: torch.Tensor) -> torch.Tensor:
+    def _timestep_tokens(
+        self,
+        timestep: torch.Tensor,
+        latent: torch.Tensor,
+        known_mask: torch.Tensor,
+        seq_len: int,
+    ) -> torch.Tensor:
+        tokens = timestep.unsqueeze(1).expand(timestep.shape[0], seq_len).clone()
+
+        _, _, t, h, w = latent.shape
+        pt, ph, pw = self.video_model.wan_model.patch_size
+        if t % pt != 0 or h % ph != 0 or w % pw != 0:
+            raise ValueError(
+                f"Latent shape {(t, h, w)} is not divisible by WAN patch_size {(pt, ph, pw)}"
+            )
+
+        frame_known = known_mask[:, 0, :, 0, 0].bool()
+        if pt > 1:
+            frame_known = frame_known.view(frame_known.shape[0], t // pt, pt).any(dim=2)
+        patch_known = frame_known[:, :, None, None].expand(-1, -1, h // ph, w // pw)
+        patch_known = patch_known.reshape(frame_known.shape[0], -1)
+        if patch_known.shape[1] < seq_len:
+            pad = patch_known.new_zeros(patch_known.shape[0], seq_len - patch_known.shape[1])
+            patch_known = torch.cat([patch_known, pad], dim=1)
+        elif patch_known.shape[1] > seq_len:
+            patch_known = patch_known[:, :seq_len]
+
+        return tokens.masked_fill(patch_known, 0)
+
+    def _known_condition_mask(self, latent: torch.Tensor) -> torch.Tensor:
         mask = torch.zeros(
             latent.shape[0],
             1,
@@ -133,7 +162,8 @@ class VGMBridgeStage1(nn.Module):
             dtype=latent.dtype,
         )
         mask[:, :, 0:1] = 1
-        mask[:, :, -1:] = 1
+        if int(self.config.tail_condition_frames) > 0:
+            mask[:, :, -1:] = 1
         return mask
 
     def _make_condition_video(
@@ -144,14 +174,15 @@ class VGMBridgeStage1(nn.Module):
     ) -> torch.Tensor:
         batch_size = first_frame.shape[0]
         tail_n = int(self.config.tail_condition_frames)
-        if tail_frames is None:
-            if last_frame is None:
-                raise ValueError("Either last_frame or tail_frames must be provided")
-            tail_frames = last_frame.unsqueeze(1).expand(-1, tail_n, -1, -1, -1)
-        elif tail_frames.shape[1] != tail_n:
-            raise ValueError(
-                f"Expected tail_frames with {tail_n} frames, got shape={tuple(tail_frames.shape)}"
-            )
+        if tail_n > 0:
+            if tail_frames is None:
+                if last_frame is None:
+                    raise ValueError("Either last_frame or tail_frames must be provided")
+                tail_frames = last_frame.unsqueeze(1).expand(-1, tail_n, -1, -1, -1)
+            elif tail_frames.shape[1] != tail_n:
+                raise ValueError(
+                    f"Expected tail_frames with {tail_n} frames, got shape={tuple(tail_frames.shape)}"
+                )
 
         condition_video = first_frame.new_zeros(
             batch_size,
@@ -161,7 +192,8 @@ class VGMBridgeStage1(nn.Module):
             first_frame.shape[3],
         )
         condition_video[:, :, 0] = first_frame * 2.0 - 1.0
-        condition_video[:, :, -tail_n:] = (tail_frames * 2.0 - 1.0).permute(0, 2, 1, 3, 4)
+        if tail_n > 0:
+            condition_video[:, :, -tail_n:] = (tail_frames * 2.0 - 1.0).permute(0, 2, 1, 3, 4)
         return condition_video
 
     def training_step(
@@ -171,7 +203,7 @@ class VGMBridgeStage1(nn.Module):
         language_embeddings: Optional[torch.Tensor] = None,
         return_dict: bool = True,
     ) -> Dict[str, torch.Tensor]:
-        """Train V0: endpoint latent clamp + middle-only flow matching loss."""
+        """Train V0: first latent clamp plus optional tail latent clamp."""
         batch_size = video_frames.shape[0]
 
         first_frame_norm = (first_frame * 2.0 - 1.0).unsqueeze(2)
@@ -181,11 +213,17 @@ class VGMBridgeStage1(nn.Module):
         condition_video = torch.zeros_like(full_video)
         condition_video[:, :, 0:1] = full_video[:, :, 0:1]
         tail_n = int(self.config.tail_condition_frames)
-        condition_video[:, :, -tail_n:] = full_video[:, :, -tail_n:]
+        if tail_n > 0:
+            condition_video[:, :, -tail_n:] = full_video[:, :, -tail_n:]
 
         with torch.no_grad():
             clean_full_latent = self.video_model.encode_video(full_video.to(self.dtype))
-            condition_latent = self.video_model.encode_video(condition_video.to(self.dtype))
+            if tail_n > 0:
+                condition_latent = self.video_model.encode_video(condition_video.to(self.dtype))
+            else:
+                first_frame_latent = self.video_model.encode_video(first_frame_norm.to(self.dtype))
+                condition_latent = torch.zeros_like(clean_full_latent)
+                condition_latent[:, :, 0:1] = first_frame_latent
 
         timestep_id = torch.randint(
             0,
@@ -204,14 +242,19 @@ class VGMBridgeStage1(nn.Module):
         video_noise = torch.randn_like(clean_full_latent, dtype=self.dtype)
         noisy_video_latent = clean_full_latent * (1 - sigma) + video_noise * sigma
 
-        known_mask = self._known_endpoint_mask(clean_full_latent)
+        known_mask = self._known_condition_mask(clean_full_latent)
         noisy_video_latent = noisy_video_latent * (1 - known_mask) + condition_latent * known_mask
 
         video_target = video_noise - clean_full_latent
         video_target = video_target * (1 - known_mask)
 
         seq_len = self._wan_seq_len(noisy_video_latent)
-        timestep_tokens = video_t_embed.unsqueeze(1).expand(batch_size, seq_len)
+        timestep_tokens = self._timestep_tokens(
+            timestep=video_t_embed,
+            latent=noisy_video_latent,
+            known_mask=known_mask,
+            seq_len=seq_len,
+        )
         context = self._context_list(language_embeddings, batch_size)
         latent_list = [noisy_video_latent[i] for i in range(batch_size)]
 
@@ -249,7 +292,7 @@ class VGMBridgeStage1(nn.Module):
         num_inference_steps: int = 30,
         generator: Optional[torch.Generator] = None,
     ) -> torch.Tensor:
-        """Generate a first-last-frame bridge video in pixel space [B, T, C, H, W]."""
+        """Generate a conditioned video in pixel space [B, T, C, H, W]."""
         was_training = self.training
         self.eval()
         try:
@@ -266,7 +309,12 @@ class VGMBridgeStage1(nn.Module):
                 tail_frames=tail_frames,
             )
             condition_latent = self.video_model.encode_video(condition_video.to(self.dtype))
-            known_mask = self._known_endpoint_mask(condition_latent)
+            if int(self.config.tail_condition_frames) == 0:
+                first_frame_norm = (first_frame * 2.0 - 1.0).unsqueeze(2)
+                first_frame_latent = self.video_model.encode_video(first_frame_norm.to(self.dtype))
+                condition_latent.zero_()
+                condition_latent[:, :, 0:1] = first_frame_latent
+            known_mask = self._known_condition_mask(condition_latent)
 
             latent = torch.randn(
                 condition_latent.shape,
@@ -290,7 +338,12 @@ class VGMBridgeStage1(nn.Module):
             context = self._context_list(language_embeddings, batch_size)
 
             for step_idx, timestep in enumerate(timesteps):
-                timestep_tokens = timestep.expand(batch_size, seq_len)
+                timestep_tokens = self._timestep_tokens(
+                    timestep=timestep.expand(batch_size),
+                    latent=latent,
+                    known_mask=known_mask,
+                    seq_len=seq_len,
+                )
                 latent_list = [latent[i] for i in range(batch_size)]
                 with torch.autocast(device_type="cuda", dtype=self.video_model.precision):
                     pred_list = self.video_model.wan_model(

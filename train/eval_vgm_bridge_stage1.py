@@ -234,7 +234,7 @@ def pixel_metrics(gt_full: torch.Tensor, pred_full: torch.Tensor, tail_condition
     frame_count = min(gt_full.shape[1], pred_full.shape[1])
     gt_full = gt_full[:, :frame_count]
     pred_full = pred_full[:, :frame_count]
-    tail_condition_frames = max(1, min(int(tail_condition_frames), frame_count - 1))
+    tail_condition_frames = max(0, min(int(tail_condition_frames), frame_count - 1))
 
     metrics: Dict[str, float] = {}
     full_mse = F.mse_loss(pred_full, gt_full).item()
@@ -259,8 +259,13 @@ def pixel_metrics(gt_full: torch.Tensor, pred_full: torch.Tensor, tail_condition
         metrics["generated_psnr"] = psnr_from_mse(generated_mse)
         metrics["generated_mae"] = F.l1_loss(generated_pred, generated_gt).item()
 
-    condition_gt = torch.cat([gt_full[:, 0:1], gt_full[:, -tail_condition_frames:]], dim=1)
-    condition_pred = torch.cat([pred_full[:, 0:1], pred_full[:, -tail_condition_frames:]], dim=1)
+    condition_parts_gt = [gt_full[:, 0:1]]
+    condition_parts_pred = [pred_full[:, 0:1]]
+    if tail_condition_frames > 0:
+        condition_parts_gt.append(gt_full[:, -tail_condition_frames:])
+        condition_parts_pred.append(pred_full[:, -tail_condition_frames:])
+    condition_gt = torch.cat(condition_parts_gt, dim=1)
+    condition_pred = torch.cat(condition_parts_pred, dim=1)
     condition_mse = F.mse_loss(condition_pred, condition_gt).item()
     metrics["condition_mse"] = condition_mse
     metrics["condition_psnr"] = psnr_from_mse(condition_mse)
@@ -327,9 +332,9 @@ def evaluate_samples(
     for batch_idx, batch in enumerate(batched(windows, batch_size)):
         first_frame = batch["first_frame"].to(model.device, dtype=model.dtype)
         video_frames = batch["video_frames"].to(model.device, dtype=model.dtype)
-        last_frame = video_frames[:, -1]
         tail_n = int(model.config.tail_condition_frames)
-        tail_frames = video_frames[:, -tail_n:]
+        last_frame = video_frames[:, -1] if tail_n > 0 else None
+        tail_frames = video_frames[:, -tail_n:] if tail_n > 0 else None
         language_embeddings = batch["language_embedding"]
         if language_embeddings is not None:
             language_embeddings = language_embeddings.to(model.device, dtype=model.dtype)
