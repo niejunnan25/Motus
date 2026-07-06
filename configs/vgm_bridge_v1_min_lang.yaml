@@ -1,0 +1,73 @@
+common:
+  # V1-min uses Wan-style mask-guided conditioning:
+  # input = noisy latent + condition latent + frame mask.
+  # The first latent is hard-clamped, but the last latent chunk is generated
+  # and supervised instead of being clamped to [zero, zero, zero, last].
+  num_video_frames: 16
+  tail_condition_frames: 1
+  conditioning_mode: "v1_mask"
+  mask_channels: 4
+  video_height: 448
+  video_width: 224
+
+  global_downsample_rate: 3
+
+dataset:
+  type: "video_bridge"
+  dataset_dir:
+    - "/mnt/workspace/users/niejunnan/lerobot_datasets/lerobot/libero"
+  max_episodes: null
+  require_language_embedding: true
+  data_format: "lerobot_v3_video"
+  image_column: "observation.images.image"
+  image_columns: ["observation.images.image", "observation.images.image2"]
+  view_layout: "vertical"
+  video_extensions: [".mp4"]
+  cache_scan: false
+
+  task_language_embedding_dir: "/mnt/workspace/users/niejunnan/lerobot_datasets/lerobot/libero/umt5_wan_tasks"
+  task_language_embedding_pattern: "task_{task_index:06d}.pt"
+
+training_mode: "vgm_bridge_stage1"
+
+model:
+  wan:
+    config_path: "/mnt/workspace/users/niejunnan/codebase/Motus/pretrained_models/Wan2.2-TI2V-5B"
+    checkpoint_path: "/mnt/workspace/users/niejunnan/codebase/Motus/pretrained_models/Wan2.2-TI2V-5B"
+    vae_path: "/mnt/workspace/users/niejunnan/codebase/Motus/pretrained_models/Wan2.2-TI2V-5B/Wan2.2_VAE.pth"
+    precision: "bfloat16"
+
+training:
+  batch_size: 4
+  gradient_accumulation_steps: 1
+  max_steps: 50004
+  learning_rate: 1.0e-5
+  weight_decay: 0.01
+
+  scheduler_type: "diffusers_cosine"
+  warmup_steps: 1000
+  lr_schedule_steps: 50004
+  min_lr: 1.0e-6
+
+  grad_clip_norm: 0.5
+  use_amp: true
+  find_unused_parameters: false
+
+system:
+  checkpoint_dir: "./checkpoints"
+  log_level: "INFO"
+  log_interval: 1
+  save_interval: 2500
+  val_interval: 1000000000
+  num_workers: 16
+  pin_memory: true
+
+logging:
+  report_to: "wandb"
+  wandb_project: "motus"
+  tensorboard_log_dir: "tensorboard_logs"
+  run_name: "vgm_bridge_v1_min_lerobot_video_448x224_lang_17f_2gpu_gbs8_50k"
+
+resume:
+  checkpoint_path: null
+  reset_scheduler: false

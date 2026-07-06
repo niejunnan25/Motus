@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Training entrypoint for VGM bridge stage1 V0."""
+"""Training entrypoint for VGM bridge stage1 experiments."""
 
 import argparse
 import logging
@@ -75,7 +75,7 @@ def normalize_report_to(value: Any) -> list[str]:
 
 
 class VGMBridgeStage1Trainer:
-    """Minimal trainer for first-last-frame bridge training."""
+    """Minimal trainer for VGM bridge stage1 training."""
 
     def __init__(
         self,
@@ -273,6 +273,11 @@ class VGMBridgeStage1Trainer:
 
 def create_model_and_optimizer(config: OmegaConf) -> tuple[VGMBridgeStage1, torch.optim.Optimizer, Any]:
     """Create VGM bridge model, optimizer, and scheduler."""
+    logger.info(
+        "VGM conditioning_mode=%s, tail_condition_frames=%s",
+        config.common.get("conditioning_mode", "v0"),
+        config.common.get("tail_condition_frames", 1),
+    )
     model_config = VGMBridgeStage1Config(
         wan_checkpoint_path=config.model.wan.checkpoint_path,
         vae_path=config.model.wan.vae_path,
@@ -283,6 +288,8 @@ def create_model_and_optimizer(config: OmegaConf) -> tuple[VGMBridgeStage1, torc
         video_width=config.common.video_width,
         batch_size=config.training.batch_size,
         tail_condition_frames=config.common.get("tail_condition_frames", 1),
+        conditioning_mode=config.common.get("conditioning_mode", "v0"),
+        mask_channels=config.common.get("mask_channels", 4),
         load_pretrained_backbones=getattr(config.model, "load_pretrained_backbones", None),
     )
     model = VGMBridgeStage1(model_config)
@@ -304,7 +311,7 @@ def create_model_and_optimizer(config: OmegaConf) -> tuple[VGMBridgeStage1, torc
 
 
 def create_train_dataloader(config: OmegaConf, rank: int, world_size: int) -> DataLoader:
-    """Create train dataloader only; stage1 V0 has no validation path."""
+    """Create train dataloader only; stage1 currently has no validation path."""
     if config.dataset.type != "video_bridge":
         raise ValueError(
             "train_vgm_bridge_stage1.py expects dataset.type='video_bridge'. "
@@ -313,7 +320,7 @@ def create_train_dataloader(config: OmegaConf, rank: int, world_size: int) -> Da
 
     dataset_dir = config.dataset.get("dataset_dir", None)
     if dataset_dir is None or len(dataset_dir) == 0:
-        raise ValueError("Fill configs/vgm_bridge_v0.yaml: dataset.dataset_dir with your video dataset root(s).")
+        raise ValueError("Fill dataset.dataset_dir in the selected VGM bridge config with your video dataset root(s).")
 
     train_dataset = VideoBridgeDataset(
         dataset_dir=[str(path) for path in dataset_dir],
@@ -366,8 +373,11 @@ def main() -> None:
     args = parser.parse_args()
 
     config = load_config(args.config)
-    if getattr(config, "training_mode", None) != "vgm_bridge_v0":
-        logger.warning("Expected training_mode=vgm_bridge_v0, got %s", getattr(config, "training_mode", None))
+    if getattr(config, "training_mode", None) not in {"vgm_bridge_v0", "vgm_bridge_stage1"}:
+        logger.warning(
+            "Expected training_mode=vgm_bridge_v0 or vgm_bridge_stage1, got %s",
+            getattr(config, "training_mode", None),
+        )
 
     if args.checkpoint_dir is not None:
         config.system.checkpoint_dir = args.checkpoint_dir

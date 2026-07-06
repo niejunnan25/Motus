@@ -83,6 +83,8 @@ def build_model(config: Any, checkpoint_path: Path) -> VGMBridgeStage1:
         video_width=config.common.video_width,
         batch_size=config.training.batch_size,
         tail_condition_frames=config.common.get("tail_condition_frames", 1),
+        conditioning_mode=config.common.get("conditioning_mode", "v0"),
+        mask_channels=config.common.get("mask_channels", 4),
         load_pretrained_backbones=False,
     )
     model = VGMBridgeStage1(model_config)
