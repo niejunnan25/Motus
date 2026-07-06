@@ -1,0 +1,84 @@
+common:
+  # V2-A finetune: start from V1-proper 50k and train another 50k steps
+  # with interaction-weighted latent flow loss.
+  num_video_frames: 16
+  tail_condition_frames: 1
+  conditioning_mode: "v1_mask_endpoint"
+  mask_channels: 4
+  video_height: 448
+  video_width: 224
+
+  global_downsample_rate: 3
+
+  state_condition_mode: "none"
+
+  interaction_loss_enabled: true
+  interaction_motion_weight: 2.0
+  interaction_edge_weight: 1.0
+  interaction_max_weight: 4.0
+  interaction_warmup_steps: 2000
+
+dataset:
+  type: "video_bridge"
+  dataset_dir:
+    - "/mnt/workspace/users/niejunnan/lerobot_datasets/lerobot/libero"
+  max_episodes: null
+  require_language_embedding: true
+  data_format: "lerobot_v3_video"
+  image_column: "observation.images.image"
+  image_columns: ["observation.images.image", "observation.images.image2"]
+  view_layout: "vertical"
+  video_extensions: [".mp4"]
+  cache_scan: false
+  load_state: false
+
+  task_language_embedding_dir: "/mnt/workspace/users/niejunnan/lerobot_datasets/lerobot/libero/umt5_wan_tasks"
+  task_language_embedding_pattern: "task_{task_index:06d}.pt"
+
+training_mode: "vgm_bridge_stage1"
+
+model:
+  wan:
+    config_path: "/mnt/workspace/users/niejunnan/codebase/Motus/pretrained_models/Wan2.2-TI2V-5B"
+    checkpoint_path: "/mnt/workspace/users/niejunnan/codebase/Motus/pretrained_models/Wan2.2-TI2V-5B"
+    vae_path: "/mnt/workspace/users/niejunnan/codebase/Motus/pretrained_models/Wan2.2-TI2V-5B/Wan2.2_VAE.pth"
+    precision: "bfloat16"
+
+training:
+  batch_size: 4
+  gradient_accumulation_steps: 1
+  max_steps: 50004
+  learning_rate: 5.0e-6
+  weight_decay: 0.01
+
+  scheduler_type: "diffusers_cosine"
+  warmup_steps: 1000
+  lr_schedule_steps: 50004
+  min_lr: 5.0e-7
+
+  grad_clip_norm: 0.5
+  use_amp: true
+  find_unused_parameters: false
+
+system:
+  checkpoint_dir: "./checkpoints"
+  log_level: "INFO"
+  log_interval: 1
+  save_interval: 2500
+  val_interval: 1000000000
+  num_workers: 16
+  pin_memory: true
+
+logging:
+  report_to: "wandb"
+  wandb_project: "motus"
+  tensorboard_log_dir: "tensorboard_logs"
+  run_name: "vgm_bridge_v2_a_roi_lerobot_video_448x224_lang_17f_2gpu_gbs8_ft50k"
+
+finetune:
+  checkpoint_path: "/mnt/workspace1/users/niejunnan/codebase/Motus/checkpoints/vgm_bridge_v1_proper_lang/vgm_bridge_v1_proper_lerobot_video_448x224_lang_17f_2gpu_gbs8_50k/checkpoint_step_50004"
+  strict: false
+
+resume:
+  checkpoint_path: null
+  reset_scheduler: false

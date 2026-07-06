@@ -559,14 +559,14 @@ class VideoBridgeDataset(data.Dataset):
         if isinstance(cell, torch.Tensor):
             tensor = cell.detach().cpu().float()
         elif isinstance(cell, np.ndarray):
-            tensor = torch.from_numpy(cell).float()
+            tensor = torch.from_numpy(np.array(cell, copy=True)).float()
         elif isinstance(cell, (list, tuple)):
             tensor = torch.tensor(cell, dtype=torch.float32)
         elif np.isscalar(cell):
             tensor = torch.tensor([cell], dtype=torch.float32)
         else:
             try:
-                tensor = torch.tensor(np.asarray(cell), dtype=torch.float32)
+                tensor = torch.tensor(np.array(cell, copy=True), dtype=torch.float32)
             except Exception as exc:
                 raise TypeError(f"Unsupported state cell type: {type(cell)}") from exc
         return tensor.flatten()
@@ -593,7 +593,7 @@ class VideoBridgeDataset(data.Dataset):
         frames = []
         has_frame_index = False
         for data_path in data_paths:
-            schema_names = set(pq.ParquetFile(data_path).schema.names)
+            schema_names = set(pq.ParquetFile(data_path).schema_arrow.names)
             if self.state_column not in schema_names:
                 raise KeyError(f"Missing state column {self.state_column!r} in {data_path}")
             columns = ["episode_index", self.state_column]
