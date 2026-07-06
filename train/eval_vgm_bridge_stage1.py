@@ -67,6 +67,11 @@ def build_dataset(config: Any, max_episodes: Optional[int] = None) -> VideoBridg
         view_layout=config.dataset.get("view_layout", "single"),
         task_language_embedding_dir=config.dataset.get("task_language_embedding_dir", None),
         task_language_embedding_pattern=config.dataset.get("task_language_embedding_pattern", "task_{task_index:06d}.pt"),
+        load_state=config.dataset.get(
+            "load_state",
+            config.common.get("state_condition_mode", "none") != "none",
+        ),
+        state_column=config.dataset.get("state_column", "observation.state"),
         cache_scan=config.dataset.get("cache_scan", True),
         val=True,
     )
@@ -85,6 +90,16 @@ def build_model(config: Any, checkpoint_path: Path) -> VGMBridgeStage1:
         tail_condition_frames=config.common.get("tail_condition_frames", 1),
         conditioning_mode=config.common.get("conditioning_mode", "v0"),
         mask_channels=config.common.get("mask_channels", 4),
+        interaction_loss_enabled=config.common.get("interaction_loss_enabled", False),
+        interaction_motion_weight=config.common.get("interaction_motion_weight", 0.0),
+        interaction_edge_weight=config.common.get("interaction_edge_weight", 0.0),
+        interaction_max_weight=config.common.get("interaction_max_weight", 4.0),
+        interaction_warmup_steps=config.common.get("interaction_warmup_steps", 0),
+        state_condition_mode=config.common.get("state_condition_mode", "none"),
+        state_num_tokens=config.common.get("state_num_tokens", 4),
+        state_hidden_dim=config.common.get("state_hidden_dim", 1024),
+        state_dropout=config.common.get("state_dropout", 0.0),
+        state_clip=config.common.get("state_clip", 10.0),
         load_pretrained_backbones=False,
     )
     model = VGMBridgeStage1(model_config)
@@ -232,6 +247,34 @@ def psnr_from_mse(mse: float) -> float:
     return -10.0 * math.log10(max(mse, 1e-12))
 
 
+def normalize_positive_map(value: torch.Tensor) -> torch.Tensor:
+    mean = value.mean(dim=tuple(range(1, value.dim())), keepdim=True).clamp_min(1e-6)
+    return value / mean
+
+
+def edge_strength_video(video: torch.Tensor) -> torch.Tensor:
+    """Return Sobel edge strength for [B, T, C, H, W] videos as [B, T, 1, H, W]."""
+    batch_size, frame_count, _, height, width = video.shape
+    gray = video.mean(dim=2, keepdim=True)
+    flat = gray.reshape(batch_size * frame_count, 1, height, width)
+    kernel_x = flat.new_tensor(
+        [[[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]]]
+    ).unsqueeze(0)
+    kernel_y = flat.new_tensor(
+        [[[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]]]
+    ).unsqueeze(0)
+    grad_x = F.conv2d(flat, kernel_x, padding=1)
+    grad_y = F.conv2d(flat, kernel_y, padding=1)
+    edge = torch.sqrt(grad_x.pow(2) + grad_y.pow(2) + 1e-8)
+    return edge.view(batch_size, frame_count, 1, height, width)
+
+
+def weighted_video_mse(gt: torch.Tensor, pred: torch.Tensor, weight: torch.Tensor) -> float:
+    error = (pred - gt).pow(2).mean(dim=2, keepdim=True)
+    weighted = error * weight
+    return (weighted.sum() / weight.sum().clamp_min(1.0)).item()
+
+
 def pixel_metrics(gt_full: torch.Tensor, pred_full: torch.Tensor, tail_condition_frames: int = 1) -> Dict[str, float]:
     frame_count = min(gt_full.shape[1], pred_full.shape[1])
     gt_full = gt_full[:, :frame_count]
@@ -260,6 +303,25 @@ def pixel_metrics(gt_full: torch.Tensor, pred_full: torch.Tensor, tail_condition
         metrics["generated_mse"] = generated_mse
         metrics["generated_psnr"] = psnr_from_mse(generated_mse)
         metrics["generated_mae"] = F.l1_loss(generated_pred, generated_gt).item()
+
+        motion = gt_full.new_zeros(gt_full.shape[0], frame_count, 1, gt_full.shape[-2], gt_full.shape[-1])
+        motion[:, 1:] = (gt_full[:, 1:] - gt_full[:, :-1]).abs().mean(dim=2, keepdim=True)
+        generated_motion = normalize_positive_map(motion[:, 1:generated_end])
+        motion_mse = weighted_video_mse(generated_gt, generated_pred, generated_motion)
+        metrics["generated_motion_mse"] = motion_mse
+        metrics["generated_motion_psnr"] = psnr_from_mse(motion_mse)
+
+        edge = edge_strength_video(gt_full)
+        generated_edge = normalize_positive_map(edge[:, 1:generated_end])
+        edge_mse = weighted_video_mse(generated_gt, generated_pred, generated_edge)
+        metrics["generated_edge_mse"] = edge_mse
+        metrics["generated_edge_psnr"] = psnr_from_mse(edge_mse)
+
+        interaction_weight = (1.0 + 2.0 * generated_motion + generated_edge).clamp(max=4.0)
+        interaction_weight = normalize_positive_map(interaction_weight)
+        interaction_mse = weighted_video_mse(generated_gt, generated_pred, interaction_weight)
+        metrics["generated_interaction_mse"] = interaction_mse
+        metrics["generated_interaction_psnr"] = psnr_from_mse(interaction_mse)
 
     condition_parts_gt = [gt_full[:, 0:1]]
     condition_parts_pred = [pred_full[:, 0:1]]
@@ -306,10 +368,18 @@ def evaluate_loss(
             language_embeddings = batch["language_embedding"]
             if language_embeddings is not None:
                 language_embeddings = language_embeddings.to(model.device, dtype=model.dtype)
+            first_state = batch.get("first_state")
+            last_state = batch.get("last_state")
+            if first_state is not None:
+                first_state = first_state.to(model.device, dtype=model.dtype)
+            if last_state is not None:
+                last_state = last_state.to(model.device, dtype=model.dtype)
             loss_dict = model.training_step(
                 first_frame=first_frame,
                 video_frames=video_frames,
                 language_embeddings=language_embeddings,
+                first_state=first_state,
+                last_state=last_state,
                 return_dict=True,
             )
             rows.append({key: float(value.detach().cpu()) for key, value in loss_dict.items()})
@@ -340,6 +410,12 @@ def evaluate_samples(
         language_embeddings = batch["language_embedding"]
         if language_embeddings is not None:
             language_embeddings = language_embeddings.to(model.device, dtype=model.dtype)
+        first_state = batch.get("first_state")
+        last_state = batch.get("last_state")
+        if first_state is not None:
+            first_state = first_state.to(model.device, dtype=model.dtype)
+        if last_state is not None:
+            last_state = last_state.to(model.device, dtype=model.dtype)
 
         generator = torch.Generator(device=model.device).manual_seed(seed + batch_idx)
         pred_full = model.sample_bridge(
@@ -347,6 +423,8 @@ def evaluate_samples(
             last_frame=last_frame,
             tail_frames=tail_frames,
             language_embeddings=language_embeddings,
+            first_state=first_state,
+            last_state=last_state,
             num_inference_steps=num_inference_steps,
             generator=generator,
         )

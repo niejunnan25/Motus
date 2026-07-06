@@ -113,6 +113,15 @@ def _process_language_embeddings_batch(
     return torch.stack(padded_embeddings, dim=0)
 
 
+def _process_state_tensors_batch(states: List[Optional[torch.Tensor]]) -> Optional[torch.Tensor]:
+    """Stack optional state tensors, returning None when the batch has no states."""
+    if not states or all(state is None for state in states):
+        return None
+    if any(state is None for state in states):
+        raise ValueError("Mixed state/no-state samples in one batch")
+    return torch.stack([state.float() for state in states if state is not None], dim=0)
+
+
 def video_bridge_collate_fn(batch: List[Optional[Dict[str, Any]]]) -> Optional[Dict[str, Any]]:
     """Collate pure video bridge samples."""
     batch = [sample for sample in batch if sample is not None]
@@ -125,6 +134,9 @@ def video_bridge_collate_fn(batch: List[Optional[Dict[str, Any]]]) -> Optional[D
         "language_embedding": _process_language_embeddings_batch(
             [sample.get("language_embedding") for sample in batch]
         ),
+        "first_state": _process_state_tensors_batch([sample.get("first_state") for sample in batch]),
+        "video_states": _process_state_tensors_batch([sample.get("video_states") for sample in batch]),
+        "last_state": _process_state_tensors_batch([sample.get("last_state") for sample in batch]),
         "episode_name": [sample.get("episode_name") for sample in batch],
         "video_path": [sample.get("video_path") for sample in batch],
     }
@@ -162,6 +174,8 @@ class VideoBridgeDataset(data.Dataset):
         view_layout: str = "single",
         task_language_embedding_dir: Optional[str] = None,
         task_language_embedding_pattern: str = "task_{task_index:06d}.pt",
+        load_state: bool = False,
+        state_column: str = "observation.state",
         cache_scan: bool = True,
         val: bool = False,
         **kwargs: Any,
@@ -183,8 +197,11 @@ class VideoBridgeDataset(data.Dataset):
         self.view_layout = view_layout
         self.task_language_embedding_dir = task_language_embedding_dir
         self.task_language_embedding_pattern = task_language_embedding_pattern
+        self.load_state = bool(load_state)
+        self.state_column = str(state_column)
         self.cache_scan = bool(cache_scan)
         self.val = val
+        self._state_cache: Dict[str, Tuple[torch.Tensor, Optional[Dict[int, int]]]] = {}
 
         self.episodes = self._scan_all_episodes()
         if self.max_episodes is not None and self.max_episodes > 0:
@@ -207,6 +224,9 @@ class VideoBridgeDataset(data.Dataset):
         cache_suffix = f"{self.data_format}.{image_key}.{self.view_layout}"
         if self.require_language_embedding:
             cache_suffix += ".lang"
+        if self.load_state:
+            safe_state_column = self.state_column.replace("/", "_").replace(".", "_")
+            cache_suffix += f".state.{safe_state_column}"
 
         for root in self.dataset_dir:
             cache_file = root / f"cached_video_bridge_episodes.{cache_suffix}.v2.pkl"
@@ -333,6 +353,11 @@ class VideoBridgeDataset(data.Dataset):
             load_task_language = self.require_language_embedding or self.task_language_embedding_dir is not None
             task_text_by_index = self._load_lerobot_v3_task_texts(leaf_dir, pd) if load_task_language else {}
             episode_task_by_index = self._load_lerobot_v3_episode_tasks(leaf_dir, pd) if load_task_language else {}
+            episode_data_paths_by_index = (
+                self._load_lerobot_v3_episode_data_paths(leaf_dir, pd)
+                if self.load_state
+                else {}
+            )
             task_embedding_dir = self._resolve_task_language_embedding_dir(leaf_dir) if load_task_language else None
             episode_files = sorted((leaf_dir / "meta" / "episodes").glob("chunk-*/file-*.parquet"))
             for episode_file in episode_files:
@@ -381,6 +406,14 @@ class VideoBridgeDataset(data.Dataset):
                             episode_index,
                         )
                         continue
+                    data_paths = episode_data_paths_by_index.get(episode_index, [])
+                    if self.load_state and not data_paths:
+                        logger.warning(
+                            "Skipping %s/episode_%06d because no LeRobot data parquet was found for state loading",
+                            leaf_dir.name,
+                            episode_index,
+                        )
+                        continue
 
                     cur_episodes.append(
                         {
@@ -393,6 +426,7 @@ class VideoBridgeDataset(data.Dataset):
                             "task_index": task_index,
                             "task_text": task_text,
                             "lang_path": str(lang_path) if lang_path is not None else None,
+                            "data_paths": data_paths,
                         }
                     )
 
@@ -443,6 +477,21 @@ class VideoBridgeDataset(data.Dataset):
             for _, row in reduced.iterrows():
                 episode_task_by_index[int(row["episode_index"])] = int(row["task_index"])
         return episode_task_by_index
+
+    def _load_lerobot_v3_episode_data_paths(self, leaf_dir: Path, pd: Any) -> Dict[int, List[str]]:
+        episode_data_paths: Dict[int, List[str]] = {}
+        data_files = sorted((leaf_dir / "data").glob("chunk-*/file-*.parquet"))
+        for data_file in data_files:
+            try:
+                df = pd.read_parquet(data_file, columns=["episode_index"])
+            except Exception as exc:
+                logger.warning("Failed reading episode_index from %s: %s", data_file, exc)
+                continue
+            if df.empty:
+                continue
+            for episode_index in sorted({int(value) for value in df["episode_index"].tolist()}):
+                episode_data_paths.setdefault(episode_index, []).append(str(data_file))
+        return episode_data_paths
 
     def _resolve_task_language_embedding_dir(self, leaf_dir: Path) -> Path:
         if self.task_language_embedding_dir:
@@ -496,6 +545,117 @@ class VideoBridgeDataset(data.Dataset):
             return self._load_lerobot_v3_video_frames(episode, frame_indices)
         return load_video_frames(episode["video_path"], frame_indices, self.video_size)
 
+    def _load_episode_states(self, episode: Dict[str, Any], frame_indices: List[int]) -> Optional[torch.Tensor]:
+        if not self.load_state:
+            return None
+        if episode.get("format") == "lerobot_parquet":
+            return self._load_lerobot_parquet_states(episode["parquet_path"], frame_indices)
+        if episode.get("format") == "lerobot_v3_video":
+            return self._load_lerobot_v3_video_states(episode, frame_indices)
+        raise ValueError(f"State loading is not supported for episode format={episode.get('format')!r}")
+
+    @staticmethod
+    def _state_cell_to_tensor(cell: Any) -> torch.Tensor:
+        if isinstance(cell, torch.Tensor):
+            tensor = cell.detach().cpu().float()
+        elif isinstance(cell, np.ndarray):
+            tensor = torch.from_numpy(cell).float()
+        elif isinstance(cell, (list, tuple)):
+            tensor = torch.tensor(cell, dtype=torch.float32)
+        elif np.isscalar(cell):
+            tensor = torch.tensor([cell], dtype=torch.float32)
+        else:
+            try:
+                tensor = torch.tensor(np.asarray(cell), dtype=torch.float32)
+            except Exception as exc:
+                raise TypeError(f"Unsupported state cell type: {type(cell)}") from exc
+        return tensor.flatten()
+
+    def _load_lerobot_parquet_states(self, parquet_path: str, frame_indices: List[int]) -> torch.Tensor:
+        import pandas as pd
+
+        df = pd.read_parquet(parquet_path, columns=[self.state_column])
+        states = [self._state_cell_to_tensor(df[self.state_column].iloc[idx]) for idx in frame_indices]
+        return torch.stack(states, dim=0)
+
+    def _read_lerobot_v3_state_table(
+        self,
+        episode: Dict[str, Any],
+    ) -> Tuple[torch.Tensor, Optional[Dict[int, int]]]:
+        import pandas as pd
+        import pyarrow.parquet as pq
+
+        data_paths = episode.get("data_paths") or []
+        if not data_paths:
+            raise ValueError(f"No data_paths available for {episode.get('episode_name')}")
+
+        episode_index = int(episode["episode_index"])
+        frames = []
+        has_frame_index = False
+        for data_path in data_paths:
+            schema_names = set(pq.ParquetFile(data_path).schema.names)
+            if self.state_column not in schema_names:
+                raise KeyError(f"Missing state column {self.state_column!r} in {data_path}")
+            columns = ["episode_index", self.state_column]
+            if "frame_index" in schema_names:
+                columns.append("frame_index")
+                has_frame_index = True
+            df = pd.read_parquet(data_path, columns=columns)
+            if "episode_index" in df:
+                df = df[df["episode_index"] == episode_index]
+            if not df.empty:
+                frames.append(df)
+
+        if not frames:
+            raise ValueError(f"No state rows found for {episode.get('episode_name')}")
+
+        state_df = pd.concat(frames, ignore_index=True)
+        frame_index_to_pos = None
+        if has_frame_index and "frame_index" in state_df:
+            state_df = state_df.sort_values("frame_index").reset_index(drop=True)
+            frame_index_to_pos = {
+                int(frame_idx): pos
+                for pos, frame_idx in enumerate(state_df["frame_index"].tolist())
+            }
+        else:
+            state_df = state_df.reset_index(drop=True)
+
+        state_tensor = torch.stack(
+            [self._state_cell_to_tensor(cell) for cell in state_df[self.state_column].tolist()],
+            dim=0,
+        )
+        return state_tensor, frame_index_to_pos
+
+    def _load_lerobot_v3_video_states(self, episode: Dict[str, Any], frame_indices: List[int]) -> torch.Tensor:
+        cache_key = f"{episode.get('episode_name')}::{self.state_column}"
+        if cache_key not in self._state_cache:
+            self._state_cache[cache_key] = self._read_lerobot_v3_state_table(episode)
+
+        states, frame_index_to_pos = self._state_cache[cache_key]
+        if frame_index_to_pos is not None:
+            missing = [idx for idx in frame_indices if idx not in frame_index_to_pos]
+            if missing:
+                raise ValueError(f"Missing state frame indices {missing} for {episode.get('episode_name')}")
+            positions = [frame_index_to_pos[idx] for idx in frame_indices]
+            return states[positions]
+
+        max_index = max(frame_indices)
+        if max_index >= states.shape[0]:
+            raise ValueError(
+                f"State table is too short for {episode.get('episode_name')}: "
+                f"need frame {max_index}, got {states.shape[0]} rows"
+            )
+        return states[frame_indices]
+
+    @staticmethod
+    def _add_states_to_sample(sample: Dict[str, Any], states: Optional[torch.Tensor]) -> Dict[str, Any]:
+        if states is None:
+            return sample
+        sample["first_state"] = states[0]
+        sample["video_states"] = states[1:]
+        sample["last_state"] = states[-1]
+        return sample
+
     def get_bridge_window(self, episode_index: int, condition_idx: Optional[int] = None) -> Dict[str, Any]:
         """Load a deterministic first-last bridge window for evaluation."""
         if not self.episodes:
@@ -519,9 +679,10 @@ class VideoBridgeDataset(data.Dataset):
         ]
         frame_indices = [condition_idx] + video_indices
         frames = self._load_episode_frames(episode, frame_indices)
+        states = self._load_episode_states(episode, frame_indices)
         language_embedding = self._load_language_embedding(episode.get("lang_path"))
 
-        return {
+        sample = {
             "first_frame": frames[0],
             "video_frames": frames[1:],
             "language_embedding": language_embedding,
@@ -533,6 +694,7 @@ class VideoBridgeDataset(data.Dataset):
             "frame_indices": frame_indices,
             "total_frames": total_frames,
         }
+        return self._add_states_to_sample(sample, states)
 
     def _load_language_embedding(self, lang_path: Optional[str]) -> Optional[torch.Tensor]:
         if lang_path is None:
@@ -659,9 +821,10 @@ class VideoBridgeDataset(data.Dataset):
                 frame_indices = [condition_idx] + video_indices
 
                 frames = self._load_episode_frames(episode, frame_indices)
+                states = self._load_episode_states(episode, frame_indices)
                 language_embedding = self._load_language_embedding(episode.get("lang_path"))
 
-                return {
+                sample = {
                     "first_frame": frames[0],
                     "video_frames": frames[1:],
                     "language_embedding": language_embedding,
@@ -670,6 +833,7 @@ class VideoBridgeDataset(data.Dataset):
                     "task_index": episode.get("task_index"),
                     "task_text": episode.get("task_text"),
                 }
+                return self._add_states_to_sample(sample, states)
             except Exception as exc:
                 logger.warning(
                     "Retry due to video bridge sample error (%s): %s",

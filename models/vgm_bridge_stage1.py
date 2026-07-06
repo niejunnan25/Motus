@@ -6,6 +6,7 @@ from typing import Dict, List, Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 BAK_ROOT = str((Path(__file__).parent.parent / "bak").resolve())
 if BAK_ROOT not in sys.path:
@@ -61,6 +62,42 @@ class EndpointTokenAdapter(nn.Module):
         return tokens
 
 
+class StateTokenAdapter(nn.Module):
+    """Project robot state vectors into WAN text-context tokens."""
+
+    def __init__(
+        self,
+        text_dim: int,
+        num_tokens: int = 4,
+        hidden_dim: int = 1024,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        if num_tokens < 1:
+            raise ValueError("num_tokens must be >= 1")
+        self.text_dim = int(text_dim)
+        self.num_tokens = int(num_tokens)
+        self.net = nn.Sequential(
+            nn.Linear(self.text_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, self.num_tokens * self.text_dim),
+        )
+        final = self.net[-1]
+        nn.init.zeros_(final.weight)
+        nn.init.zeros_(final.bias)
+
+    def forward(self, state_features: torch.Tensor) -> torch.Tensor:
+        batch_size = state_features.shape[0]
+        if state_features.shape[-1] < self.text_dim:
+            pad = state_features.new_zeros(batch_size, self.text_dim - state_features.shape[-1])
+            state_features = torch.cat([state_features, pad], dim=-1)
+        elif state_features.shape[-1] > self.text_dim:
+            state_features = state_features[:, : self.text_dim]
+        tokens = self.net(state_features)
+        return tokens.view(batch_size, self.num_tokens, self.text_dim)
+
+
 @dataclass
 class VGMBridgeStage1Config:
     wan_checkpoint_path: str = ""
@@ -74,6 +111,16 @@ class VGMBridgeStage1Config:
     tail_condition_frames: int = 1
     conditioning_mode: str = "v0"
     mask_channels: int = 4
+    interaction_loss_enabled: bool = False
+    interaction_motion_weight: float = 0.0
+    interaction_edge_weight: float = 0.0
+    interaction_max_weight: float = 4.0
+    interaction_warmup_steps: int = 0
+    state_condition_mode: str = "none"
+    state_num_tokens: int = 4
+    state_hidden_dim: int = 1024
+    state_dropout: float = 0.0
+    state_clip: float = 10.0
     load_pretrained_backbones: Optional[bool] = None
 
 
@@ -81,6 +128,7 @@ class VGMBridgeStage1(nn.Module):
     """Stage1 WAN video-prior training with first-frame and optional tail conditioning."""
 
     VALID_CONDITIONING_MODES = {"v0", "v0_5_endpoint", "v1_mask", "v1_mask_endpoint"}
+    VALID_STATE_CONDITION_MODES = {"none", "first", "first_last", "first_last_delta"}
 
     def __init__(self, config: VGMBridgeStage1Config):
         super().__init__()
@@ -92,6 +140,11 @@ class VGMBridgeStage1(nn.Module):
             raise ValueError(
                 f"Unknown conditioning_mode={config.conditioning_mode!r}; "
                 f"expected one of {sorted(self.VALID_CONDITIONING_MODES)}"
+            )
+        if config.state_condition_mode not in self.VALID_STATE_CONDITION_MODES:
+            raise ValueError(
+                f"Unknown state_condition_mode={config.state_condition_mode!r}; "
+                f"expected one of {sorted(self.VALID_STATE_CONDITION_MODES)}"
             )
         if config.tail_condition_frames < 0:
             raise ValueError("tail_condition_frames must be >= 0")
@@ -133,6 +186,8 @@ class VGMBridgeStage1(nn.Module):
         self.latent_channels = self.video_model.wan_model.in_dim
         self.use_mask_condition = config.conditioning_mode in {"v1_mask", "v1_mask_endpoint"}
         self.use_endpoint_adapter = config.conditioning_mode in {"v0_5_endpoint", "v1_mask_endpoint"}
+        self.use_state_condition = config.state_condition_mode != "none"
+        self.use_interaction_loss = bool(config.interaction_loss_enabled)
 
         if self.use_mask_condition:
             self._expand_patch_embedding(self.latent_channels * 2 + config.mask_channels)
@@ -144,6 +199,15 @@ class VGMBridgeStage1(nn.Module):
             ).to(device=self.device, dtype=self.dtype)
         else:
             self.endpoint_adapter = None
+        if self.use_state_condition:
+            self.state_adapter = StateTokenAdapter(
+                text_dim=self.video_model.wan_model.text_dim,
+                num_tokens=config.state_num_tokens,
+                hidden_dim=config.state_hidden_dim,
+                dropout=config.state_dropout,
+            ).to(device=self.device, dtype=self.dtype)
+        else:
+            self.state_adapter = None
 
         self.fm_train_scheduler = FlowMatchScheduler(
             shift=5.0,
@@ -155,10 +219,12 @@ class VGMBridgeStage1(nn.Module):
 
         logger.info(
             "Initialized VGMBridgeStage1: conditioning_mode=%s, num_video_frames=%s, "
-            "tail_condition_frames=%s, video_size=%sx%s",
+            "tail_condition_frames=%s, state_condition_mode=%s, interaction_loss=%s, video_size=%sx%s",
             config.conditioning_mode,
             config.num_video_frames,
             config.tail_condition_frames,
+            config.state_condition_mode,
+            self.use_interaction_loss,
             config.video_height,
             config.video_width,
         )
@@ -203,15 +269,38 @@ class VGMBridgeStage1(nn.Module):
             new_in_channels,
         )
 
-    def _context_list(self, language_embeddings: Optional[torch.Tensor], batch_size: int) -> List[torch.Tensor]:
+    def _context_list(
+        self,
+        language_embeddings: Optional[torch.Tensor],
+        batch_size: int,
+        state_tokens: Optional[torch.Tensor] = None,
+    ) -> List[torch.Tensor]:
         text_len = self.video_model.wan_model.text_len
         text_dim = self.video_model.wan_model.text_dim
+        state_token_count = 0
+        if state_tokens is not None:
+            if state_tokens.shape[0] != batch_size:
+                raise ValueError(
+                    f"state_tokens batch size {state_tokens.shape[0]} does not match batch_size={batch_size}"
+                )
+            if state_tokens.shape[-1] != text_dim:
+                raise ValueError(
+                    f"state_tokens dim {state_tokens.shape[-1]} does not match WAN text_dim={text_dim}"
+                )
+            state_token_count = state_tokens.shape[1]
+            if state_token_count >= text_len:
+                raise ValueError(f"state_token_count={state_token_count} must be smaller than text_len={text_len}")
+            state_tokens = state_tokens.to(device=self.device, dtype=self.dtype)
 
         if language_embeddings is None:
-            return [
+            context = [
                 torch.zeros(text_len, text_dim, device=self.device, dtype=self.dtype)
                 for _ in range(batch_size)
             ]
+            if state_tokens is not None:
+                for idx, item in enumerate(context):
+                    item[-state_token_count:] = item[-state_token_count:] + state_tokens[idx]
+            return context
 
         if isinstance(language_embeddings, torch.Tensor):
             if language_embeddings.dim() == 2:
@@ -227,8 +316,56 @@ class VGMBridgeStage1(nn.Module):
                 emb = emb.squeeze(0)
             if emb.shape[0] > text_len:
                 emb = emb[:text_len]
+            elif emb.shape[0] < text_len:
+                emb = torch.cat([emb, emb.new_zeros(text_len - emb.shape[0], emb.shape[1])])
+            if state_tokens is not None:
+                emb = emb.clone()
+                emb[-state_token_count:] = emb[-state_token_count:] + state_tokens[len(context)]
             context.append(emb)
         return context
+
+    def _state_feature_tensor(
+        self,
+        first_state: Optional[torch.Tensor],
+        last_state: Optional[torch.Tensor],
+    ) -> Optional[torch.Tensor]:
+        if not self.use_state_condition:
+            return None
+        if first_state is None:
+            raise ValueError(f"first_state is required for state_condition_mode={self.config.state_condition_mode!r}")
+
+        first_state = first_state.to(device=self.device, dtype=self.dtype).flatten(start_dim=1)
+        features = [first_state]
+        if self.config.state_condition_mode in {"first_last", "first_last_delta"}:
+            if last_state is None:
+                raise ValueError(f"last_state is required for state_condition_mode={self.config.state_condition_mode!r}")
+            last_state = last_state.to(device=self.device, dtype=self.dtype).flatten(start_dim=1)
+            if last_state.shape != first_state.shape:
+                raise ValueError(
+                    f"last_state shape {tuple(last_state.shape)} must match first_state shape {tuple(first_state.shape)}"
+                )
+            features.append(last_state)
+            if self.config.state_condition_mode == "first_last_delta":
+                features.append(last_state - first_state)
+
+        state_features = torch.cat(features, dim=-1).float()
+        state_features = torch.nan_to_num(state_features, nan=0.0, posinf=0.0, neginf=0.0)
+        state_clip = float(self.config.state_clip)
+        if state_clip > 0:
+            state_features = state_features.clamp(min=-state_clip, max=state_clip)
+        return state_features.to(device=self.device, dtype=self.dtype)
+
+    def _state_tokens(
+        self,
+        first_state: Optional[torch.Tensor],
+        last_state: Optional[torch.Tensor],
+    ) -> Optional[torch.Tensor]:
+        if self.state_adapter is None:
+            return None
+        state_features = self._state_feature_tensor(first_state=first_state, last_state=last_state)
+        if state_features is None:
+            return None
+        return self.state_adapter(state_features)
 
     def _wan_seq_len(self, latent: torch.Tensor) -> int:
         _, _, t, h, w = latent.shape
@@ -476,11 +613,86 @@ class VGMBridgeStage1(nn.Module):
             condition_video[:, :, -tail_n:] = (tail_frames * 2.0 - 1.0).permute(0, 2, 1, 3, 4)
         return condition_video
 
+    def _interaction_warmup_scale(self, global_step: Optional[int]) -> float:
+        warmup_steps = int(self.config.interaction_warmup_steps)
+        if warmup_steps <= 0 or global_step is None:
+            return 1.0
+        return float(max(0.0, min(1.0, float(global_step) / float(warmup_steps))))
+
+    @staticmethod
+    def _normalize_positive_map(value: torch.Tensor) -> torch.Tensor:
+        mean = value.mean(dim=(2, 3, 4), keepdim=True).clamp_min(1e-6)
+        return value / mean
+
+    def _edge_strength(self, video: torch.Tensor) -> torch.Tensor:
+        batch_size, _, frame_count, height, width = video.shape
+        gray = video.mean(dim=1, keepdim=True)
+        flat = gray.permute(0, 2, 1, 3, 4).reshape(batch_size * frame_count, 1, height, width)
+        kernel_x = flat.new_tensor(
+            [[[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]]]
+        ).unsqueeze(0)
+        kernel_y = flat.new_tensor(
+            [[[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]]]
+        ).unsqueeze(0)
+        grad_x = F.conv2d(flat, kernel_x, padding=1)
+        grad_y = F.conv2d(flat, kernel_y, padding=1)
+        edge = torch.sqrt(grad_x.pow(2) + grad_y.pow(2) + 1e-8)
+        return edge.view(batch_size, frame_count, 1, height, width).permute(0, 2, 1, 3, 4)
+
+    def _interaction_latent_weight(
+        self,
+        full_video: torch.Tensor,
+        latent: torch.Tensor,
+        known_mask: torch.Tensor,
+        global_step: Optional[int],
+    ) -> Optional[torch.Tensor]:
+        if not self.use_interaction_loss:
+            return None
+
+        motion_weight = float(self.config.interaction_motion_weight)
+        edge_weight = float(self.config.interaction_edge_weight)
+        if motion_weight <= 0 and edge_weight <= 0:
+            return None
+
+        pixel_video = ((full_video.float() + 1.0) * 0.5).clamp(0.0, 1.0)
+        score = pixel_video.new_zeros(
+            (pixel_video.shape[0], 1, pixel_video.shape[2], pixel_video.shape[3], pixel_video.shape[4])
+        )
+
+        if motion_weight > 0:
+            motion = pixel_video.new_zeros(score.shape)
+            motion[:, :, 1:] = (pixel_video[:, :, 1:] - pixel_video[:, :, :-1]).abs().mean(dim=1, keepdim=True)
+            score = score + motion_weight * self._normalize_positive_map(motion)
+
+        if edge_weight > 0:
+            edge = self._edge_strength(pixel_video)
+            score = score + edge_weight * self._normalize_positive_map(edge)
+
+        warmup_scale = self._interaction_warmup_scale(global_step)
+        pixel_weight = 1.0 + warmup_scale * score
+        max_weight = float(self.config.interaction_max_weight)
+        if max_weight > 0:
+            pixel_weight = pixel_weight.clamp(max=max_weight)
+
+        latent_weight = F.interpolate(
+            pixel_weight,
+            size=latent.shape[2:],
+            mode="trilinear",
+            align_corners=False,
+        )
+        active_mask = (1 - known_mask).float().expand_as(latent_weight)
+        active_sum = active_mask.sum(dim=(1, 2, 3, 4), keepdim=True).clamp_min(1.0)
+        active_mean = (latent_weight * active_mask).sum(dim=(1, 2, 3, 4), keepdim=True) / active_sum
+        return latent_weight / active_mean.clamp_min(1e-6)
+
     def training_step(
         self,
         first_frame: torch.Tensor,
         video_frames: torch.Tensor,
         language_embeddings: Optional[torch.Tensor] = None,
+        first_state: Optional[torch.Tensor] = None,
+        last_state: Optional[torch.Tensor] = None,
+        global_step: Optional[int] = None,
         return_dict: bool = True,
     ) -> Dict[str, torch.Tensor]:
         """Run one bridge training step for the configured conditioning mode."""
@@ -545,7 +757,8 @@ class VGMBridgeStage1(nn.Module):
             known_mask=known_mask,
             seq_len=seq_len,
         )
-        context = self._context_list(language_embeddings, batch_size)
+        state_tokens = self._state_tokens(first_state=first_state, last_state=last_state)
+        context = self._context_list(language_embeddings, batch_size, state_tokens=state_tokens)
         latent_list = [model_input[i] for i in range(batch_size)]
 
         with torch.autocast(device_type="cuda", dtype=self.video_model.precision):
@@ -558,9 +771,32 @@ class VGMBridgeStage1(nn.Module):
             )
 
         loss_mask = 1 - known_mask
-        sq_error = (video_pred.float() - video_target.float()).pow(2) * loss_mask.float()
-        denom = loss_mask.expand_as(video_pred).float().sum().clamp_min(1.0)
-        video_loss = sq_error.sum() / denom
+        sq_error = (video_pred.float() - video_target.float()).pow(2)
+        expanded_loss_mask = loss_mask.expand_as(video_pred).float()
+        base_sq_error = sq_error * expanded_loss_mask
+        base_denom = expanded_loss_mask.sum().clamp_min(1.0)
+        base_video_loss = base_sq_error.sum() / base_denom
+
+        interaction_weight = self._interaction_latent_weight(
+            full_video=full_video,
+            latent=clean_full_latent,
+            known_mask=known_mask,
+            global_step=global_step,
+        )
+        if interaction_weight is not None:
+            expanded_weight = interaction_weight.float().expand_as(video_pred)
+            weighted_mask = expanded_loss_mask * expanded_weight
+            denom = weighted_mask.sum().clamp_min(1.0)
+            video_loss = (sq_error * weighted_mask).sum() / denom
+            interaction_weight_mean = (
+                (interaction_weight.float() * (1 - known_mask).float().expand_as(interaction_weight)).sum()
+                / (1 - known_mask).float().expand_as(interaction_weight).sum().clamp_min(1.0)
+            )
+            interaction_weight_max = interaction_weight.float().max()
+        else:
+            video_loss = base_video_loss
+            interaction_weight_mean = video_loss.detach().new_ones(())
+            interaction_weight_max = video_loss.detach().new_ones(())
         zero = video_loss.detach().new_zeros(())
 
         if return_dict:
@@ -568,6 +804,9 @@ class VGMBridgeStage1(nn.Module):
                 "total_loss": video_loss,
                 "video_loss": video_loss,
                 "middle_loss": video_loss,
+                "base_video_loss": base_video_loss,
+                "interaction_weight_mean": interaction_weight_mean.detach(),
+                "interaction_weight_max": interaction_weight_max.detach(),
                 "action_loss": zero,
             }
         return {"total_loss": video_loss}
@@ -579,6 +818,8 @@ class VGMBridgeStage1(nn.Module):
         last_frame: Optional[torch.Tensor] = None,
         tail_frames: Optional[torch.Tensor] = None,
         language_embeddings: Optional[torch.Tensor] = None,
+        first_state: Optional[torch.Tensor] = None,
+        last_state: Optional[torch.Tensor] = None,
         num_inference_steps: int = 30,
         generator: Optional[torch.Generator] = None,
     ) -> torch.Tensor:
@@ -628,7 +869,8 @@ class VGMBridgeStage1(nn.Module):
             timesteps = scheduler.timesteps.to(device=self.device, dtype=self.dtype)
 
             seq_len = self._wan_seq_len(latent)
-            context = self._context_list(language_embeddings, batch_size)
+            state_tokens = self._state_tokens(first_state=first_state, last_state=last_state)
+            context = self._context_list(language_embeddings, batch_size, state_tokens=state_tokens)
             endpoint_frame = last_frame
             if endpoint_frame is None and tail_frames is not None and tail_frames.shape[1] > 0:
                 endpoint_frame = tail_frames[:, -1]

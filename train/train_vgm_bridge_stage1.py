@@ -26,6 +26,11 @@ from torch.utils.tensorboard import SummaryWriter
 import wandb
 import yaml
 
+try:
+    from safetensors.torch import load_file as safe_load_file
+except Exception:  # pragma: no cover
+    safe_load_file = None
+
 sys.path.append(str(Path(__file__).parent.parent))
 
 from data.video_bridge.video_bridge_dataset import VideoBridgeDataset, video_bridge_collate_fn
@@ -180,12 +185,21 @@ class VGMBridgeStage1Trainer:
             language_embeddings = batch["language_embedding"]
             if language_embeddings is not None:
                 language_embeddings = language_embeddings.to(self.device, dtype=self.dtype)
+            first_state = batch.get("first_state")
+            last_state = batch.get("last_state")
+            if first_state is not None:
+                first_state = first_state.to(self.device, dtype=self.dtype)
+            if last_state is not None:
+                last_state = last_state.to(self.device, dtype=self.dtype)
 
             model = self.accelerator.unwrap_model(self.model) if self.accelerator is not None else self.model
             loss_dict = model.training_step(
                 first_frame=first_frame,
                 video_frames=video_frames,
                 language_embeddings=language_embeddings,
+                first_state=first_state,
+                last_state=last_state,
+                global_step=self.global_step,
                 return_dict=True,
             )
             total_loss = loss_dict["total_loss"]
@@ -290,6 +304,16 @@ def create_model_and_optimizer(config: OmegaConf) -> tuple[VGMBridgeStage1, torc
         tail_condition_frames=config.common.get("tail_condition_frames", 1),
         conditioning_mode=config.common.get("conditioning_mode", "v0"),
         mask_channels=config.common.get("mask_channels", 4),
+        interaction_loss_enabled=config.common.get("interaction_loss_enabled", False),
+        interaction_motion_weight=config.common.get("interaction_motion_weight", 0.0),
+        interaction_edge_weight=config.common.get("interaction_edge_weight", 0.0),
+        interaction_max_weight=config.common.get("interaction_max_weight", 4.0),
+        interaction_warmup_steps=config.common.get("interaction_warmup_steps", 0),
+        state_condition_mode=config.common.get("state_condition_mode", "none"),
+        state_num_tokens=config.common.get("state_num_tokens", 4),
+        state_hidden_dim=config.common.get("state_hidden_dim", 1024),
+        state_dropout=config.common.get("state_dropout", 0.0),
+        state_clip=config.common.get("state_clip", 10.0),
         load_pretrained_backbones=getattr(config.model, "load_pretrained_backbones", None),
     )
     model = VGMBridgeStage1(model_config)
@@ -308,6 +332,53 @@ def create_model_and_optimizer(config: OmegaConf) -> tuple[VGMBridgeStage1, torc
     trainable_count = sum(param.numel() for param in trainable_params)
     logger.info("Trainable parameters: %s", f"{trainable_count:,}")
     return model, optimizer, scheduler
+
+
+def _checkpoint_file(checkpoint_path: str) -> Path:
+    path = Path(checkpoint_path)
+    if path.is_dir():
+        candidates = [
+            path / "model.safetensors",
+            path / "pytorch_model.bin",
+            path / "training_state.pt",
+        ]
+        candidates += sorted(path.glob("pytorch_model_*.bin"))
+        checkpoint_file = next((candidate for candidate in candidates if candidate.exists()), None)
+        if checkpoint_file is None:
+            raise FileNotFoundError(f"No model checkpoint found under {checkpoint_path}")
+        return checkpoint_file
+    return path
+
+
+def load_model_only_checkpoint(model: VGMBridgeStage1, checkpoint_path: str, strict: bool = False) -> None:
+    """Load model weights without optimizer/scheduler state for V2 finetuning."""
+    checkpoint_file = _checkpoint_file(checkpoint_path)
+    logger.info("Loading model-only finetune checkpoint from %s", checkpoint_file)
+    if checkpoint_file.suffix == ".safetensors":
+        if safe_load_file is None:
+            raise RuntimeError("safetensors is required to load model.safetensors")
+        state_dict = safe_load_file(str(checkpoint_file), device="cpu")
+    else:
+        state = torch.load(checkpoint_file, map_location="cpu")
+        state_dict = state.get("model", state) if isinstance(state, dict) else state
+
+    cleaned = {}
+    for key, value in state_dict.items():
+        if key.startswith("module."):
+            key = key[len("module.") :]
+        cleaned[key] = value
+
+    missing, unexpected = model.load_state_dict(cleaned, strict=strict)
+    if missing:
+        logger.warning("Missing finetune checkpoint keys: %s", missing[:30])
+    if unexpected:
+        logger.warning("Unexpected finetune checkpoint keys: %s", unexpected[:30])
+    logger.info(
+        "Model-only checkpoint loaded: tensors=%s, missing=%s, unexpected=%s",
+        len(cleaned),
+        len(missing),
+        len(unexpected),
+    )
 
 
 def create_train_dataloader(config: OmegaConf, rank: int, world_size: int) -> DataLoader:
@@ -336,6 +407,11 @@ def create_train_dataloader(config: OmegaConf, rank: int, world_size: int) -> Da
         view_layout=config.dataset.get("view_layout", "single"),
         task_language_embedding_dir=config.dataset.get("task_language_embedding_dir", None),
         task_language_embedding_pattern=config.dataset.get("task_language_embedding_pattern", "task_{task_index:06d}.pt"),
+        load_state=config.dataset.get(
+            "load_state",
+            config.common.get("state_condition_mode", "none") != "none",
+        ),
+        state_column=config.dataset.get("state_column", "observation.state"),
         cache_scan=config.dataset.get("cache_scan", True),
         val=False,
     )
@@ -392,6 +468,11 @@ def main() -> None:
 
     if getattr(config.resume, "checkpoint_path", None):
         config.model.load_pretrained_backbones = False
+    finetune_checkpoint = None
+    if hasattr(config, "finetune"):
+        finetune_checkpoint = getattr(config.finetune, "checkpoint_path", None)
+    if finetune_checkpoint and not getattr(config.resume, "checkpoint_path", None):
+        config.model.load_pretrained_backbones = False
 
     report_to = normalize_report_to(config.logging.get("report_to", "tensorboard"))
 
@@ -446,6 +527,9 @@ def main() -> None:
     try:
         logger.info("Creating VGMBridgeStage1 model and optimizer...")
         model, optimizer, scheduler = create_model_and_optimizer(config)
+        if finetune_checkpoint and not getattr(config.resume, "checkpoint_path", None):
+            strict = bool(getattr(config.finetune, "strict", False))
+            load_model_only_checkpoint(model, finetune_checkpoint, strict=strict)
 
         logger.info("Creating train dataloader...")
         train_dataloader = create_train_dataloader(config, rank, world_size)
