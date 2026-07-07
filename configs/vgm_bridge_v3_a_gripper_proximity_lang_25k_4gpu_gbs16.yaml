@@ -1,0 +1,90 @@
+common:
+  # V3-A2 fast ablation: V1-proper conditioning plus a motion mask filtered
+  # by an approximate robot/gripper proximity seed.
+  # 4 GPUs x batch 4 = global batch 16, 25002 steps ~= 2GPU 50k total samples.
+  num_video_frames: 16
+  tail_condition_frames: 1
+  conditioning_mode: "v1_mask_endpoint"
+  mask_channels: 4
+  video_height: 448
+  video_width: 224
+
+  global_downsample_rate: 3
+
+  state_condition_mode: "none"
+
+  interaction_loss_enabled: true
+  interaction_weight_mode: "motion_gripper_proximity"
+  interaction_motion_weight: 3.0
+  interaction_edge_weight: 0.0
+  interaction_max_weight: 4.0
+  interaction_warmup_steps: 1000
+  interaction_mask_percentile: 0.92
+  interaction_mask_min_threshold: 0.012
+  interaction_mask_dilation: 7
+  interaction_proximity_dilation: 57
+
+dataset:
+  type: "video_bridge"
+  dataset_dir:
+    - "/mnt/workspace/users/niejunnan/lerobot_datasets/lerobot/libero"
+  max_episodes: null
+  require_language_embedding: true
+  data_format: "lerobot_v3_video"
+  image_column: "observation.images.image"
+  image_columns: ["observation.images.image", "observation.images.image2"]
+  view_layout: "vertical"
+  video_extensions: [".mp4"]
+  cache_scan: false
+  load_state: false
+
+  task_language_embedding_dir: "/mnt/workspace/users/niejunnan/lerobot_datasets/lerobot/libero/umt5_wan_tasks"
+  task_language_embedding_pattern: "task_{task_index:06d}.pt"
+
+training_mode: "vgm_bridge_stage1"
+
+model:
+  wan:
+    config_path: "/mnt/workspace/users/niejunnan/codebase/Motus/pretrained_models/Wan2.2-TI2V-5B"
+    checkpoint_path: "/mnt/workspace/users/niejunnan/codebase/Motus/pretrained_models/Wan2.2-TI2V-5B"
+    vae_path: "/mnt/workspace/users/niejunnan/codebase/Motus/pretrained_models/Wan2.2-TI2V-5B/Wan2.2_VAE.pth"
+    precision: "bfloat16"
+
+training:
+  batch_size: 4
+  gradient_accumulation_steps: 1
+  max_steps: 25002
+  learning_rate: 1.0e-5
+  weight_decay: 0.01
+
+  scheduler_type: "diffusers_cosine"
+  warmup_steps: 500
+  lr_schedule_steps: 25002
+  min_lr: 1.0e-6
+
+  grad_clip_norm: 0.5
+  use_amp: true
+  find_unused_parameters: false
+
+system:
+  checkpoint_dir: "./checkpoints"
+  log_level: "INFO"
+  log_interval: 1
+  save_interval: 2500
+  val_interval: 1000000000
+  num_workers: 16
+  pin_memory: true
+
+logging:
+  report_to: "wandb"
+  wandb_project: "motus"
+  tensorboard_log_dir: "tensorboard_logs"
+  run_name: "vgm_bridge_v3_a_gripper_proximity_lerobot_video_448x224_lang_17f_4gpu_gbs16_25k"
+
+finetune:
+  checkpoint_path: null
+  strict: false
+
+resume:
+  checkpoint_path: null
+  reset_scheduler: false
