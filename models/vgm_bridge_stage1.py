@@ -112,10 +112,15 @@ class VGMBridgeStage1Config:
     conditioning_mode: str = "v0"
     mask_channels: int = 4
     interaction_loss_enabled: bool = False
+    interaction_weight_mode: str = "motion_edge"
     interaction_motion_weight: float = 0.0
     interaction_edge_weight: float = 0.0
     interaction_max_weight: float = 4.0
     interaction_warmup_steps: int = 0
+    interaction_mask_percentile: float = 0.92
+    interaction_mask_min_threshold: float = 0.012
+    interaction_mask_dilation: int = 7
+    interaction_proximity_dilation: int = 57
     state_condition_mode: str = "none"
     state_num_tokens: int = 4
     state_hidden_dim: int = 1024
@@ -129,6 +134,7 @@ class VGMBridgeStage1(nn.Module):
 
     VALID_CONDITIONING_MODES = {"v0", "v0_5_endpoint", "v1_mask", "v1_mask_endpoint"}
     VALID_STATE_CONDITION_MODES = {"none", "first", "first_last", "first_last_delta"}
+    VALID_INTERACTION_WEIGHT_MODES = {"motion_edge", "motion_only", "motion_gripper_proximity"}
 
     def __init__(self, config: VGMBridgeStage1Config):
         super().__init__()
@@ -145,6 +151,11 @@ class VGMBridgeStage1(nn.Module):
             raise ValueError(
                 f"Unknown state_condition_mode={config.state_condition_mode!r}; "
                 f"expected one of {sorted(self.VALID_STATE_CONDITION_MODES)}"
+            )
+        if config.interaction_weight_mode not in self.VALID_INTERACTION_WEIGHT_MODES:
+            raise ValueError(
+                f"Unknown interaction_weight_mode={config.interaction_weight_mode!r}; "
+                f"expected one of {sorted(self.VALID_INTERACTION_WEIGHT_MODES)}"
             )
         if config.tail_condition_frames < 0:
             raise ValueError("tail_condition_frames must be >= 0")
@@ -219,12 +230,14 @@ class VGMBridgeStage1(nn.Module):
 
         logger.info(
             "Initialized VGMBridgeStage1: conditioning_mode=%s, num_video_frames=%s, "
-            "tail_condition_frames=%s, state_condition_mode=%s, interaction_loss=%s, video_size=%sx%s",
+            "tail_condition_frames=%s, state_condition_mode=%s, interaction_loss=%s, "
+            "interaction_weight_mode=%s, video_size=%sx%s",
             config.conditioning_mode,
             config.num_video_frames,
             config.tail_condition_frames,
             config.state_condition_mode,
             self.use_interaction_loss,
+            config.interaction_weight_mode,
             config.video_height,
             config.video_width,
         )
@@ -639,6 +652,119 @@ class VGMBridgeStage1(nn.Module):
         edge = torch.sqrt(grad_x.pow(2) + grad_y.pow(2) + 1e-8)
         return edge.view(batch_size, frame_count, 1, height, width).permute(0, 2, 1, 3, 4)
 
+    @staticmethod
+    def _odd_kernel_size(value: int, minimum: int = 1) -> int:
+        value = max(int(value), minimum)
+        if value % 2 == 0:
+            value += 1
+        return value
+
+    def _motion_map(self, pixel_video: torch.Tensor) -> torch.Tensor:
+        motion = pixel_video.new_zeros(
+            (pixel_video.shape[0], 1, pixel_video.shape[2], pixel_video.shape[3], pixel_video.shape[4])
+        )
+        motion[:, :, 1:] = (pixel_video[:, :, 1:] - pixel_video[:, :, :-1]).abs().mean(dim=1, keepdim=True)
+        return motion
+
+    def _high_motion_mask(self, motion: torch.Tensor) -> torch.Tensor:
+        batch_size, _, frame_count, height, width = motion.shape
+        flat = motion.flatten(3)
+        percentile = float(self.config.interaction_mask_percentile)
+        percentile = max(0.0, min(1.0, percentile))
+        quantile_threshold = torch.quantile(flat, percentile, dim=-1, keepdim=True).view(batch_size, 1, frame_count, 1, 1)
+        mean = flat.mean(dim=-1, keepdim=True).view(batch_size, 1, frame_count, 1, 1)
+        std = flat.std(dim=-1, keepdim=True, unbiased=False).view(batch_size, 1, frame_count, 1, 1)
+        min_threshold = float(self.config.interaction_mask_min_threshold)
+        threshold = torch.maximum(quantile_threshold, mean + 0.85 * std)
+        if min_threshold > 0:
+            threshold = torch.maximum(threshold, threshold.new_full((), min_threshold))
+
+        mask = (motion >= threshold).float()
+        mask[:, :, 0:1] = 0.0
+
+        kernel = self._odd_kernel_size(self.config.interaction_mask_dilation, minimum=1)
+        if kernel > 1:
+            padding = kernel // 2
+            mask = F.max_pool3d(mask, kernel_size=(1, kernel, kernel), stride=1, padding=(0, padding, padding))
+            mask = F.avg_pool3d(mask, kernel_size=(1, kernel, kernel), stride=1, padding=(0, padding, padding))
+            mask = mask.clamp(0.0, 1.0)
+        return mask
+
+    def _robot_like_motion_seed(self, pixel_video: torch.Tensor, motion_mask: torch.Tensor) -> torch.Tensor:
+        max_rgb = pixel_video.max(dim=1, keepdim=True).values
+        min_rgb = pixel_video.min(dim=1, keepdim=True).values
+        saturation = (max_rgb - min_rgb) / max_rgb.clamp_min(1e-6)
+        value = max_rgb
+
+        low_saturation = saturation < 0.30
+        bright_or_mid = value > 0.22
+        dark_gripper = (saturation < 0.40) & (value < 0.33)
+        robot_like = (low_saturation & bright_or_mid) | dark_gripper
+
+        seed = robot_like.float() * (motion_mask > 0.15).float()
+        seed[:, :, 0:1] = 0.0
+
+        kernel = self._odd_kernel_size(self.config.interaction_mask_dilation, minimum=3)
+        padding = kernel // 2
+        seed = F.max_pool3d(seed, kernel_size=(1, kernel, kernel), stride=1, padding=(0, padding, padding))
+        return seed.clamp(0.0, 1.0)
+
+    def _motion_interaction_score(self, pixel_video: torch.Tensor, motion: torch.Tensor) -> torch.Tensor:
+        motion_mask = self._high_motion_mask(motion)
+        if self.config.interaction_weight_mode == "motion_only":
+            return float(self.config.interaction_motion_weight) * motion_mask
+
+        seed = self._robot_like_motion_seed(pixel_video, motion_mask)
+        proximity_kernel = self._odd_kernel_size(self.config.interaction_proximity_dilation, minimum=3)
+        padding = proximity_kernel // 2
+        proximity = F.max_pool3d(seed, kernel_size=(1, proximity_kernel, proximity_kernel), stride=1, padding=(0, padding, padding))
+        candidate = motion_mask * (proximity > 0).float()
+        candidate = torch.maximum(candidate, seed)
+
+        smooth_kernel = self._odd_kernel_size(self.config.interaction_mask_dilation, minimum=3)
+        smooth_padding = smooth_kernel // 2
+        candidate = F.max_pool3d(
+            candidate,
+            kernel_size=(1, smooth_kernel, smooth_kernel),
+            stride=1,
+            padding=(0, smooth_padding, smooth_padding),
+        )
+        candidate = F.avg_pool3d(
+            candidate,
+            kernel_size=(1, smooth_kernel, smooth_kernel),
+            stride=1,
+            padding=(0, smooth_padding, smooth_padding),
+        )
+        candidate = candidate.clamp(0.0, 1.0)
+        return float(self.config.interaction_motion_weight) * candidate
+
+    def _latent_weight_from_frame_chunks(self, pixel_weight: torch.Tensor, latent: torch.Tensor) -> torch.Tensor:
+        batch_size, _, frame_count, height, width = pixel_weight.shape
+        _, _, latent_t, latent_h, latent_w = latent.shape
+        chunk_size = int(self.config.mask_channels)
+        chunks = []
+
+        for latent_idx in range(latent_t):
+            if latent_idx == 0:
+                chunk = pixel_weight[:, :, 0:1]
+            else:
+                start = 1 + chunk_size * (latent_idx - 1)
+                end = min(start + chunk_size, frame_count)
+                if start >= frame_count:
+                    chunk = pixel_weight[:, :, -1:]
+                else:
+                    chunk = pixel_weight[:, :, start:end].amax(dim=2, keepdim=True)
+            chunks.append(chunk)
+
+        temporal_weight = torch.cat(chunks, dim=2)
+        spatial_weight = F.interpolate(
+            temporal_weight.permute(0, 2, 1, 3, 4).reshape(batch_size * latent_t, 1, height, width),
+            size=(latent_h, latent_w),
+            mode="bilinear",
+            align_corners=False,
+        )
+        return spatial_weight.view(batch_size, latent_t, 1, latent_h, latent_w).permute(0, 2, 1, 3, 4)
+
     def _interaction_latent_weight(
         self,
         full_video: torch.Tensor,
@@ -659,14 +785,21 @@ class VGMBridgeStage1(nn.Module):
             (pixel_video.shape[0], 1, pixel_video.shape[2], pixel_video.shape[3], pixel_video.shape[4])
         )
 
-        if motion_weight > 0:
-            motion = pixel_video.new_zeros(score.shape)
-            motion[:, :, 1:] = (pixel_video[:, :, 1:] - pixel_video[:, :, :-1]).abs().mean(dim=1, keepdim=True)
-            score = score + motion_weight * self._normalize_positive_map(motion)
+        motion = self._motion_map(pixel_video)
+        if self.config.interaction_weight_mode == "motion_edge":
+            if motion_weight > 0:
+                score = score + motion_weight * self._normalize_positive_map(motion)
 
-        if edge_weight > 0:
-            edge = self._edge_strength(pixel_video)
-            score = score + edge_weight * self._normalize_positive_map(edge)
+            if edge_weight > 0:
+                edge = self._edge_strength(pixel_video)
+                score = score + edge_weight * self._normalize_positive_map(edge)
+        elif motion_weight > 0:
+            score = score + self._motion_interaction_score(pixel_video, motion)
+
+        if self.config.interaction_weight_mode != "motion_edge":
+            # Mask modes already produce bounded candidate maps; do not normalize them
+            # over the full image, otherwise sparse manipulation regions become too broad.
+            score = score.clamp_min(0.0)
 
         warmup_scale = self._interaction_warmup_scale(global_step)
         pixel_weight = 1.0 + warmup_scale * score
@@ -674,12 +807,15 @@ class VGMBridgeStage1(nn.Module):
         if max_weight > 0:
             pixel_weight = pixel_weight.clamp(max=max_weight)
 
-        latent_weight = F.interpolate(
-            pixel_weight,
-            size=latent.shape[2:],
-            mode="trilinear",
-            align_corners=False,
-        )
+        if self.config.interaction_weight_mode == "motion_edge":
+            latent_weight = F.interpolate(
+                pixel_weight,
+                size=latent.shape[2:],
+                mode="trilinear",
+                align_corners=False,
+            )
+        else:
+            latent_weight = self._latent_weight_from_frame_chunks(pixel_weight, latent)
         active_mask = (1 - known_mask).float().expand_as(latent_weight)
         active_sum = active_mask.sum(dim=(1, 2, 3, 4), keepdim=True).clamp_min(1.0)
         active_mean = (latent_weight * active_mask).sum(dim=(1, 2, 3, 4), keepdim=True) / active_sum
