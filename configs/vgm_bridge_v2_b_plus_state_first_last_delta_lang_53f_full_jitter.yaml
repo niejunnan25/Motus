@@ -49,8 +49,8 @@ model:
     precision: "bfloat16"
 
 training:
-  batch_size: 1
-  gradient_accumulation_steps: 4
+  batch_size: 4
+  gradient_accumulation_steps: 1
   max_steps: 50004
   learning_rate: 1.0e-5
   weight_decay: 0.01
@@ -77,7 +77,7 @@ logging:
   report_to: "wandb"
   wandb_project: "motus"
   tensorboard_log_dir: "tensorboard_logs"
-  run_name: "vgm_bridge_v2_b_plus_state_first_last_delta_lerobot_video_448x224_lang_53f_full_jitter_2gpu_bs1_acc4_50k"
+  run_name: "vgm_bridge_v2_b_plus_state_first_last_delta_lerobot_video_448x224_lang_53f_full_jitter_2gpu_gbs8_50k"
 
 finetune:
   checkpoint_path: null
