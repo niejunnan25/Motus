@@ -157,6 +157,7 @@ class VideoBridgeDataset(data.Dataset):
       <root>/meta/episodes/chunk-000/file-000.parquet
       <root>/videos/<video_key>/chunk-000/file-000.mp4
     """
+    VALID_BRIDGE_SAMPLING_MODES = {"sliding_window", "full_episode_uniform"}
 
     def __init__(
         self,
@@ -176,6 +177,8 @@ class VideoBridgeDataset(data.Dataset):
         task_language_embedding_pattern: str = "task_{task_index:06d}.pt",
         load_state: bool = False,
         state_column: str = "observation.state",
+        bridge_sampling_mode: str = "sliding_window",
+        bridge_sampling_jitter: bool = False,
         cache_scan: bool = True,
         val: bool = False,
         **kwargs: Any,
@@ -183,6 +186,11 @@ class VideoBridgeDataset(data.Dataset):
         super().__init__()
         if not dataset_dir:
             raise ValueError("dataset.dataset_dir must contain at least one video dataset root")
+        if bridge_sampling_mode not in self.VALID_BRIDGE_SAMPLING_MODES:
+            raise ValueError(
+                f"Unknown bridge_sampling_mode={bridge_sampling_mode!r}; "
+                f"expected one of {sorted(self.VALID_BRIDGE_SAMPLING_MODES)}"
+            )
 
         self.dataset_dir = [Path(path) for path in dataset_dir]
         self.global_downsample_rate = int(global_downsample_rate)
@@ -199,6 +207,8 @@ class VideoBridgeDataset(data.Dataset):
         self.task_language_embedding_pattern = task_language_embedding_pattern
         self.load_state = bool(load_state)
         self.state_column = str(state_column)
+        self.bridge_sampling_mode = bridge_sampling_mode
+        self.bridge_sampling_jitter = bool(bridge_sampling_jitter)
         self.cache_scan = bool(cache_scan)
         self.val = val
         self._state_cache: Dict[str, Tuple[torch.Tensor, Optional[Dict[int, int]]]] = {}
@@ -209,13 +219,16 @@ class VideoBridgeDataset(data.Dataset):
 
         logger.info(
             "VideoBridgeDataset initialized with %s episodes from %s roots; "
-            "data_format=%s, image_columns=%s, view_layout=%s, require_language_embedding=%s",
+            "data_format=%s, image_columns=%s, view_layout=%s, require_language_embedding=%s, "
+            "bridge_sampling_mode=%s, bridge_sampling_jitter=%s",
             len(self.episodes),
             len(self.dataset_dir),
             self.data_format,
             self.image_columns,
             self.view_layout,
             self.require_language_embedding,
+            self.bridge_sampling_mode,
+            self.bridge_sampling_jitter,
         )
 
     def _scan_all_episodes(self) -> List[Dict[str, Any]]:
@@ -518,7 +531,35 @@ class VideoBridgeDataset(data.Dataset):
     def __len__(self) -> int:
         return len(self.episodes) * 100
 
+    def _uniform_frame_indices(self, total_frames: int, *, jitter: bool) -> List[int]:
+        frame_count = self.num_video_frames + 1
+        if total_frames < frame_count:
+            raise ValueError(f"Video is too short: total_frames={total_frames}, needs at least {frame_count}")
+
+        start_idx = 0
+        end_idx = total_frames - 1
+        targets = np.linspace(start_idx, end_idx, frame_count)
+        if not jitter or frame_count <= 2:
+            return [int(round(value)) for value in targets]
+
+        indices = [start_idx]
+        for frame_pos in range(1, frame_count - 1):
+            left = (targets[frame_pos - 1] + targets[frame_pos]) * 0.5
+            right = (targets[frame_pos] + targets[frame_pos + 1]) * 0.5
+            lo = max(start_idx + 1, int(np.ceil(left)))
+            hi = min(end_idx - 1, int(np.floor(right)))
+            if lo <= hi:
+                indices.append(random.randint(lo, hi))
+            else:
+                indices.append(int(round(targets[frame_pos])))
+        indices.append(end_idx)
+        return [int(max(start_idx, min(end_idx, value))) for value in indices]
+
     def _select_indices(self, total_frames: int) -> Tuple[int, List[int]]:
+        if self.bridge_sampling_mode == "full_episode_uniform":
+            frame_indices = self._uniform_frame_indices(total_frames, jitter=self.bridge_sampling_jitter)
+            return frame_indices[0], frame_indices[1:]
+
         step = self.global_downsample_rate
         max_cond = total_frames - 1 - self.num_video_frames * step
         if max_cond < 0:
@@ -663,21 +704,25 @@ class VideoBridgeDataset(data.Dataset):
 
         episode = self.episodes[episode_index % len(self.episodes)]
         total_frames = self._episode_frame_count(episode)
-        max_cond = total_frames - 1 - self.num_video_frames * self.global_downsample_rate
-        if max_cond < 0:
-            raise ValueError(
-                f"Video is too short: total_frames={total_frames}, "
-                f"needs at least {1 + self.num_video_frames * self.global_downsample_rate}"
-            )
+        if self.bridge_sampling_mode == "full_episode_uniform":
+            frame_indices = self._uniform_frame_indices(total_frames, jitter=False)
+            condition_idx = frame_indices[0]
+        else:
+            max_cond = total_frames - 1 - self.num_video_frames * self.global_downsample_rate
+            if max_cond < 0:
+                raise ValueError(
+                    f"Video is too short: total_frames={total_frames}, "
+                    f"needs at least {1 + self.num_video_frames * self.global_downsample_rate}"
+                )
 
-        if condition_idx is None:
-            condition_idx = max_cond // 2
-        condition_idx = int(max(0, min(condition_idx, max_cond)))
-        video_indices = [
-            condition_idx + (i + 1) * self.global_downsample_rate
-            for i in range(self.num_video_frames)
-        ]
-        frame_indices = [condition_idx] + video_indices
+            if condition_idx is None:
+                condition_idx = max_cond // 2
+            condition_idx = int(max(0, min(condition_idx, max_cond)))
+            video_indices = [
+                condition_idx + (i + 1) * self.global_downsample_rate
+                for i in range(self.num_video_frames)
+            ]
+            frame_indices = [condition_idx] + video_indices
         frames = self._load_episode_frames(episode, frame_indices)
         states = self._load_episode_states(episode, frame_indices)
         language_embedding = self._load_language_embedding(episode.get("lang_path"))

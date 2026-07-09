@@ -417,6 +417,8 @@ def create_train_dataloader(config: OmegaConf, rank: int, world_size: int) -> Da
             config.common.get("state_condition_mode", "none") != "none",
         ),
         state_column=config.dataset.get("state_column", "observation.state"),
+        bridge_sampling_mode=config.dataset.get("bridge_sampling_mode", "sliding_window"),
+        bridge_sampling_jitter=config.dataset.get("bridge_sampling_jitter", False),
         cache_scan=config.dataset.get("cache_scan", True),
         val=False,
     )

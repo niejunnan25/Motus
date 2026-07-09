@@ -72,6 +72,8 @@ def build_dataset(config: Any, max_episodes: Optional[int] = None) -> VideoBridg
             config.common.get("state_condition_mode", "none") != "none",
         ),
         state_column=config.dataset.get("state_column", "observation.state"),
+        bridge_sampling_mode=config.dataset.get("bridge_sampling_mode", "sliding_window"),
+        bridge_sampling_jitter=config.dataset.get("bridge_sampling_jitter", False),
         cache_scan=config.dataset.get("cache_scan", True),
         val=True,
     )
@@ -171,6 +173,19 @@ def fixed_windows(dataset: VideoBridgeDataset, num_samples: int) -> List[Dict[st
     for sample_idx, episode_index in enumerate(episode_indices):
         episode = dataset.episodes[episode_index]
         total_frames = dataset._episode_frame_count(episode)
+        if dataset.bridge_sampling_mode == "full_episode_uniform":
+            required_frames = dataset.num_video_frames + 1
+            if total_frames < required_frames:
+                logger.warning(
+                    "Skipping short episode %s: %s frames; needs at least %s",
+                    episode.get("episode_name"),
+                    total_frames,
+                    required_frames,
+                )
+                continue
+            windows.append(dataset.get_bridge_window(episode_index))
+            continue
+
         max_cond = total_frames - 1 - dataset.num_video_frames * dataset.global_downsample_rate
         if max_cond < 0:
             logger.warning("Skipping short episode %s: %s frames", episode.get("episode_name"), total_frames)
