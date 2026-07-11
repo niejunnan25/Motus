@@ -182,6 +182,12 @@ class VGMBridgeStage1Trainer:
         with accumulate_context:
             first_frame = batch["first_frame"].to(self.device, dtype=self.dtype)
             video_frames = batch["video_frames"].to(self.device, dtype=self.dtype)
+            first_role_mask = batch.get("first_role_mask")
+            role_mask_frames = batch.get("role_mask_frames")
+            if first_role_mask is not None:
+                first_role_mask = first_role_mask.to(self.device, dtype=self.dtype)
+            if role_mask_frames is not None:
+                role_mask_frames = role_mask_frames.to(self.device, dtype=self.dtype)
             language_embeddings = batch["language_embedding"]
             if language_embeddings is not None:
                 language_embeddings = language_embeddings.to(self.device, dtype=self.dtype)
@@ -196,6 +202,8 @@ class VGMBridgeStage1Trainer:
             loss_dict = model.training_step(
                 first_frame=first_frame,
                 video_frames=video_frames,
+                first_role_mask=first_role_mask,
+                role_mask_frames=role_mask_frames,
                 language_embeddings=language_embeddings,
                 first_state=first_state,
                 last_state=last_state,
@@ -319,6 +327,8 @@ def create_model_and_optimizer(config: OmegaConf) -> tuple[VGMBridgeStage1, torc
         state_hidden_dim=config.common.get("state_hidden_dim", 1024),
         state_dropout=config.common.get("state_dropout", 0.0),
         state_clip=config.common.get("state_clip", 10.0),
+        role_mask_fusion_mode=config.common.get("role_mask_fusion_mode", "none"),
+        role_mask_loss_weight=config.common.get("role_mask_loss_weight", 1.0),
         load_pretrained_backbones=getattr(config.model, "load_pretrained_backbones", None),
     )
     model = VGMBridgeStage1(model_config)
@@ -402,7 +412,10 @@ def create_train_dataloader(config: OmegaConf, rank: int, world_size: int) -> Da
         dataset_dir=[str(path) for path in dataset_dir],
         global_downsample_rate=config.common.global_downsample_rate,
         num_video_frames=config.common.num_video_frames,
-        video_size=(config.common.video_height, config.common.video_width),
+        video_size=(
+            config.dataset.get("video_height", config.common.video_height),
+            config.dataset.get("video_width", config.common.video_width),
+        ),
         max_episodes=config.dataset.get("max_episodes", None),
         require_language_embedding=config.dataset.get("require_language_embedding", False),
         video_extensions=list(config.dataset.get("video_extensions", [".mp4"])),
@@ -420,6 +433,14 @@ def create_train_dataloader(config: OmegaConf, rank: int, world_size: int) -> Da
         state_column=config.dataset.get("state_column", "observation.state"),
         bridge_sampling_mode=config.dataset.get("bridge_sampling_mode", "sliding_window"),
         bridge_sampling_jitter=config.dataset.get("bridge_sampling_jitter", False),
+        load_role_mask=config.dataset.get("load_role_mask", False),
+        role_mask_columns=config.dataset.get("role_mask_columns", None),
+        role_mask_render_mode=config.dataset.get("role_mask_render_mode", "binary"),
+        role_mask_foreground_ids=config.dataset.get("role_mask_foreground_ids", [1, 2, 4]),
+        role_mask_palette=config.dataset.get("role_mask_palette", None),
+        role_mask_cache_dir=config.dataset.get("role_mask_cache_dir", None),
+        role_mask_memory_cache_size=config.dataset.get("role_mask_memory_cache_size", 1),
+        strict_role_mask=config.dataset.get("strict_role_mask", True),
         cache_scan=config.dataset.get("cache_scan", True),
         val=False,
     )

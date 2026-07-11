@@ -57,7 +57,10 @@ def build_dataset(config: Any, max_episodes: Optional[int] = None) -> VideoBridg
         dataset_dir=[str(path) for path in config.dataset.dataset_dir],
         global_downsample_rate=config.common.global_downsample_rate,
         num_video_frames=config.common.num_video_frames,
-        video_size=(config.common.video_height, config.common.video_width),
+        video_size=(
+            config.dataset.get("video_height", config.common.video_height),
+            config.dataset.get("video_width", config.common.video_width),
+        ),
         max_episodes=max_episodes if max_episodes is not None else config.dataset.get("max_episodes", None),
         require_language_embedding=config.dataset.get("require_language_embedding", False),
         video_extensions=list(config.dataset.get("video_extensions", [".mp4"])),
@@ -75,6 +78,14 @@ def build_dataset(config: Any, max_episodes: Optional[int] = None) -> VideoBridg
         state_column=config.dataset.get("state_column", "observation.state"),
         bridge_sampling_mode=config.dataset.get("bridge_sampling_mode", "sliding_window"),
         bridge_sampling_jitter=config.dataset.get("bridge_sampling_jitter", False),
+        load_role_mask=config.dataset.get("load_role_mask", False),
+        role_mask_columns=config.dataset.get("role_mask_columns", None),
+        role_mask_render_mode=config.dataset.get("role_mask_render_mode", "binary"),
+        role_mask_foreground_ids=config.dataset.get("role_mask_foreground_ids", [1, 2, 4]),
+        role_mask_palette=config.dataset.get("role_mask_palette", None),
+        role_mask_cache_dir=config.dataset.get("role_mask_cache_dir", None),
+        role_mask_memory_cache_size=config.dataset.get("role_mask_memory_cache_size", 1),
+        strict_role_mask=config.dataset.get("strict_role_mask", True),
         cache_scan=config.dataset.get("cache_scan", True),
         val=True,
     )
@@ -108,6 +119,8 @@ def build_model(config: Any, checkpoint_path: Path) -> VGMBridgeStage1:
         state_hidden_dim=config.common.get("state_hidden_dim", 1024),
         state_dropout=config.common.get("state_dropout", 0.0),
         state_clip=config.common.get("state_clip", 10.0),
+        role_mask_fusion_mode=config.common.get("role_mask_fusion_mode", "none"),
+        role_mask_loss_weight=config.common.get("role_mask_loss_weight", 1.0),
         load_pretrained_backbones=False,
     )
     model = VGMBridgeStage1(model_config)
@@ -357,6 +370,63 @@ def pixel_metrics(gt_full: torch.Tensor, pred_full: torch.Tensor, tail_condition
     return metrics
 
 
+def role_mask_metrics(
+    gt: torch.Tensor,
+    pred: torch.Tensor,
+    render_mode: str,
+    role_mask_palette: Optional[Dict[Any, Any]] = None,
+) -> Dict[str, float]:
+    """Measure decoded role masks without mixing their easy background into RGB metrics."""
+    if render_mode == "binary":
+        gt_foreground = gt.mean(dim=2) >= 0.5
+        pred_foreground = pred.mean(dim=2) >= 0.5
+        intersection = (gt_foreground & pred_foreground).sum().float()
+        gt_count = gt_foreground.sum().float()
+        pred_count = pred_foreground.sum().float()
+        union = (gt_foreground | pred_foreground).sum().float()
+        return {
+            "role_mask_iou": float((intersection / union.clamp_min(1.0)).cpu()),
+            "role_mask_f1": float((2 * intersection / (gt_count + pred_count).clamp_min(1.0)).cpu()),
+            "role_mask_precision": float((intersection / pred_count.clamp_min(1.0)).cpu()),
+            "role_mask_recall": float((intersection / gt_count.clamp_min(1.0)).cpu()),
+        }
+
+    configured_palette = role_mask_palette or {
+        0: [0, 0, 0],
+        1: [255, 0, 0],
+        2: [0, 255, 0],
+        4: [0, 0, 255],
+    }
+    palette_by_id = {int(role_id): color for role_id, color in configured_palette.items()}
+    role_ids = sorted(role_id for role_id in palette_by_id if role_id in {0, 1, 2, 4})
+    if role_ids != [0, 1, 2, 4]:
+        raise ValueError(f"Color role-mask evaluation requires palette entries 0,1,2,4; got {role_ids}")
+    palette = pred.new_tensor([palette_by_id[role_id] for role_id in role_ids]) / 255.0
+    role_id_tensor = pred.new_tensor(role_ids, dtype=torch.long)
+
+    def nearest_role(value: torch.Tensor) -> torch.Tensor:
+        channels_last = value.permute(0, 1, 3, 4, 2)
+        distance = (channels_last.unsqueeze(-2) - palette).pow(2).sum(dim=-1)
+        return role_id_tensor[distance.argmin(dim=-1)]
+
+    gt_role = nearest_role(gt)
+    pred_role = nearest_role(pred)
+    metrics: Dict[str, float] = {}
+    role_names = {1: "active", 2: "target", 4: "robot"}
+    ious = []
+    for role_index, role_name in role_names.items():
+        gt_current = gt_role == role_index
+        pred_current = pred_role == role_index
+        intersection = (gt_current & pred_current).sum().float()
+        union = (gt_current | pred_current).sum().float()
+        if float(union) > 0:
+            iou = intersection / union
+            ious.append(iou)
+            metrics[f"role_mask_{role_name}_iou"] = float(iou.cpu())
+    metrics["role_mask_macro_iou"] = float(torch.stack(ious).mean().cpu()) if ious else 0.0
+    return metrics
+
+
 def mean_metrics(rows: List[Dict[str, float]]) -> Dict[str, float]:
     keys = sorted({key for row in rows for key in row})
     result = {}
@@ -386,6 +456,12 @@ def evaluate_loss(
                 torch.cuda.manual_seed_all(step_seed)
             first_frame = batch["first_frame"].to(model.device, dtype=model.dtype)
             video_frames = batch["video_frames"].to(model.device, dtype=model.dtype)
+            first_role_mask = batch.get("first_role_mask")
+            role_mask_frames = batch.get("role_mask_frames")
+            if first_role_mask is not None:
+                first_role_mask = first_role_mask.to(model.device, dtype=model.dtype)
+            if role_mask_frames is not None:
+                role_mask_frames = role_mask_frames.to(model.device, dtype=model.dtype)
             language_embeddings = batch["language_embedding"]
             if language_embeddings is not None:
                 language_embeddings = language_embeddings.to(model.device, dtype=model.dtype)
@@ -398,6 +474,8 @@ def evaluate_loss(
             loss_dict = model.training_step(
                 first_frame=first_frame,
                 video_frames=video_frames,
+                first_role_mask=first_role_mask,
+                role_mask_frames=role_mask_frames,
                 language_embeddings=language_embeddings,
                 first_state=first_state,
                 last_state=last_state,
@@ -416,6 +494,8 @@ def evaluate_samples(
     num_inference_steps: int,
     seed: int,
     fps: int,
+    role_mask_render_mode: str = "binary",
+    role_mask_palette: Optional[Dict[Any, Any]] = None,
 ) -> Dict[str, float]:
     sample_dir = output_dir / "samples"
     sample_dir.mkdir(parents=True, exist_ok=True)
@@ -428,6 +508,14 @@ def evaluate_samples(
         tail_n = int(model.config.tail_condition_frames)
         last_frame = video_frames[:, -1] if tail_n > 0 else None
         tail_frames = video_frames[:, -tail_n:] if tail_n > 0 else None
+        first_role_mask = batch.get("first_role_mask")
+        role_mask_frames = batch.get("role_mask_frames")
+        if first_role_mask is not None:
+            first_role_mask = first_role_mask.to(model.device, dtype=model.dtype)
+        if role_mask_frames is not None:
+            role_mask_frames = role_mask_frames.to(model.device, dtype=model.dtype)
+        last_role_mask = role_mask_frames[:, -1] if role_mask_frames is not None and tail_n > 0 else None
+        tail_role_masks = role_mask_frames[:, -tail_n:] if role_mask_frames is not None and tail_n > 0 else None
         language_embeddings = batch["language_embedding"]
         if language_embeddings is not None:
             language_embeddings = language_embeddings.to(model.device, dtype=model.dtype)
@@ -443,18 +531,39 @@ def evaluate_samples(
             first_frame=first_frame,
             last_frame=last_frame,
             tail_frames=tail_frames,
+            first_role_mask=first_role_mask,
+            last_role_mask=last_role_mask,
+            tail_role_masks=tail_role_masks,
             language_embeddings=language_embeddings,
             first_state=first_state,
             last_state=last_state,
             num_inference_steps=num_inference_steps,
             generator=generator,
         )
-        gt_full = torch.cat([first_frame.unsqueeze(1).float(), video_frames.float()], dim=1).clamp(0, 1)
-        batch_metrics = pixel_metrics(
-            gt_full.float(),
-            pred_full.float(),
-            tail_condition_frames=model.config.tail_condition_frames,
-        )
+        gt_rgb = torch.cat([first_frame.unsqueeze(1).float(), video_frames.float()], dim=1).clamp(0, 1)
+        if role_mask_frames is not None:
+            gt_role = torch.cat([first_role_mask.unsqueeze(1).float(), role_mask_frames.float()], dim=1).clamp(0, 1)
+            gt_full = torch.cat([gt_rgb, gt_role], dim=-1)
+            pred_rgb, pred_role = pred_full.chunk(2, dim=-1)
+            batch_metrics = {
+                f"rgb_{key}": value
+                for key, value in pixel_metrics(
+                    gt_rgb.float(), pred_rgb.float(), tail_condition_frames=model.config.tail_condition_frames
+                ).items()
+            }
+            batch_metrics.update(
+                role_mask_metrics(
+                    gt_role.float(),
+                    pred_role.float(),
+                    role_mask_render_mode,
+                    role_mask_palette=role_mask_palette,
+                )
+            )
+        else:
+            gt_full = gt_rgb
+            batch_metrics = pixel_metrics(
+                gt_full.float(), pred_full.float(), tail_condition_frames=model.config.tail_condition_frames
+            )
         metric_rows.append(batch_metrics)
 
         for local_idx in range(pred_full.shape[0]):
@@ -561,6 +670,8 @@ def main() -> None:
             num_inference_steps=args.num_inference_steps,
             seed=args.seed,
             fps=args.fps,
+            role_mask_render_mode=config.dataset.get("role_mask_render_mode", "binary"),
+            role_mask_palette=config.dataset.get("role_mask_palette", None),
         )
 
     with (output_dir / "metrics.json").open("w") as file:

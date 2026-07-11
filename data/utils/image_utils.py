@@ -13,7 +13,11 @@ import random
 from decord import VideoReader, cpu
 
 
-def resize_with_padding(frame: np.ndarray, target_size: Tuple[int, int]) -> np.ndarray:
+def resize_with_padding(
+    frame: np.ndarray,
+    target_size: Tuple[int, int],
+    interpolation: int = cv2.INTER_LINEAR,
+) -> np.ndarray:
     """
     Resize image with aspect ratio preservation and padding to target size.
     
@@ -48,7 +52,7 @@ def resize_with_padding(frame: np.ndarray, target_size: Tuple[int, int]) -> np.n
     new_width = int(original_width * scale)
     
     # Resize with aspect ratio preservation
-    resized_frame = cv2.resize(frame, (new_width, new_height))
+    resized_frame = cv2.resize(frame, (new_width, new_height), interpolation=interpolation)
     
     # Create black background with target size
     padded_frame = np.zeros((target_height, target_width, frame.shape[2]), dtype=frame.dtype)

@@ -1,4 +1,5 @@
 import logging
+import math
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -126,6 +127,8 @@ class VGMBridgeStage1Config:
     state_hidden_dim: int = 1024
     state_dropout: float = 0.0
     state_clip: float = 10.0
+    role_mask_fusion_mode: str = "none"
+    role_mask_loss_weight: float = 1.0
     load_pretrained_backbones: Optional[bool] = None
 
 
@@ -135,6 +138,7 @@ class VGMBridgeStage1(nn.Module):
     VALID_CONDITIONING_MODES = {"v0", "v0_5_endpoint", "v1_mask", "v1_mask_endpoint"}
     VALID_STATE_CONDITION_MODES = {"none", "first", "first_last", "first_last_delta"}
     VALID_INTERACTION_WEIGHT_MODES = {"motion_edge", "motion_only", "motion_gripper_proximity"}
+    VALID_ROLE_MASK_FUSION_MODES = {"none", "spatial", "latent_channel"}
 
     def __init__(self, config: VGMBridgeStage1Config):
         super().__init__()
@@ -157,6 +161,15 @@ class VGMBridgeStage1(nn.Module):
                 f"Unknown interaction_weight_mode={config.interaction_weight_mode!r}; "
                 f"expected one of {sorted(self.VALID_INTERACTION_WEIGHT_MODES)}"
             )
+        if config.role_mask_fusion_mode not in self.VALID_ROLE_MASK_FUSION_MODES:
+            raise ValueError(
+                f"Unknown role_mask_fusion_mode={config.role_mask_fusion_mode!r}; "
+                f"expected one of {sorted(self.VALID_ROLE_MASK_FUSION_MODES)}"
+            )
+        if config.role_mask_loss_weight < 0:
+            raise ValueError("role_mask_loss_weight must be >= 0")
+        if config.role_mask_fusion_mode != "none" and config.interaction_loss_enabled:
+            raise ValueError("Role-mask experiments currently require interaction_loss_enabled=false")
         if config.tail_condition_frames < 0:
             raise ValueError("tail_condition_frames must be >= 0")
         if config.tail_condition_frames > config.num_video_frames:
@@ -195,16 +208,21 @@ class VGMBridgeStage1(nn.Module):
 
         self.device = next(self.video_model.wan_model.parameters()).device
         self.latent_channels = self.video_model.wan_model.in_dim
+        self.role_mask_fusion_mode = config.role_mask_fusion_mode
+        self.use_role_mask = self.role_mask_fusion_mode != "none"
+        self.model_latent_channels = self.latent_channels * (2 if self.role_mask_fusion_mode == "latent_channel" else 1)
         self.use_mask_condition = config.conditioning_mode in {"v1_mask", "v1_mask_endpoint"}
         self.use_endpoint_adapter = config.conditioning_mode in {"v0_5_endpoint", "v1_mask_endpoint"}
         self.use_state_condition = config.state_condition_mode != "none"
         self.use_interaction_loss = bool(config.interaction_loss_enabled)
 
         if self.use_mask_condition:
-            self._expand_patch_embedding(self.latent_channels * 2 + config.mask_channels)
+            self._expand_patch_embedding(self.model_latent_channels * 2 + config.mask_channels)
+        if self.role_mask_fusion_mode == "latent_channel":
+            self._expand_output_head(self.model_latent_channels)
         if self.use_endpoint_adapter:
             self.endpoint_adapter = EndpointTokenAdapter(
-                latent_channels=self.latent_channels,
+                latent_channels=self.model_latent_channels,
                 hidden_dim=self.video_model.wan_model.dim,
                 patch_size=self.video_model.wan_model.patch_size,
             ).to(device=self.device, dtype=self.dtype)
@@ -230,12 +248,13 @@ class VGMBridgeStage1(nn.Module):
 
         logger.info(
             "Initialized VGMBridgeStage1: conditioning_mode=%s, num_video_frames=%s, "
-            "tail_condition_frames=%s, state_condition_mode=%s, interaction_loss=%s, "
+            "tail_condition_frames=%s, state_condition_mode=%s, role_mask_fusion_mode=%s, interaction_loss=%s, "
             "interaction_weight_mode=%s, video_size=%sx%s",
             config.conditioning_mode,
             config.num_video_frames,
             config.tail_condition_frames,
             config.state_condition_mode,
+            config.role_mask_fusion_mode,
             self.use_interaction_loss,
             config.interaction_weight_mode,
             config.video_height,
@@ -281,6 +300,41 @@ class VGMBridgeStage1(nn.Module):
             self.latent_channels,
             new_in_channels,
         )
+
+    def _expand_output_head(self, new_out_channels: int) -> None:
+        """Expand WAN's per-patch output head while preserving RGB rows for every patch cell."""
+        wan_model = self.video_model.wan_model
+        output_head = wan_model.head
+        if int(output_head.out_dim) == int(new_out_channels):
+            return
+        if int(output_head.out_dim) != self.latent_channels:
+            raise ValueError(
+                f"Cannot expand output head with out_dim={output_head.out_dim}; "
+                f"expected base latent_channels={self.latent_channels}"
+            )
+
+        patch_volume = math.prod(output_head.patch_size)
+        old_linear = output_head.head
+        expanded = nn.Linear(
+            old_linear.in_features,
+            patch_volume * int(new_out_channels),
+            bias=old_linear.bias is not None,
+        ).to(device=old_linear.weight.device, dtype=old_linear.weight.dtype)
+        with torch.no_grad():
+            expanded.weight.zero_()
+            expanded_weight = expanded.weight.view(patch_volume, int(new_out_channels), old_linear.in_features)
+            old_weight = old_linear.weight.view(patch_volume, self.latent_channels, old_linear.in_features)
+            expanded_weight[:, : self.latent_channels].copy_(old_weight)
+            if old_linear.bias is not None:
+                expanded.bias.zero_()
+                expanded_bias = expanded.bias.view(patch_volume, int(new_out_channels))
+                old_bias = old_linear.bias.view(patch_volume, self.latent_channels)
+                expanded_bias[:, : self.latent_channels].copy_(old_bias)
+
+        output_head.head = expanded
+        output_head.out_dim = int(new_out_channels)
+        wan_model.out_dim = int(new_out_channels)
+        logger.info("Expanded WAN output head from %s to %s channels", self.latent_channels, new_out_channels)
 
     def _context_list(
         self,
@@ -551,6 +605,7 @@ class VGMBridgeStage1(nn.Module):
     def _endpoint_token_residual(
         self,
         last_frame: Optional[torch.Tensor],
+        last_role_mask: Optional[torch.Tensor],
         target_latent: torch.Tensor,
         seq_len: int,
     ) -> Optional[torch.Tensor]:
@@ -558,9 +613,22 @@ class VGMBridgeStage1(nn.Module):
             return None
         if last_frame is None:
             raise ValueError("last_frame is required when conditioning_mode uses the endpoint adapter")
-        last_frame_norm = (last_frame * 2.0 - 1.0).unsqueeze(2)
+        endpoint_frame = last_frame
+        if self.role_mask_fusion_mode == "spatial":
+            if last_role_mask is None:
+                raise ValueError("last_role_mask is required for spatial role-mask fusion")
+            endpoint_frame = torch.cat([last_frame, last_role_mask], dim=-1)
         with torch.no_grad():
-            endpoint_latent = self.video_model.encode_video(last_frame_norm.to(self.dtype))
+            endpoint_latent = self.video_model.encode_video(
+                (endpoint_frame * 2.0 - 1.0).unsqueeze(2).to(self.dtype)
+            )
+            if self.role_mask_fusion_mode == "latent_channel":
+                if last_role_mask is None:
+                    raise ValueError("last_role_mask is required for latent-channel role-mask fusion")
+                role_latent = self.video_model.encode_video(
+                    (last_role_mask * 2.0 - 1.0).unsqueeze(2).to(self.dtype)
+                )
+                endpoint_latent = torch.cat([endpoint_latent, role_latent], dim=1)
         return self.endpoint_adapter(endpoint_latent, target_latent, seq_len)
 
     def _encode_condition_latent(
@@ -825,6 +893,8 @@ class VGMBridgeStage1(nn.Module):
         self,
         first_frame: torch.Tensor,
         video_frames: torch.Tensor,
+        first_role_mask: Optional[torch.Tensor] = None,
+        role_mask_frames: Optional[torch.Tensor] = None,
         language_embeddings: Optional[torch.Tensor] = None,
         first_state: Optional[torch.Tensor] = None,
         last_state: Optional[torch.Tensor] = None,
@@ -833,25 +903,82 @@ class VGMBridgeStage1(nn.Module):
     ) -> Dict[str, torch.Tensor]:
         """Run one bridge training step for the configured conditioning mode."""
         batch_size = video_frames.shape[0]
+        if self.use_role_mask and (first_role_mask is None or role_mask_frames is None):
+            raise ValueError("Role-mask fusion requires first_role_mask and role_mask_frames")
 
-        first_frame_norm = (first_frame * 2.0 - 1.0).unsqueeze(2)
-        video_normalized = (video_frames * 2.0 - 1.0).permute(0, 2, 1, 3, 4)
-        full_video = torch.cat([first_frame_norm, video_normalized], dim=2)
+        full_rgb = torch.cat(
+            [
+                (first_frame * 2.0 - 1.0).unsqueeze(2),
+                (video_frames * 2.0 - 1.0).permute(0, 2, 1, 3, 4),
+            ],
+            dim=2,
+        )
+        full_role = None
+        if self.use_role_mask:
+            full_role = torch.cat(
+                [
+                    (first_role_mask * 2.0 - 1.0).unsqueeze(2),
+                    (role_mask_frames * 2.0 - 1.0).permute(0, 2, 1, 3, 4),
+                ],
+                dim=2,
+            )
 
         last_frame = video_frames[:, -1] if int(self.config.tail_condition_frames) > 0 else None
+        last_role_mask = (
+            role_mask_frames[:, -1]
+            if self.use_role_mask and int(self.config.tail_condition_frames) > 0
+            else None
+        )
         tail_n = int(self.config.tail_condition_frames)
-        condition_video = torch.zeros_like(full_video)
-        condition_video[:, :, 0:1] = full_video[:, :, 0:1]
+
+        condition_rgb = torch.zeros_like(full_rgb)
+        condition_rgb[:, :, 0:1] = full_rgb[:, :, 0:1]
         if tail_n > 0:
-            condition_video[:, :, -tail_n:] = full_video[:, :, -tail_n:]
+            condition_rgb[:, :, -tail_n:] = full_rgb[:, :, -tail_n:]
+
+        condition_role = None
+        if full_role is not None:
+            condition_role = torch.zeros_like(full_role)
+            condition_role[:, :, 0:1] = full_role[:, :, 0:1]
+            if tail_n > 0:
+                condition_role[:, :, -tail_n:] = full_role[:, :, -tail_n:]
 
         with torch.no_grad():
-            clean_full_latent = self.video_model.encode_video(full_video.to(self.dtype))
-            condition_latent = self._encode_condition_latent(
-                first_frame_norm=first_frame_norm,
-                condition_video=condition_video,
-                latent_template=clean_full_latent,
-            )
+            if self.role_mask_fusion_mode == "spatial":
+                full_video = torch.cat([full_rgb, full_role], dim=-1)
+                condition_video = torch.cat([condition_rgb, condition_role], dim=-1)
+                first_visual = torch.cat([first_frame, first_role_mask], dim=-1)
+                first_visual_norm = (first_visual * 2.0 - 1.0).unsqueeze(2)
+                clean_full_latent = self.video_model.encode_video(full_video.to(self.dtype))
+                condition_latent = self._encode_condition_latent(
+                    first_frame_norm=first_visual_norm,
+                    condition_video=condition_video,
+                    latent_template=clean_full_latent,
+                )
+            elif self.role_mask_fusion_mode == "latent_channel":
+                clean_rgb_latent = self.video_model.encode_video(full_rgb.to(self.dtype))
+                clean_role_latent = self.video_model.encode_video(full_role.to(self.dtype))
+                condition_rgb_latent = self._encode_condition_latent(
+                    first_frame_norm=(first_frame * 2.0 - 1.0).unsqueeze(2),
+                    condition_video=condition_rgb,
+                    latent_template=clean_rgb_latent,
+                )
+                condition_role_latent = self._encode_condition_latent(
+                    first_frame_norm=(first_role_mask * 2.0 - 1.0).unsqueeze(2),
+                    condition_video=condition_role,
+                    latent_template=clean_role_latent,
+                )
+                clean_full_latent = torch.cat([clean_rgb_latent, clean_role_latent], dim=1)
+                condition_latent = torch.cat([condition_rgb_latent, condition_role_latent], dim=1)
+                full_video = full_rgb
+            else:
+                full_video = full_rgb
+                clean_full_latent = self.video_model.encode_video(full_video.to(self.dtype))
+                condition_latent = self._encode_condition_latent(
+                    first_frame_norm=(first_frame * 2.0 - 1.0).unsqueeze(2),
+                    condition_video=condition_rgb,
+                    latent_template=clean_full_latent,
+                )
 
         timestep_id = torch.randint(
             0,
@@ -886,7 +1013,12 @@ class VGMBridgeStage1(nn.Module):
             condition_latent=condition_latent,
             frame_mask=frame_mask,
         )
-        token_residual = self._endpoint_token_residual(last_frame=last_frame, target_latent=noisy_video_latent, seq_len=seq_len)
+        token_residual = self._endpoint_token_residual(
+            last_frame=last_frame,
+            last_role_mask=last_role_mask,
+            target_latent=noisy_video_latent,
+            seq_len=seq_len,
+        )
         timestep_tokens = self._timestep_tokens(
             timestep=video_t_embed,
             latent=noisy_video_latent,
@@ -908,10 +1040,28 @@ class VGMBridgeStage1(nn.Module):
 
         loss_mask = 1 - known_mask
         sq_error = (video_pred.float() - video_target.float()).pow(2)
+
+        def masked_mean(error: torch.Tensor) -> torch.Tensor:
+            expanded = loss_mask.expand_as(error).float()
+            return (error * expanded).sum() / expanded.sum().clamp_min(1.0)
+
+        if self.role_mask_fusion_mode == "spatial":
+            if video_pred.shape[-1] % 2 != 0:
+                raise ValueError(f"Spatial role-mask latent width must be even, got {video_pred.shape[-1]}")
+            split = video_pred.shape[-1] // 2
+            rgb_loss = masked_mean(sq_error[..., :split])
+            role_mask_loss = masked_mean(sq_error[..., split:])
+            base_video_loss = rgb_loss + float(self.config.role_mask_loss_weight) * role_mask_loss
+        elif self.role_mask_fusion_mode == "latent_channel":
+            rgb_loss = masked_mean(sq_error[:, : self.latent_channels])
+            role_mask_loss = masked_mean(sq_error[:, self.latent_channels :])
+            base_video_loss = rgb_loss + float(self.config.role_mask_loss_weight) * role_mask_loss
+        else:
+            rgb_loss = masked_mean(sq_error)
+            role_mask_loss = rgb_loss.detach().new_zeros(())
+            base_video_loss = rgb_loss
+
         expanded_loss_mask = loss_mask.expand_as(video_pred).float()
-        base_sq_error = sq_error * expanded_loss_mask
-        base_denom = expanded_loss_mask.sum().clamp_min(1.0)
-        base_video_loss = base_sq_error.sum() / base_denom
 
         interaction_weight = self._interaction_latent_weight(
             full_video=full_video,
@@ -941,6 +1091,8 @@ class VGMBridgeStage1(nn.Module):
                 "video_loss": video_loss,
                 "middle_loss": video_loss,
                 "base_video_loss": base_video_loss,
+                "rgb_loss": rgb_loss,
+                "role_mask_loss": role_mask_loss,
                 "interaction_weight_mean": interaction_weight_mean.detach(),
                 "interaction_weight_max": interaction_weight_max.detach(),
                 "action_loss": zero,
@@ -953,6 +1105,9 @@ class VGMBridgeStage1(nn.Module):
         first_frame: torch.Tensor,
         last_frame: Optional[torch.Tensor] = None,
         tail_frames: Optional[torch.Tensor] = None,
+        first_role_mask: Optional[torch.Tensor] = None,
+        last_role_mask: Optional[torch.Tensor] = None,
+        tail_role_masks: Optional[torch.Tensor] = None,
         language_embeddings: Optional[torch.Tensor] = None,
         first_state: Optional[torch.Tensor] = None,
         last_state: Optional[torch.Tensor] = None,
@@ -968,18 +1123,53 @@ class VGMBridgeStage1(nn.Module):
                 last_frame = last_frame.to(device=self.device, dtype=self.dtype)
             if tail_frames is not None:
                 tail_frames = tail_frames.to(device=self.device, dtype=self.dtype)
+            if first_role_mask is not None:
+                first_role_mask = first_role_mask.to(device=self.device, dtype=self.dtype)
+            if last_role_mask is not None:
+                last_role_mask = last_role_mask.to(device=self.device, dtype=self.dtype)
+            if tail_role_masks is not None:
+                tail_role_masks = tail_role_masks.to(device=self.device, dtype=self.dtype)
+            if self.use_role_mask and first_role_mask is None:
+                raise ValueError("Role-mask sampling requires first_role_mask")
             batch_size = first_frame.shape[0]
 
-            condition_video = self._make_condition_video(
+            condition_rgb = self._make_condition_video(
                 first_frame=first_frame,
                 last_frame=last_frame,
                 tail_frames=tail_frames,
             )
-            first_frame_norm = (first_frame * 2.0 - 1.0).unsqueeze(2)
-            condition_latent = self._encode_condition_latent(
-                first_frame_norm=first_frame_norm,
-                condition_video=condition_video,
-            )
+            if self.role_mask_fusion_mode == "spatial":
+                condition_role = self._make_condition_video(
+                    first_frame=first_role_mask,
+                    last_frame=last_role_mask,
+                    tail_frames=tail_role_masks,
+                )
+                condition_video = torch.cat([condition_rgb, condition_role], dim=-1)
+                first_visual = torch.cat([first_frame, first_role_mask], dim=-1)
+                condition_latent = self._encode_condition_latent(
+                    first_frame_norm=(first_visual * 2.0 - 1.0).unsqueeze(2),
+                    condition_video=condition_video,
+                )
+            elif self.role_mask_fusion_mode == "latent_channel":
+                condition_role = self._make_condition_video(
+                    first_frame=first_role_mask,
+                    last_frame=last_role_mask,
+                    tail_frames=tail_role_masks,
+                )
+                condition_rgb_latent = self._encode_condition_latent(
+                    first_frame_norm=(first_frame * 2.0 - 1.0).unsqueeze(2),
+                    condition_video=condition_rgb,
+                )
+                condition_role_latent = self._encode_condition_latent(
+                    first_frame_norm=(first_role_mask * 2.0 - 1.0).unsqueeze(2),
+                    condition_video=condition_role,
+                )
+                condition_latent = torch.cat([condition_rgb_latent, condition_role_latent], dim=1)
+            else:
+                condition_latent = self._encode_condition_latent(
+                    first_frame_norm=(first_frame * 2.0 - 1.0).unsqueeze(2),
+                    condition_video=condition_rgb,
+                )
             if self.config.conditioning_mode == "v0":
                 known_mask = self._known_condition_mask(condition_latent)
             else:
@@ -1008,10 +1198,14 @@ class VGMBridgeStage1(nn.Module):
             state_tokens = self._state_tokens(first_state=first_state, last_state=last_state)
             context = self._context_list(language_embeddings, batch_size, state_tokens=state_tokens)
             endpoint_frame = last_frame
+            endpoint_role_mask = last_role_mask
             if endpoint_frame is None and tail_frames is not None and tail_frames.shape[1] > 0:
                 endpoint_frame = tail_frames[:, -1]
+            if endpoint_role_mask is None and tail_role_masks is not None and tail_role_masks.shape[1] > 0:
+                endpoint_role_mask = tail_role_masks[:, -1]
             token_residual = self._endpoint_token_residual(
                 last_frame=endpoint_frame,
+                last_role_mask=endpoint_role_mask,
                 target_latent=latent,
                 seq_len=seq_len,
             )
@@ -1042,7 +1236,12 @@ class VGMBridgeStage1(nn.Module):
                 latent = latent + pred * (sigma_next - sigma)
                 latent = latent * (1 - known_mask) + condition_latent * known_mask
 
-            decoded = self.video_model.decode_video(latent.to(self.dtype)).float()
+            if self.role_mask_fusion_mode == "latent_channel":
+                decoded_rgb = self.video_model.decode_video(latent[:, : self.latent_channels].to(self.dtype)).float()
+                decoded_role = self.video_model.decode_video(latent[:, self.latent_channels :].to(self.dtype)).float()
+                decoded = torch.cat([decoded_rgb, decoded_role], dim=-1)
+            else:
+                decoded = self.video_model.decode_video(latent.to(self.dtype)).float()
             decoded = (decoded.clamp(-1.0, 1.0) + 1.0) * 0.5
             return decoded.permute(0, 2, 1, 3, 4).contiguous()
         finally:

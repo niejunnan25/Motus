@@ -5,6 +5,7 @@ import os
 import pickle
 import random
 import uuid
+from collections import OrderedDict
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -19,6 +20,10 @@ from data.utils.image_utils import get_video_frame_count, load_video_frames, res
 
 
 logger = logging.getLogger(__name__)
+
+
+class RoleMaskDataError(RuntimeError):
+    """A strict role-mask data failure that should not be hidden by sample retries."""
 
 
 def _has_video_subdir(directory: Path) -> bool:
@@ -124,6 +129,15 @@ def _process_state_tensors_batch(states: List[Optional[torch.Tensor]]) -> Option
     return torch.stack([state.float() for state in states if state is not None], dim=0)
 
 
+def _process_optional_tensors_batch(tensors: List[Optional[torch.Tensor]], name: str) -> Optional[torch.Tensor]:
+    """Stack an optional tensor field while rejecting mixed mask/no-mask batches."""
+    if not tensors or all(tensor is None for tensor in tensors):
+        return None
+    if any(tensor is None for tensor in tensors):
+        raise ValueError(f"Mixed {name}/no-{name} samples in one batch")
+    return torch.stack([tensor for tensor in tensors if tensor is not None], dim=0)
+
+
 def video_bridge_collate_fn(batch: List[Optional[Dict[str, Any]]]) -> Optional[Dict[str, Any]]:
     """Collate pure video bridge samples."""
     batch = [sample for sample in batch if sample is not None]
@@ -133,6 +147,12 @@ def video_bridge_collate_fn(batch: List[Optional[Dict[str, Any]]]) -> Optional[D
     return {
         "first_frame": torch.stack([sample["first_frame"] for sample in batch]),
         "video_frames": torch.stack([sample["video_frames"] for sample in batch]),
+        "first_role_mask": _process_optional_tensors_batch(
+            [sample.get("first_role_mask") for sample in batch], "first_role_mask"
+        ),
+        "role_mask_frames": _process_optional_tensors_batch(
+            [sample.get("role_mask_frames") for sample in batch], "role_mask_frames"
+        ),
         "language_embedding": _process_language_embeddings_batch(
             [sample.get("language_embedding") for sample in batch]
         ),
@@ -189,6 +209,14 @@ class VideoBridgeDataset(data.Dataset):
         state_column: str = "observation.state",
         bridge_sampling_mode: str = "sliding_window",
         bridge_sampling_jitter: bool = False,
+        load_role_mask: bool = False,
+        role_mask_columns: Optional[List[str]] = None,
+        role_mask_render_mode: str = "binary",
+        role_mask_foreground_ids: Optional[List[int]] = None,
+        role_mask_palette: Optional[Dict[Any, List[int]]] = None,
+        role_mask_cache_dir: Optional[str] = None,
+        role_mask_memory_cache_size: int = 1,
+        strict_role_mask: bool = True,
         cache_scan: bool = True,
         val: bool = False,
         **kwargs: Any,
@@ -220,9 +248,41 @@ class VideoBridgeDataset(data.Dataset):
         self.state_column = str(state_column)
         self.bridge_sampling_mode = bridge_sampling_mode
         self.bridge_sampling_jitter = bool(bridge_sampling_jitter)
+        self.load_role_mask = bool(load_role_mask)
+        self.role_mask_columns = list(role_mask_columns or [])
+        self.role_mask_render_mode = str(role_mask_render_mode)
+        self.role_mask_foreground_ids = tuple(
+            int(value) for value in (role_mask_foreground_ids or [1, 2, 4])
+        )
+        default_palette = {
+            0: [0, 0, 0],
+            1: [255, 0, 0],
+            2: [0, 255, 0],
+            4: [0, 0, 255],
+        }
+        palette_source = role_mask_palette or default_palette
+        self.role_mask_palette = {
+            int(role_id): np.asarray(color, dtype=np.uint8)
+            for role_id, color in palette_source.items()
+        }
+        self.role_mask_cache_dir = Path(role_mask_cache_dir) if role_mask_cache_dir else None
+        self.role_mask_memory_cache_size = max(0, int(role_mask_memory_cache_size))
+        self.strict_role_mask = bool(strict_role_mask)
         self.cache_scan = bool(cache_scan)
         self.val = val
         self._state_cache: Dict[str, Tuple[torch.Tensor, Optional[Dict[int, int]]]] = {}
+        self._role_mask_cache: OrderedDict[str, Tuple[np.ndarray, List[np.ndarray]]] = OrderedDict()
+
+        if self.load_role_mask:
+            if len(self.role_mask_columns) != len(self.image_columns):
+                raise ValueError(
+                    "role_mask_columns must contain one column per RGB image column: "
+                    f"got {len(self.role_mask_columns)} masks for {len(self.image_columns)} views"
+                )
+            if self.role_mask_render_mode not in {"binary", "role_color"}:
+                raise ValueError("role_mask_render_mode must be 'binary' or 'role_color'")
+            if self.role_mask_cache_dir is not None:
+                self.role_mask_cache_dir.mkdir(parents=True, exist_ok=True)
 
         self.episodes = self._scan_all_episodes()
         if self.max_episodes is not None and self.max_episodes > 0:
@@ -258,6 +318,9 @@ class VideoBridgeDataset(data.Dataset):
         if self.load_state:
             safe_state_column = self.state_column.replace("/", "_").replace(".", "_")
             cache_suffix += f".state.{safe_state_column}"
+        if self.load_role_mask:
+            mask_key = "|".join(self.role_mask_columns)
+            cache_suffix += f".rolemask.{hashlib.sha1(mask_key.encode('utf-8')).hexdigest()[:12]}"
 
         for root in self.dataset_dir:
             cache_file = root / f"cached_video_bridge_episodes.{cache_suffix}.v2.pkl"
@@ -386,7 +449,7 @@ class VideoBridgeDataset(data.Dataset):
             episode_task_by_index = self._load_lerobot_v3_episode_tasks(leaf_dir, pd) if load_task_language else {}
             episode_data_paths_by_index = (
                 self._load_lerobot_v3_episode_data_paths(leaf_dir, pd)
-                if self.load_state
+                if self.load_state or self.load_role_mask
                 else {}
             )
             task_embedding_dir = self._resolve_task_language_embedding_dir(leaf_dir) if load_task_language else None
@@ -452,9 +515,9 @@ class VideoBridgeDataset(data.Dataset):
                         )
                         continue
                     data_paths = episode_data_paths_by_index.get(episode_index, [])
-                    if self.load_state and not data_paths:
+                    if (self.load_state or self.load_role_mask) and not data_paths:
                         logger.warning(
-                            "Skipping %s/episode_%06d because no LeRobot data parquet was found for state loading",
+                            "Skipping %s/episode_%06d because no LeRobot data parquet was found",
                             leaf_dir.name,
                             episode_index,
                         )
@@ -671,6 +734,165 @@ class VideoBridgeDataset(data.Dataset):
         raise ValueError(f"State loading is not supported for episode format={episode.get('format')!r}")
 
     @staticmethod
+    def _nested_role_mask_array(table: Any, column_name: str) -> np.ndarray:
+        column = table[column_name].combine_chunks()
+        if len(column) == 0:
+            raise ValueError(f"Role-mask column {column_name!r} is empty")
+        height = len(column[0])
+        width = len(column[0].values)
+        values = column.values.values.to_numpy(zero_copy_only=False)
+        expected = len(column) * height * width
+        if values.size != expected:
+            raise ValueError(
+                f"Unexpected flattened size for {column_name}: got {values.size}, expected {expected}"
+            )
+        return values.reshape(len(column), height, width).astype(np.uint8, copy=False)
+
+    def _role_mask_cache_path(self, episode: Dict[str, Any]) -> Optional[Path]:
+        if self.role_mask_cache_dir is None:
+            return None
+        source_key = f"{episode.get('root')}|{'|'.join(self.role_mask_columns)}|role-mask-cache-v2"
+        source_dir = hashlib.sha1(source_key.encode("utf-8")).hexdigest()[:16]
+        return self.role_mask_cache_dir / source_dir / f"episode_{int(episode['episode_index']):06d}.npz"
+
+    def _role_mask_source_signature(self, episode: Dict[str, Any]) -> str:
+        parts = ["role-mask-source-v1", "|".join(self.role_mask_columns)]
+        for raw_path in episode.get("data_paths") or []:
+            path = Path(raw_path)
+            stat = path.stat()
+            parts.append(f"{path.resolve()}:{stat.st_size}:{stat.st_mtime_ns}")
+        return hashlib.sha1("\n".join(parts).encode("utf-8")).hexdigest()
+
+    def _read_role_mask_cache(
+        self,
+        cache_path: Path,
+        expected_source_signature: str,
+    ) -> Optional[Tuple[np.ndarray, List[np.ndarray]]]:
+        if not cache_path.exists():
+            return None
+        try:
+            with np.load(cache_path, allow_pickle=False) as payload:
+                source_signature = str(payload["source_signature"].item())
+                if source_signature != expected_source_signature:
+                    logger.info("Ignoring stale role-mask cache %s", cache_path)
+                    return None
+                frame_indices = payload["frame_indices"].astype(np.int64, copy=False)
+                masks = [payload[f"view_{idx}"] for idx in range(len(self.role_mask_columns))]
+            return frame_indices, masks
+        except Exception as exc:
+            logger.warning("Ignoring unreadable role-mask cache %s: %s", cache_path, exc)
+            return None
+
+    def _write_role_mask_cache(
+        self,
+        cache_path: Path,
+        source_signature: str,
+        frame_indices: np.ndarray,
+        masks: List[np.ndarray],
+    ) -> None:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = cache_path.with_name(f".{cache_path.stem}.{os.getpid()}.{uuid.uuid4().hex}.npz")
+        payload = {
+            "source_signature": np.asarray(source_signature),
+            "frame_indices": frame_indices.astype(np.int64, copy=False),
+        }
+        payload.update({f"view_{idx}": mask for idx, mask in enumerate(masks)})
+        try:
+            np.savez_compressed(tmp_path, **payload)
+            os.replace(tmp_path, cache_path)
+        finally:
+            if tmp_path.exists():
+                tmp_path.unlink()
+
+    def _cache_role_masks_in_memory(
+        self,
+        key: str,
+        value: Tuple[np.ndarray, List[np.ndarray]],
+    ) -> None:
+        if self.role_mask_memory_cache_size <= 0:
+            return
+        self._role_mask_cache[key] = value
+        self._role_mask_cache.move_to_end(key)
+        while len(self._role_mask_cache) > self.role_mask_memory_cache_size:
+            self._role_mask_cache.popitem(last=False)
+
+    def _read_lerobot_v3_role_mask_table(
+        self,
+        episode: Dict[str, Any],
+    ) -> Tuple[np.ndarray, List[np.ndarray]]:
+        import pyarrow.dataset as pads
+
+        cache_key = f"{episode.get('root')}::{episode.get('episode_index')}::{'|'.join(self.role_mask_columns)}"
+        cached = self._role_mask_cache.get(cache_key)
+        if cached is not None:
+            self._role_mask_cache.move_to_end(cache_key)
+            return cached
+
+        cache_path = self._role_mask_cache_path(episode)
+        source_signature = self._role_mask_source_signature(episode)
+        if cache_path is not None:
+            cached = self._read_role_mask_cache(cache_path, source_signature)
+            if cached is not None:
+                self._cache_role_masks_in_memory(cache_key, cached)
+                return cached
+
+        data_paths = episode.get("data_paths") or []
+        if not data_paths:
+            raise ValueError(f"No data_paths available for {episode.get('episode_name')}")
+        episode_index = int(episode["episode_index"])
+        dataset = pads.dataset(data_paths, format="parquet")
+        table = dataset.to_table(
+            columns=["frame_index", *self.role_mask_columns],
+            filter=pads.field("episode_index") == episode_index,
+        ).sort_by("frame_index")
+        frame_indices = table["frame_index"].combine_chunks().to_numpy(zero_copy_only=False).astype(np.int64)
+        masks = [self._nested_role_mask_array(table, column) for column in self.role_mask_columns]
+        value = (frame_indices, masks)
+        if cache_path is not None:
+            self._write_role_mask_cache(cache_path, source_signature, frame_indices, masks)
+        self._cache_role_masks_in_memory(cache_key, value)
+        return value
+
+    def _render_role_mask(self, role_mask: np.ndarray) -> np.ndarray:
+        if self.role_mask_render_mode == "binary":
+            foreground = np.isin(role_mask, np.asarray(self.role_mask_foreground_ids, dtype=np.uint8))
+            return np.repeat((foreground.astype(np.uint8) * 255)[..., None], 3, axis=-1)
+
+        rendered = np.zeros((*role_mask.shape, 3), dtype=np.uint8)
+        for role_id, color in self.role_mask_palette.items():
+            rendered[role_mask == role_id] = color
+        return rendered
+
+    def _load_episode_role_masks(
+        self,
+        episode: Dict[str, Any],
+        frame_indices: List[int],
+    ) -> Optional[torch.Tensor]:
+        if not self.load_role_mask:
+            return None
+        if episode.get("format") != "lerobot_v3_video":
+            raise ValueError("role_mask loading currently requires data_format='lerobot_v3_video'")
+
+        stored_indices, masks = self._read_lerobot_v3_role_mask_table(episode)
+        index_to_position = {int(frame_idx): pos for pos, frame_idx in enumerate(stored_indices.tolist())}
+        missing = [frame_idx for frame_idx in frame_indices if frame_idx not in index_to_position]
+        if missing:
+            raise ValueError(f"Missing role-mask frame indices {missing} for {episode.get('episode_name')}")
+        positions = [index_to_position[frame_idx] for frame_idx in frame_indices]
+
+        frames = []
+        for position_idx in range(len(frame_indices)):
+            rendered_views = [self._render_role_mask(view_masks[positions[position_idx]]) for view_masks in masks]
+            frame_np = self._compose_lerobot_views(rendered_views)
+            if self.video_size is not None and frame_np.shape[:2] != tuple(self.video_size):
+                import cv2
+
+                frame_np = resize_with_padding(frame_np, self.video_size, interpolation=cv2.INTER_NEAREST)
+            frames.append(frame_np)
+        frames_np = np.stack(frames, axis=0)
+        return torch.from_numpy(frames_np).permute(0, 3, 1, 2).float() / 255.0
+
+    @staticmethod
     def _state_cell_to_tensor(cell: Any) -> torch.Tensor:
         if isinstance(cell, torch.Tensor):
             tensor = cell.detach().cpu().float()
@@ -799,12 +1021,15 @@ class VideoBridgeDataset(data.Dataset):
             ]
             frame_indices = [condition_idx] + video_indices
         frames = self._load_episode_frames(episode, frame_indices)
+        role_masks = self._load_episode_role_masks(episode, frame_indices)
         states = self._load_episode_states(episode, frame_indices)
         language_embedding = self._load_language_embedding(episode.get("lang_path"))
 
         sample = {
             "first_frame": frames[0],
             "video_frames": frames[1:],
+            "first_role_mask": role_masks[0] if role_masks is not None else None,
+            "role_mask_frames": role_masks[1:] if role_masks is not None else None,
             "language_embedding": language_embedding,
             "episode_name": episode["episode_name"],
             "video_path": episode.get("video_path", episode.get("parquet_path", episode.get("video_paths"))),
@@ -946,12 +1171,22 @@ class VideoBridgeDataset(data.Dataset):
                 frame_indices = [condition_idx] + video_indices
 
                 frames = self._load_episode_frames(episode, frame_indices)
+                try:
+                    role_masks = self._load_episode_role_masks(episode, frame_indices)
+                except Exception as exc:
+                    if self.load_role_mask and self.strict_role_mask:
+                        raise RoleMaskDataError(
+                            f"Failed loading role masks for {episode.get('episode_name')}"
+                        ) from exc
+                    raise
                 states = self._load_episode_states(episode, frame_indices)
                 language_embedding = self._load_language_embedding(episode.get("lang_path"))
 
                 sample = {
                     "first_frame": frames[0],
                     "video_frames": frames[1:],
+                    "first_role_mask": role_masks[0] if role_masks is not None else None,
+                    "role_mask_frames": role_masks[1:] if role_masks is not None else None,
                     "language_embedding": language_embedding,
                     "episode_name": episode["episode_name"],
                     "video_path": episode.get("video_path", episode.get("parquet_path", episode.get("video_paths"))),
@@ -965,6 +1200,8 @@ class VideoBridgeDataset(data.Dataset):
                 }
                 return self._add_states_to_sample(sample, states)
             except Exception as exc:
+                if isinstance(exc, RoleMaskDataError):
+                    raise
                 logger.warning(
                     "Retry due to video bridge sample error (%s): %s",
                     episode.get("episode_name", "unknown"),
