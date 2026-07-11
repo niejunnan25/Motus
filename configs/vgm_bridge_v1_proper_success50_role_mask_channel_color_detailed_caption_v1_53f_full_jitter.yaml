@@ -57,7 +57,7 @@ model:
     precision: "bfloat16"
 
 training:
-  batch_size: 4
+  batch_size: 2
   gradient_accumulation_steps: 1
   max_steps: 30000
   learning_rate: 1.0e-5
@@ -85,7 +85,7 @@ logging:
   report_to: "wandb"
   wandb_project: "motus"
   tensorboard_log_dir: "tensorboard_logs"
-  run_name: "vgm_bridge_v1_proper_lerobot_success50_role_mask_channel_color_448x224_detailed_caption_v1_53f_full_jitter_2gpu_gbs8_30k"
+  run_name: "vgm_bridge_v1_proper_lerobot_success50_role_mask_channel_color_448x224_detailed_caption_v1_53f_full_jitter_2gpu_gbs4_ddpfix_30k"
 
 resume:
   checkpoint_path: null

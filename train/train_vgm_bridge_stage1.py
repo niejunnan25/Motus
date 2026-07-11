@@ -116,12 +116,44 @@ class VGMBridgeStage1Trainer:
         self.config = config
         self.global_step = 0
         self.epoch = 0
+        self._distributed_sync_verified = world_size <= 1
 
         if rank == 0:
             self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
         logger.info("VGMBridgeStage1 trainer initialized on rank %s/%s", rank, world_size)
         logger.info("Logging backends: %s", self.report_to)
+
+    def _verify_distributed_gradient_sync(self) -> None:
+        """Fail fast when a multi-rank backward did not synchronize gradients."""
+        if self._distributed_sync_verified or self.accelerator is None or self.world_size <= 1:
+            return
+
+        unwrapped_model = self.accelerator.unwrap_model(self.model)
+        for name, parameter in unwrapped_model.named_parameters():
+            if not parameter.requires_grad or parameter.grad is None:
+                continue
+            gradient = parameter.grad.detach().float()
+            stats = torch.stack(
+                [
+                    gradient.mean(),
+                    gradient.abs().mean(),
+                    gradient.square().mean(),
+                ]
+            )
+            gathered = self.accelerator.gather(stats).view(self.world_size, -1)
+            reference = gathered[0:1].expand_as(gathered)
+            if not torch.allclose(gathered, reference, rtol=1e-4, atol=1e-7):
+                raise RuntimeError(
+                    "Distributed gradient synchronization check failed for "
+                    f"{name}: per-rank stats={gathered.cpu().tolist()}"
+                )
+            self._distributed_sync_verified = True
+            if self.rank == 0:
+                logger.info("Verified synchronized gradients across %s ranks using %s", self.world_size, name)
+            return
+
+        raise RuntimeError("Could not find a trainable gradient for the distributed synchronization check")
 
     def save_checkpoint(self, suffix: str = "") -> None:
         """Save full accelerator state and resolved config."""
@@ -198,8 +230,7 @@ class VGMBridgeStage1Trainer:
             if last_state is not None:
                 last_state = last_state.to(self.device, dtype=self.dtype)
 
-            model = self.accelerator.unwrap_model(self.model) if self.accelerator is not None else self.model
-            loss_dict = model.training_step(
+            loss_dict = self.model(
                 first_frame=first_frame,
                 video_frames=video_frames,
                 first_role_mask=first_role_mask,
@@ -215,6 +246,7 @@ class VGMBridgeStage1Trainer:
             if self.accelerator is not None:
                 self.accelerator.backward(total_loss)
                 if self.accelerator.sync_gradients:
+                    self._verify_distributed_gradient_sync()
                     grad_clip_norm = getattr(self.config.training, "grad_clip_norm", 1.0)
                     self.accelerator.clip_grad_norm_(self.model.parameters(), max_norm=grad_clip_norm)
             else:

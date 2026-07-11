@@ -889,6 +889,31 @@ class VGMBridgeStage1(nn.Module):
         active_mean = (latent_weight * active_mask).sum(dim=(1, 2, 3, 4), keepdim=True) / active_sum
         return latent_weight / active_mean.clamp_min(1e-6)
 
+    def forward(
+        self,
+        first_frame: torch.Tensor,
+        video_frames: torch.Tensor,
+        first_role_mask: Optional[torch.Tensor] = None,
+        role_mask_frames: Optional[torch.Tensor] = None,
+        language_embeddings: Optional[torch.Tensor] = None,
+        first_state: Optional[torch.Tensor] = None,
+        last_state: Optional[torch.Tensor] = None,
+        global_step: Optional[int] = None,
+        return_dict: bool = True,
+    ) -> Dict[str, torch.Tensor]:
+        """Run the training forward through wrappers such as DDP or DeepSpeed."""
+        return self.training_step(
+            first_frame=first_frame,
+            video_frames=video_frames,
+            first_role_mask=first_role_mask,
+            role_mask_frames=role_mask_frames,
+            language_embeddings=language_embeddings,
+            first_state=first_state,
+            last_state=last_state,
+            global_step=global_step,
+            return_dict=return_dict,
+        )
+
     def training_step(
         self,
         first_frame: torch.Tensor,

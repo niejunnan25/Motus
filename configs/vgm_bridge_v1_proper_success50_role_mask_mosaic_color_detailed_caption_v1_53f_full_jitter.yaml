@@ -58,7 +58,7 @@ model:
 
 training:
   batch_size: 2
-  gradient_accumulation_steps: 2
+  gradient_accumulation_steps: 1
   max_steps: 30000
   learning_rate: 1.0e-5
   weight_decay: 0.01
@@ -85,7 +85,7 @@ logging:
   report_to: "wandb"
   wandb_project: "motus"
   tensorboard_log_dir: "tensorboard_logs"
-  run_name: "vgm_bridge_v1_proper_lerobot_success50_role_mask_mosaic_color_448x448_detailed_caption_v1_53f_full_jitter_2gpu_gbs8_30k"
+  run_name: "vgm_bridge_v1_proper_lerobot_success50_role_mask_mosaic_color_448x448_detailed_caption_v1_53f_full_jitter_2gpu_gbs4_ddpfix_30k"
 
 resume:
   checkpoint_path: null
