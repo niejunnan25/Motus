@@ -4,10 +4,13 @@ import sys
 from types import SimpleNamespace
 
 import torch
+from omegaconf import OmegaConf
+from torch.utils.data import RandomSampler
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from train.train_vgm_bridge_stage1 import VGMBridgeStage1Trainer
+from train import train_vgm_bridge_stage1
+from train.train_vgm_bridge_stage1 import VGMBridgeStage1Trainer, create_train_dataloader
 
 
 class _InnerModel(torch.nn.Module):
@@ -70,3 +73,36 @@ def test_trainer_forward_uses_distributed_wrapper(tmp_path: Path) -> None:
     trainer.train_step(batch)
 
     assert model.forward_calls == 1
+
+
+class _Dataset(torch.utils.data.Dataset):
+    def __len__(self) -> int:
+        return 16
+
+    def __getitem__(self, index: int) -> int:
+        return index
+
+
+def test_dataloader_leaves_distributed_sharding_to_accelerate(monkeypatch: object) -> None:
+    monkeypatch.setattr(train_vgm_bridge_stage1, "VideoBridgeDataset", lambda **_: _Dataset())
+    config = OmegaConf.create(
+        {
+            "dataset": {
+                "type": "video_bridge",
+                "dataset_dir": ["unused"],
+            },
+            "common": {
+                "global_downsample_rate": 1,
+                "num_video_frames": 52,
+                "video_height": 224,
+                "video_width": 448,
+                "state_condition_mode": "none",
+            },
+            "training": {"batch_size": 2},
+            "system": {"num_workers": 0, "pin_memory": False},
+        }
+    )
+
+    dataloader = create_train_dataloader(config, rank=0, world_size=2)
+
+    assert isinstance(dataloader.sampler, RandomSampler)

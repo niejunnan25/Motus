@@ -21,7 +21,6 @@ from accelerate import Accelerator
 from accelerate.utils import DeepSpeedPlugin, ProjectConfiguration
 from omegaconf import OmegaConf
 from torch.utils.data import DataLoader
-from torch.utils.data.distributed import DistributedSampler
 from torch.utils.tensorboard import SummaryWriter
 import wandb
 import yaml
@@ -134,14 +133,29 @@ class VGMBridgeStage1Trainer:
             if not parameter.requires_grad or parameter.grad is None:
                 continue
             gradient = parameter.grad.detach().float()
-            stats = torch.stack(
+            flat_gradient = gradient.flatten()
+            if flat_gradient.numel() == 0:
+                continue
+            sample_count = min(64, flat_gradient.numel())
+            sample_indices = torch.linspace(
+                0,
+                flat_gradient.numel() - 1,
+                steps=sample_count,
+                device=flat_gradient.device,
+            ).long()
+            signature = torch.cat(
                 [
-                    gradient.mean(),
-                    gradient.abs().mean(),
-                    gradient.square().mean(),
+                    torch.stack(
+                        [
+                            gradient.mean(),
+                            gradient.abs().mean(),
+                            gradient.square().mean(),
+                        ]
+                    ),
+                    flat_gradient[sample_indices],
                 ]
             )
-            gathered = self.accelerator.gather(stats).view(self.world_size, -1)
+            gathered = self.accelerator.gather(signature).view(self.world_size, -1)
             reference = gathered[0:1].expand_as(gathered)
             if not torch.allclose(gathered, reference, rtol=1e-4, atol=1e-7):
                 raise RuntimeError(
@@ -476,13 +490,12 @@ def create_train_dataloader(config: OmegaConf, rank: int, world_size: int) -> Da
         cache_scan=config.dataset.get("cache_scan", True),
         val=False,
     )
-    train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank) if world_size > 1 else None
-
+    # Accelerator.prepare() shards the batch sampler across ranks. Adding a
+    # DistributedSampler here would shard the dataset a second time.
     return DataLoader(
         train_dataset,
         batch_size=config.training.batch_size,
-        shuffle=(train_sampler is None),
-        sampler=train_sampler,
+        shuffle=True,
         num_workers=config.system.num_workers,
         pin_memory=config.system.pin_memory,
         collate_fn=video_bridge_collate_fn,
