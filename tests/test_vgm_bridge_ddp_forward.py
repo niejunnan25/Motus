@@ -1,6 +1,7 @@
 from contextlib import nullcontext
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 
 import torch
 
@@ -58,6 +59,7 @@ def test_trainer_forward_uses_distributed_wrapper(tmp_path: Path) -> None:
         world_size=1,
         checkpoint_dir=str(tmp_path),
         accelerator=_FakeAccelerator(),
+        config=SimpleNamespace(training=SimpleNamespace(grad_clip_norm=1.0)),
     )
     batch = {
         "first_frame": torch.ones(1, 1, 1, 1),
