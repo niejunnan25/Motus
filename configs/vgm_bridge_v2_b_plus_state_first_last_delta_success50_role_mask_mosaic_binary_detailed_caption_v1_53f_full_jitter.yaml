@@ -62,8 +62,8 @@ model:
     precision: "bfloat16"
 
 training:
-  batch_size: 4
-  gradient_accumulation_steps: 1
+  batch_size: 2
+  gradient_accumulation_steps: 2
   max_steps: 30000
   learning_rate: 1.0e-5
   weight_decay: 0.01
