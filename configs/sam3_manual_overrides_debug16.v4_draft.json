@@ -1,0 +1,234 @@
+{
+  "samples": {
+    "2": {
+      "objects": [
+        {
+          "name": "white_mug_top_issue_frames",
+          "role": "object",
+          "source": "manual_box_seed_v3_draft_needs_review",
+          "interpolate": true,
+          "frames": {
+            "8": { "xyxy_abs": [79, 140, 124, 194] },
+            "11": { "xyxy_abs": [78, 140, 125, 194] },
+            "14": { "xyxy_abs": [76, 140, 124, 194] }
+          }
+        },
+        {
+          "name": "plate_top_issue_frames",
+          "role": "target",
+          "source": "manual_box_seed_v3_draft_needs_review",
+          "interpolate": true,
+          "frames": {
+            "8": { "xyxy_abs": [73, 169, 128, 205] },
+            "11": { "xyxy_abs": [73, 169, 129, 205] },
+            "14": { "xyxy_abs": [72, 169, 129, 205] }
+          }
+        },
+        {
+          "name": "plate_bottom_issue_frames",
+          "role": "target",
+          "source": "manual_box_seed_v3_draft_needs_review",
+          "interpolate": true,
+          "frames": {
+            "8": { "xyxy_abs": [0, 280, 95, 390] },
+            "11": { "xyxy_abs": [0, 248, 100, 345] },
+            "14": { "xyxy_abs": [0, 218, 106, 316] }
+          }
+        },
+        {
+          "name": "white_mug_top_v4_missing_frame4",
+          "role": "object",
+          "source": "manual_box_seed_v4_draft_missing_zero_frame",
+          "interpolate": false,
+          "frames": {
+            "4": { "xyxy_abs": [76, 143, 126, 200] }
+          }
+        },
+        {
+          "name": "plate_top_v4_missing_frames",
+          "role": "target",
+          "source": "manual_box_seed_v4_draft_missing_zero_frames",
+          "interpolate": false,
+          "frames": {
+            "6": { "xyxy_abs": [73, 181, 128, 211] },
+            "15": { "xyxy_abs": [72, 177, 129, 209] }
+          }
+        },
+        {
+          "name": "plate_bottom_v4_missing_frames",
+          "role": "target",
+          "source": "manual_box_seed_v4_draft_missing_zero_frames",
+          "interpolate": false,
+          "frames": {
+            "6": { "xyxy_abs": [0, 295, 91, 360] },
+            "15": { "xyxy_abs": [0, 222, 101, 276] }
+          }
+        }
+      ]
+    },
+    "5": {
+      "objects": [
+        {
+          "name": "middle_drawer_top_region",
+          "role": "context",
+          "source": "manual_box_seed_v3_refined_definition_check_only",
+          "xyxy_abs": [148, 58, 224, 174]
+        },
+        {
+          "name": "middle_drawer_bottom_region",
+          "role": "context",
+          "source": "manual_box_seed_v3_refined_definition_check_only",
+          "interpolate": true,
+          "frames": {
+            "0": { "xyxy_abs": [0, 350, 92, 420] },
+            "4": { "xyxy_abs": [0, 342, 118, 420] },
+            "8": { "xyxy_abs": [154, 304, 224, 404] },
+            "12": { "xyxy_abs": [69, 303, 196, 367] },
+            "16": { "xyxy_abs": [52, 303, 180, 367] }
+          }
+        }
+      ]
+    },
+    "6": {
+      "objects": [
+        {
+          "name": "bowl_top_occluded_issue_frames",
+          "role": "object",
+          "source": "manual_box_seed_v3_draft_needs_review",
+          "interpolate": true,
+          "frames": {
+            "5": { "xyxy_abs": [96, 109, 144, 140] },
+            "6": { "xyxy_abs": [96, 109, 144, 140] },
+            "7": { "xyxy_abs": [96, 109, 144, 140] }
+          }
+        }
+      ]
+    },
+    "7": {
+      "objects": [
+        {
+          "name": "wine_bottle_top",
+          "role": "object",
+          "source": "manual_box_seed_v2",
+          "interpolate": true,
+          "frames": {
+            "0": { "xyxy_abs": [115, 78, 130, 110] },
+            "8": { "xyxy_abs": [115, 78, 130, 112] },
+            "16": { "xyxy_abs": [134, 67, 151, 103] }
+          }
+        },
+        {
+          "name": "wine_bottle_bottom",
+          "role": "object",
+          "source": "manual_box_seed_v2",
+          "interpolate": true,
+          "frames": {
+            "0": { "xyxy_abs": [84, 322, 113, 392] },
+            "4": { "xyxy_abs": [88, 322, 116, 394] },
+            "8": { "xyxy_abs": [89, 323, 119, 394] },
+            "12": { "xyxy_abs": [101, 314, 132, 389] },
+            "16": { "xyxy_abs": [105, 326, 136, 397] }
+          }
+        }
+      ]
+    },
+    "8": {
+      "objects": [
+        {
+          "name": "chocolate_pudding_top",
+          "role": "object",
+          "source": "manual_box_seed_v2",
+          "xyxy_abs": [124, 112, 155, 150]
+        },
+        {
+          "name": "chocolate_pudding_bottom",
+          "role": "object",
+          "source": "manual_box_seed_v2",
+          "interpolate": true,
+          "frames": {
+            "4": { "xyxy_abs": [84, 238, 124, 302] },
+            "8": { "xyxy_abs": [92, 276, 126, 331] },
+            "12": { "xyxy_abs": [118, 294, 160, 348] },
+            "16": { "xyxy_abs": [97, 284, 150, 330] }
+          }
+        }
+      ]
+    },
+    "9": {
+      "objects": [
+        {
+          "name": "alphabet_soup_top",
+          "role": "object",
+          "source": "manual_box_seed_v2_needs_identity_confirmation",
+          "xyxy_abs": [168, 108, 199, 151]
+        },
+        {
+          "name": "alphabet_soup_bottom_early",
+          "role": "object",
+          "source": "manual_box_seed_v2_needs_identity_confirmation",
+          "interpolate": false,
+          "frames": {
+            "0": { "xyxy_abs": [4, 220, 51, 266] },
+            "1": { "xyxy_abs": [5, 220, 52, 266] }
+          }
+        }
+      ]
+    },
+    "12": {
+      "objects": [
+        {
+          "name": "ketchup_top",
+          "role": "object",
+          "source": "manual_box_seed_v2",
+          "xyxy_abs": [121, 54, 145, 96]
+        },
+        {
+          "name": "ketchup_bottom",
+          "role": "object",
+          "source": "manual_box_seed_v2",
+          "interpolate": true,
+          "frames": {
+            "8": { "xyxy_abs": [126, 266, 165, 300] },
+            "12": { "xyxy_abs": [129, 289, 156, 318] },
+            "16": { "xyxy_abs": [58, 300, 99, 324] }
+          }
+        }
+      ]
+    },
+    "13": {
+      "objects": [
+        {
+          "name": "black_bowl_bottom",
+          "role": "object",
+          "source": "manual_box_seed_v2",
+          "xyxy_abs": [0, 318, 70, 414]
+        }
+      ]
+    },
+    "14": {
+      "objects": [
+        {
+          "name": "black_bowl_bottom",
+          "role": "object",
+          "source": "manual_box_seed_v2",
+          "xyxy_abs": [0, 322, 66, 414]
+        }
+      ]
+    },
+    "15": {
+      "objects": [
+        {
+          "name": "black_bowl_top_occluded_issue_frames",
+          "role": "object",
+          "source": "manual_box_seed_v3_refined_needs_review",
+          "interpolate": true,
+          "frames": {
+            "11": { "xyxy_abs": [82, 62, 124, 108] },
+            "12": { "xyxy_abs": [84, 82, 122, 112] },
+            "15": { "xyxy_abs": [94, 72, 132, 112] }
+          }
+        }
+      ]
+    }
+  }
+}

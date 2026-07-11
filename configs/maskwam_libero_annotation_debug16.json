@@ -1,0 +1,159 @@
+{
+  "schema_version": "maskwam_libero_annotation_debug16_v2_view_aware",
+  "description": "MaskWAM-style SAM3 annotation pipeline for the 16 fixed LIBERO VGM evaluation windows. This config is view-aware for main/wrist QA and is for debug/human QA only; it is not a full-dataset mask recipe.",
+  "windows_json": "artifacts/vgm_bridge_v2_50k_step50004_s50_16samples/v2_a_base50k/vgm_bridge_v2_a_roi_lerobot_video_448x224_lang_17f_2gpu_gbs8_50k/step_50004/windows.json",
+  "output_root": "artifacts/maskwam_libero_annotation_debug16",
+  "sample_ids": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+  "target_size": {
+    "height": 448,
+    "width": 224
+  },
+  "view_layout": "vertical",
+  "review_frame_indices": [0, 4, 8, 12, 16],
+  "mask_semantics": {
+    "object": "Base manipulated object mask before view split; debug only.",
+    "target": "Base destination/receptacle/handle mask before view split; debug only.",
+    "robot": "Base visible robot arm and gripper mask before view split; debug only.",
+    "main_object": "Manipulated object region in the main/top view.",
+    "main_target": "Target/contact region in the main/top view.",
+    "main_robot": "Visible robot arm and gripper in the main/top view.",
+    "wrist_object": "Manipulated object region in the wrist/bottom view.",
+    "wrist_target": "Target/contact region in the wrist/bottom view.",
+    "wrist_robot": "Visible robot arm and gripper in the wrist/bottom view.",
+    "context": "Human-review aid only. Context masks are excluded from final_train_mask.",
+    "final_train_mask": "Union of main/wrist object, target, and robot masks. Context and base debug masks are excluded."
+  },
+  "review_statuses": [
+    "ok",
+    "wrong_object",
+    "missing_object",
+    "missing_target",
+    "too_broad",
+    "bad_tracking",
+    "exclude"
+  ],
+  "samples": {
+    "0": {
+      "prompts": [
+        {"name": "white mug", "role": "object", "text": "white mug"},
+        {"name": "left plate", "role": "target", "text": "left plate"},
+        {"name": "right plate", "role": "target", "text": "right plate"},
+        {"name": "robot arm", "role": "robot", "text": "robot arm"}
+      ]
+    },
+    "1": {
+      "prompts": [
+        {"name": "white mug", "role": "object", "text": "white mug"},
+        {"name": "left plate", "role": "target", "text": "left plate"},
+        {"name": "right plate", "role": "target", "text": "right plate"},
+        {"name": "robot arm", "role": "robot", "text": "robot arm"}
+      ]
+    },
+    "2": {
+      "prompts": [
+        {"name": "white mug", "role": "object", "text": "white mug"},
+        {"name": "plate", "role": "target", "text": "plate"},
+        {"name": "chocolate pudding", "role": "context", "text": "chocolate pudding"},
+        {"name": "robot arm", "role": "robot", "text": "robot arm"}
+      ]
+    },
+    "3": {
+      "prompts": [
+        {"name": "white mug", "role": "object", "text": "white mug"},
+        {"name": "left plate", "role": "target", "text": "left plate"},
+        {"name": "right plate", "role": "target", "text": "right plate"},
+        {"name": "robot arm", "role": "robot", "text": "robot arm"}
+      ]
+    },
+    "4": {
+      "prompts": [
+        {"name": "plate", "role": "object", "text": "plate"},
+        {"name": "stove", "role": "target", "text": "stove"},
+        {"name": "robot arm", "role": "robot", "text": "robot arm"}
+      ]
+    },
+    "5": {
+      "prompts": [
+        {"name": "drawer handle", "role": "target", "text": "drawer handle"},
+        {"name": "middle drawer front", "role": "target", "text": "middle drawer"},
+        {"name": "cabinet", "role": "context", "text": "cabinet"},
+        {"name": "robot arm", "role": "robot", "text": "robot arm"}
+      ]
+    },
+    "6": {
+      "prompts": [
+        {"name": "bowl", "role": "object", "text": "bowl"},
+        {"name": "cabinet top", "role": "target", "text": "cabinet"},
+        {"name": "robot arm", "role": "robot", "text": "robot arm"}
+      ]
+    },
+    "7": {
+      "prompts": [
+        {"name": "wine bottle", "role": "object", "text": "wine bottle"},
+        {"name": "cabinet top", "role": "target", "text": "cabinet"},
+        {"name": "robot arm", "role": "robot", "text": "robot arm"}
+      ]
+    },
+    "8": {
+      "prompts": [
+        {"name": "chocolate pudding", "role": "object", "text": "chocolate pudding"},
+        {"name": "basket", "role": "target", "text": "basket"},
+        {"name": "robot arm", "role": "robot", "text": "robot arm"}
+      ]
+    },
+    "9": {
+      "prompts": [
+        {"name": "alphabet soup", "role": "object", "text": "alphabet soup"},
+        {"name": "basket", "role": "target", "text": "basket"},
+        {"name": "robot arm", "role": "robot", "text": "robot arm"}
+      ]
+    },
+    "10": {
+      "prompts": [
+        {"name": "orange juice", "role": "object", "text": "orange juice"},
+        {"name": "basket", "role": "target", "text": "basket"},
+        {"name": "robot arm", "role": "robot", "text": "robot arm"}
+      ]
+    },
+    "11": {
+      "prompts": [
+        {"name": "orange juice", "role": "object", "text": "orange juice"},
+        {"name": "basket", "role": "target", "text": "basket"},
+        {"name": "robot arm", "role": "robot", "text": "robot arm"}
+      ]
+    },
+    "12": {
+      "prompts": [
+        {"name": "ketchup", "role": "object", "text": "ketchup"},
+        {"name": "basket", "role": "target", "text": "basket"},
+        {"name": "robot arm", "role": "robot", "text": "robot arm"}
+      ]
+    },
+    "13": {
+      "prompts": [
+        {"name": "black bowl", "role": "object", "text": "black bowl"},
+        {"name": "top drawer", "role": "target", "text": "top drawer"},
+        {"name": "wooden cabinet", "role": "context", "text": "wooden cabinet"},
+        {"name": "plate", "role": "context", "text": "plate"},
+        {"name": "robot arm", "role": "robot", "text": "robot arm"}
+      ]
+    },
+    "14": {
+      "prompts": [
+        {"name": "black bowl", "role": "object", "text": "black bowl"},
+        {"name": "top drawer", "role": "target", "text": "top drawer"},
+        {"name": "wooden cabinet", "role": "context", "text": "wooden cabinet"},
+        {"name": "plate", "role": "context", "text": "plate"},
+        {"name": "robot arm", "role": "robot", "text": "robot arm"}
+      ]
+    },
+    "15": {
+      "prompts": [
+        {"name": "black bowl", "role": "object", "text": "black bowl"},
+        {"name": "plate", "role": "target", "text": "plate"},
+        {"name": "cookie box", "role": "context", "text": "cookie box"},
+        {"name": "robot arm", "role": "robot", "text": "robot arm"}
+      ]
+    }
+  }
+}

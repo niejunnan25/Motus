@@ -1,3 +1,5 @@
+import hashlib
+import json
 import logging
 import os
 import pickle
@@ -139,6 +141,13 @@ def video_bridge_collate_fn(batch: List[Optional[Dict[str, Any]]]) -> Optional[D
         "last_state": _process_state_tensors_batch([sample.get("last_state") for sample in batch]),
         "episode_name": [sample.get("episode_name") for sample in batch],
         "video_path": [sample.get("video_path") for sample in batch],
+        "task_index": [sample.get("task_index") for sample in batch],
+        "task_text": [sample.get("task_text") for sample in batch],
+        "language_caption": [sample.get("language_caption") for sample in batch],
+        "language_caption_version": [sample.get("language_caption_version") for sample in batch],
+        "language_caption_field": [sample.get("language_caption_field") for sample in batch],
+        "language_caption_manifest": [sample.get("language_caption_manifest") for sample in batch],
+        "language_embedding_path": [sample.get("language_embedding_path") for sample in batch],
     }
 
 
@@ -175,6 +184,7 @@ class VideoBridgeDataset(data.Dataset):
         view_layout: str = "single",
         task_language_embedding_dir: Optional[str] = None,
         task_language_embedding_pattern: str = "task_{task_index:06d}.pt",
+        task_language_caption_version: Optional[str] = None,
         load_state: bool = False,
         state_column: str = "observation.state",
         bridge_sampling_mode: str = "sliding_window",
@@ -205,6 +215,7 @@ class VideoBridgeDataset(data.Dataset):
         self.view_layout = view_layout
         self.task_language_embedding_dir = task_language_embedding_dir
         self.task_language_embedding_pattern = task_language_embedding_pattern
+        self.task_language_caption_version = task_language_caption_version
         self.load_state = bool(load_state)
         self.state_column = str(state_column)
         self.bridge_sampling_mode = bridge_sampling_mode
@@ -237,6 +248,13 @@ class VideoBridgeDataset(data.Dataset):
         cache_suffix = f"{self.data_format}.{image_key}.{self.view_layout}"
         if self.require_language_embedding:
             cache_suffix += ".lang"
+        if self.task_language_embedding_dir is not None:
+            language_cache_key = (
+                f"{self.task_language_embedding_dir}|{self.task_language_embedding_pattern}|"
+                f"{self.task_language_caption_version}"
+            )
+            language_cache_token = hashlib.sha1(language_cache_key.encode("utf-8")).hexdigest()[:12]
+            cache_suffix += f".langsrc.{language_cache_token}"
         if self.load_state:
             safe_state_column = self.state_column.replace("/", "_").replace(".", "_")
             cache_suffix += f".state.{safe_state_column}"
@@ -372,6 +390,11 @@ class VideoBridgeDataset(data.Dataset):
                 else {}
             )
             task_embedding_dir = self._resolve_task_language_embedding_dir(leaf_dir) if load_task_language else None
+            task_language_metadata = (
+                self._load_task_language_manifest(task_embedding_dir)
+                if task_embedding_dir is not None
+                else {}
+            )
             episode_files = sorted((leaf_dir / "meta" / "episodes").glob("chunk-*/file-*.parquet"))
             for episode_file in episode_files:
                 episodes_df = pd.read_parquet(episode_file)
@@ -407,6 +430,15 @@ class VideoBridgeDataset(data.Dataset):
                     episode_index = int(row["episode_index"])
                     task_index = episode_task_by_index.get(episode_index)
                     task_text = task_text_by_index.get(task_index) if task_index is not None else None
+                    language_metadata = task_language_metadata.get(task_index, {})
+                    if (
+                        self.task_language_caption_version is not None
+                        and task_index is not None
+                        and not language_metadata
+                    ):
+                        raise KeyError(
+                            f"Caption manifest for {task_embedding_dir} has no entry for task_index={task_index}"
+                        )
                     lang_path = (
                         self._task_language_embedding_path(task_embedding_dir, task_index)
                         if task_embedding_dir is not None
@@ -439,6 +471,10 @@ class VideoBridgeDataset(data.Dataset):
                             "task_index": task_index,
                             "task_text": task_text,
                             "lang_path": str(lang_path) if lang_path is not None else None,
+                            "language_caption": language_metadata.get("caption_text"),
+                            "language_caption_version": language_metadata.get("version"),
+                            "language_caption_field": language_metadata.get("caption_field"),
+                            "language_caption_manifest": language_metadata.get("manifest_path"),
                             "data_paths": data_paths,
                         }
                     )
@@ -513,6 +549,45 @@ class VideoBridgeDataset(data.Dataset):
                 embedding_dir = leaf_dir / embedding_dir
             return embedding_dir
         return leaf_dir / "umt5_wan_tasks"
+
+    def _load_task_language_manifest(self, embedding_dir: Path) -> Dict[int, Dict[str, Any]]:
+        manifest_path = embedding_dir / "manifest.json"
+        if not manifest_path.exists():
+            if self.task_language_caption_version is not None:
+                raise FileNotFoundError(
+                    f"Expected caption manifest version {self.task_language_caption_version!r}, "
+                    f"but {manifest_path} does not exist"
+                )
+            return {}
+        try:
+            with manifest_path.open("r", encoding="utf-8") as file:
+                manifest = json.load(file)
+        except Exception as exc:
+            if self.task_language_caption_version is not None:
+                raise RuntimeError(f"Failed reading required task language manifest {manifest_path}") from exc
+            logger.warning("Failed reading task language manifest %s: %s", manifest_path, exc)
+            return {}
+
+        source = manifest.get("caption_source", {})
+        version = source.get("version") if isinstance(source, dict) else None
+        source_field = source.get("caption_field") if isinstance(source, dict) else None
+        if self.task_language_caption_version is not None and version != self.task_language_caption_version:
+            raise ValueError(
+                f"Task language caption version mismatch for {manifest_path}: "
+                f"expected {self.task_language_caption_version!r}, got {version!r}"
+            )
+        metadata: Dict[int, Dict[str, Any]] = {}
+        for entry in manifest.get("tasks", []):
+            if not isinstance(entry, dict) or "task_index" not in entry:
+                continue
+            caption_text = entry.get("caption_text", entry.get("task_text"))
+            metadata[int(entry["task_index"])] = {
+                "caption_text": caption_text if isinstance(caption_text, str) else None,
+                "version": version,
+                "caption_field": entry.get("caption_field", source_field),
+                "manifest_path": str(manifest_path),
+            }
+        return metadata
 
     def _task_language_embedding_path(self, embedding_dir: Path, task_index: Optional[int]) -> Optional[Path]:
         if task_index is None:
@@ -735,6 +810,11 @@ class VideoBridgeDataset(data.Dataset):
             "video_path": episode.get("video_path", episode.get("parquet_path", episode.get("video_paths"))),
             "task_index": episode.get("task_index"),
             "task_text": episode.get("task_text"),
+            "language_caption": episode.get("language_caption"),
+            "language_caption_version": episode.get("language_caption_version"),
+            "language_caption_field": episode.get("language_caption_field"),
+            "language_caption_manifest": episode.get("language_caption_manifest"),
+            "language_embedding_path": episode.get("lang_path"),
             "condition_idx": condition_idx,
             "frame_indices": frame_indices,
             "total_frames": total_frames,
@@ -877,6 +957,11 @@ class VideoBridgeDataset(data.Dataset):
                     "video_path": episode.get("video_path", episode.get("parquet_path", episode.get("video_paths"))),
                     "task_index": episode.get("task_index"),
                     "task_text": episode.get("task_text"),
+                    "language_caption": episode.get("language_caption"),
+                    "language_caption_version": episode.get("language_caption_version"),
+                    "language_caption_field": episode.get("language_caption_field"),
+                    "language_caption_manifest": episode.get("language_caption_manifest"),
+                    "language_embedding_path": episode.get("lang_path"),
                 }
                 return self._add_states_to_sample(sample, states)
             except Exception as exc:

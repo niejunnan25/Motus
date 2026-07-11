@@ -67,6 +67,7 @@ def build_dataset(config: Any, max_episodes: Optional[int] = None) -> VideoBridg
         view_layout=config.dataset.get("view_layout", "single"),
         task_language_embedding_dir=config.dataset.get("task_language_embedding_dir", None),
         task_language_embedding_pattern=config.dataset.get("task_language_embedding_pattern", "task_{task_index:06d}.pt"),
+        task_language_caption_version=config.dataset.get("task_language_caption_version", None),
         load_state=config.dataset.get(
             "load_state",
             config.common.get("state_condition_mode", "none") != "none",
@@ -524,6 +525,11 @@ def main() -> None:
                     "video_path": item["video_path"],
                     "task_index": item.get("task_index"),
                     "task_text": item.get("task_text"),
+                    "language_caption": item.get("language_caption"),
+                    "language_caption_version": item.get("language_caption_version"),
+                    "language_caption_field": item.get("language_caption_field"),
+                    "language_caption_manifest": item.get("language_caption_manifest"),
+                    "language_embedding_path": item.get("language_embedding_path"),
                 }
                 for item in windows
             ],

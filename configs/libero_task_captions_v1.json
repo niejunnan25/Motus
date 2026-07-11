@@ -1,0 +1,326 @@
+{
+  "version": "libero_detailed_caption_v1",
+  "description": "Video-grounded English captions for all 40 LIBERO tasks. Chinese fields are audit-only; caption_en is encoded for training.",
+  "tasks": [
+    {
+      "task_index": 0,
+      "representative_episode_index": 0,
+      "original_en": "put the white mug on the left plate and put the yellow and white mug on the right plate",
+      "original_zh": "把白色马克杯放到左边的盘子上，并把黄白相间的马克杯放到右边的盘子上。",
+      "caption_en": "A robotic arm first moves its open gripper toward the white mug, grasps and lifts the mug, carries it over the left plate, lowers it onto the plate, and releases it. The arm then approaches the yellow-and-white mug, grasps and lifts it, carries it over the right plate, lowers it onto the plate, releases it, and withdraws.",
+      "caption_zh": "机械臂先将张开的夹爪移向白色马克杯，抓住并抬起杯子，将其搬运到左边的盘子上方，下降放到盘子上并松开。随后机械臂接近黄白相间的马克杯，抓住并抬起杯子，将其搬运到右边的盘子上方，下降放到盘子上，松开夹爪并离开。"
+    },
+    {
+      "task_index": 1,
+      "representative_episode_index": 1,
+      "original_en": "put the white mug on the plate and put the chocolate pudding to the right of the plate",
+      "original_zh": "把白色马克杯放到盘子上，并把巧克力布丁放到盘子右侧。",
+      "caption_en": "A robotic arm first approaches the white mug, closes its gripper around the mug, lifts it, carries it over the plate, lowers it onto the plate, and releases it. The arm then grasps the chocolate pudding package, lifts it, carries it to the right side of the plate, sets it down, releases it, and withdraws.",
+      "caption_zh": "机械臂先接近白色马克杯，闭合夹爪抓住杯子并将其抬起，搬运到盘子上方，下降放到盘子上并松开。随后机械臂抓住巧克力布丁包装，抬起并搬运到盘子右侧，放到桌面上，松开夹爪并离开。"
+    },
+    {
+      "task_index": 2,
+      "representative_episode_index": 2,
+      "original_en": "put the yellow and white mug in the microwave and close it",
+      "original_zh": "把黄白相间的马克杯放进微波炉，并关上微波炉门。",
+      "caption_en": "With the microwave door already open, a robotic arm approaches the yellow-and-white mug, grasps and lifts it, carries it into the microwave, sets it down inside, and releases it. The arm withdraws from the microwave, moves to the open door, pushes the door closed, and moves away.",
+      "caption_zh": "在微波炉门已经打开的情况下，机械臂接近黄白相间的马克杯，抓住并抬起杯子，将其搬运到微波炉内部，放下并松开。机械臂退出微波炉，移动到打开的炉门旁，将炉门推闭后离开。"
+    },
+    {
+      "task_index": 3,
+      "representative_episode_index": 6,
+      "original_en": "turn on the stove and put the moka pot on it",
+      "original_zh": "打开炉灶，并把摩卡壶放到炉灶上。",
+      "caption_en": "A robotic arm reaches for the stove control knob and turns it until the burner glows red. The arm then approaches the moka pot, grasps and lifts it, carries it over the active burner, lowers it onto the burner, releases it, and withdraws.",
+      "caption_zh": "机械臂伸向炉灶控制旋钮并转动旋钮，直到炉盘变红。随后机械臂接近摩卡壶，抓住并抬起摩卡壶，将其搬运到已开启的炉盘上方，下降放到炉盘上，松开夹爪并离开。"
+    },
+    {
+      "task_index": 4,
+      "representative_episode_index": 7,
+      "original_en": "put both the alphabet soup and the cream cheese box in the basket",
+      "original_zh": "把字母汤罐头和奶油奶酪盒都放进篮子。",
+      "caption_en": "A robotic arm first approaches the alphabet soup can, grasps and lifts it, carries it over the basket, lowers it into the basket, and releases it. The arm then approaches the cream cheese box, grasps and lifts it, carries it over the basket, lowers it inside, releases it, and withdraws.",
+      "caption_zh": "机械臂先接近字母汤罐头，抓住并抬起罐头，将其搬运到篮子上方，下降放入篮子并松开。随后机械臂接近奶油奶酪盒，抓住并抬起盒子，将其搬运到篮子上方，下降放入篮子，松开夹爪并离开。"
+    },
+    {
+      "task_index": 5,
+      "representative_episode_index": 8,
+      "original_en": "put both the alphabet soup and the tomato sauce in the basket",
+      "original_zh": "把字母汤罐头和番茄酱罐头都放进篮子。",
+      "caption_en": "A robotic arm first approaches the alphabet soup can, grasps and lifts it, carries it over the basket, lowers it into the basket, and releases it. The arm then approaches the tomato sauce can, grasps and lifts it, carries it over the basket, lowers it inside, releases it, and withdraws.",
+      "caption_zh": "机械臂先接近字母汤罐头，抓住并抬起罐头，将其搬运到篮子上方，下降放入篮子并松开。随后机械臂接近番茄酱罐头，抓住并抬起罐头，将其搬运到篮子上方，下降放入篮子，松开夹爪并离开。"
+    },
+    {
+      "task_index": 6,
+      "representative_episode_index": 10,
+      "original_en": "put both moka pots on the stove",
+      "original_zh": "把两个摩卡壶都放到炉灶上。",
+      "caption_en": "A robotic arm approaches one moka pot, grasps and lifts it, carries it over one stove burner, lowers it onto the burner, and releases it. The arm then approaches the second moka pot, grasps and lifts it, carries it over the other burner, lowers it onto the burner, releases it, and withdraws.",
+      "caption_zh": "机械臂接近其中一个摩卡壶，抓住并抬起摩卡壶，将其搬运到一个炉盘上方，下降放到炉盘上并松开。随后机械臂接近第二个摩卡壶，抓住并抬起摩卡壶，将其搬运到另一个炉盘上方，下降放到炉盘上，松开夹爪并离开。"
+    },
+    {
+      "task_index": 7,
+      "representative_episode_index": 12,
+      "original_en": "put both the cream cheese box and the butter in the basket",
+      "original_zh": "把奶油奶酪盒和黄油盒都放进篮子。",
+      "caption_en": "A robotic arm first approaches the cream cheese box, grasps and lifts it, carries it over the basket, lowers it into the basket, and releases it. The arm then approaches the butter package, grasps and lifts it, carries it over the basket, lowers it inside, releases it, and withdraws.",
+      "caption_zh": "机械臂先接近奶油奶酪盒，抓住并抬起盒子，将其搬运到篮子上方，下降放入篮子并松开。随后机械臂接近黄油包装，抓住并抬起包装，将其搬运到篮子上方，下降放入篮子，松开夹爪并离开。"
+    },
+    {
+      "task_index": 8,
+      "representative_episode_index": 14,
+      "original_en": "put the black bowl in the bottom drawer of the cabinet and close it",
+      "original_zh": "把黑碗放进柜子的底层抽屉，并关上抽屉。",
+      "caption_en": "With the bottom drawer already open, a robotic arm approaches the black bowl, grasps and lifts it, carries it over the drawer, lowers it into the drawer, and releases it. The arm withdraws, moves to the drawer front, pushes the drawer closed, and moves away.",
+      "caption_zh": "在底层抽屉已经打开的情况下，机械臂接近黑碗，抓住并抬起碗，将其搬运到底层抽屉上方，下降放入抽屉并松开。机械臂退出抽屉，移动到抽屉前方，将抽屉推闭后离开。"
+    },
+    {
+      "task_index": 9,
+      "representative_episode_index": 27,
+      "original_en": "pick up the book and place it in the back compartment of the caddy",
+      "original_zh": "拿起书，并把它放进收纳盒的后部隔间。",
+      "caption_en": "A robotic arm approaches the upright book, aligns its open gripper around the book, closes the gripper to grasp it, lifts it from the table, carries it over the caddy, lowers it into the back compartment, releases it, and withdraws.",
+      "caption_zh": "机械臂接近竖放的书，将张开的夹爪对准书本，闭合夹爪抓住书本并从桌面抬起，将其搬运到收纳盒上方，下降放入后部隔间，松开夹爪并离开。"
+    },
+    {
+      "task_index": 10,
+      "representative_episode_index": 379,
+      "original_en": "put the bowl on the plate",
+      "original_zh": "把碗放到盘子上。",
+      "caption_en": "A robotic arm approaches the bowl, positions its open gripper around the bowl, closes the gripper to grasp it, lifts it from the table, carries it over the plate, lowers it onto the center of the plate, releases it, and withdraws.",
+      "caption_zh": "机械臂接近碗，将张开的夹爪对准碗，闭合夹爪抓住碗并从桌面抬起，将其搬运到盘子上方，下降放到盘子中央，松开夹爪并离开。"
+    },
+    {
+      "task_index": 11,
+      "representative_episode_index": 380,
+      "original_en": "put the wine bottle on the rack",
+      "original_zh": "把葡萄酒瓶放到置物架上。",
+      "caption_en": "A robotic arm approaches the wine bottle, aligns its open gripper around the bottle, closes the gripper to grasp it, lifts it from the table, carries it to the rack, lowers it into an open slot on the rack, releases it, and withdraws.",
+      "caption_zh": "机械臂接近葡萄酒瓶，将张开的夹爪对准瓶身，闭合夹爪抓住酒瓶并从桌面抬起，将其搬运到置物架，下降放入架子的空位，松开夹爪并离开。"
+    },
+    {
+      "task_index": 12,
+      "representative_episode_index": 382,
+      "original_en": "open the top drawer and put the bowl inside",
+      "original_zh": "打开顶层抽屉，并把碗放进去。",
+      "caption_en": "A robotic arm moves to the top drawer handle, grips the handle, and pulls the drawer outward until it is open. The arm releases the handle, approaches the bowl, grasps and lifts it, carries it over the open top drawer, lowers it inside, releases it, and withdraws.",
+      "caption_zh": "机械臂移动到顶层抽屉把手处，抓住把手并向外拉动，直到抽屉打开。机械臂松开把手，接近碗，抓住并抬起碗，将其搬运到打开的顶层抽屉上方，下降放入抽屉，松开夹爪并离开。"
+    },
+    {
+      "task_index": 13,
+      "representative_episode_index": 384,
+      "original_en": "put the cream cheese in the bowl",
+      "original_zh": "把奶油奶酪盒放进碗里。",
+      "caption_en": "A robotic arm approaches the cream cheese box, aligns its open gripper around the box, closes the gripper to grasp it, lifts it from the table, carries it over the bowl, lowers it into the bowl, releases it, and withdraws.",
+      "caption_zh": "机械臂接近奶油奶酪盒，将张开的夹爪对准盒子，闭合夹爪抓住盒子并从桌面抬起，将其搬运到碗上方，下降放入碗中，松开夹爪并离开。"
+    },
+    {
+      "task_index": 14,
+      "representative_episode_index": 385,
+      "original_en": "put the wine bottle on top of the cabinet",
+      "original_zh": "把葡萄酒瓶放到柜子顶部。",
+      "caption_en": "A robotic arm approaches the wine bottle, closes its gripper around the bottle, lifts it from the table, carries it above the cabinet, lowers it onto the cabinet top, releases it in an upright position, and withdraws.",
+      "caption_zh": "机械臂接近葡萄酒瓶，闭合夹爪抓住瓶身并从桌面抬起，将其搬运到柜子上方，下降放到柜子顶部，使酒瓶保持直立，松开夹爪并离开。"
+    },
+    {
+      "task_index": 15,
+      "representative_episode_index": 386,
+      "original_en": "push the plate to the front of the stove",
+      "original_zh": "把盘子推到炉灶前方。",
+      "caption_en": "A robotic arm approaches the plate, lowers its gripper to contact the plate edge, and steadily pushes the plate across the tabletop until it is positioned directly in front of the stove. The arm then lifts the gripper away and withdraws.",
+      "caption_zh": "机械臂接近盘子，降低夹爪使其接触盘子边缘，并持续推动盘子在桌面上滑动，直到盘子位于炉灶正前方。随后机械臂抬起夹爪并离开。"
+    },
+    {
+      "task_index": 16,
+      "representative_episode_index": 388,
+      "original_en": "turn on the stove",
+      "original_zh": "打开炉灶。",
+      "caption_en": "A robotic arm moves toward the stove control knob, positions its gripper around the knob, rotates the knob until the burner glows red, releases the knob, and withdraws.",
+      "caption_zh": "机械臂移动到炉灶控制旋钮旁，将夹爪对准旋钮并转动旋钮，直到炉盘变红，随后松开旋钮并离开。"
+    },
+    {
+      "task_index": 17,
+      "representative_episode_index": 392,
+      "original_en": "put the bowl on the stove",
+      "original_zh": "把碗放到炉灶上。",
+      "caption_en": "A robotic arm approaches the bowl, positions its open gripper around the bowl, closes the gripper to grasp it, lifts it from the table, carries it over the stove, lowers it onto the burner, releases it, and withdraws.",
+      "caption_zh": "机械臂接近碗，将张开的夹爪对准碗，闭合夹爪抓住碗并从桌面抬起，将其搬运到炉灶上方，下降放到炉盘上，松开夹爪并离开。"
+    },
+    {
+      "task_index": 18,
+      "representative_episode_index": 398,
+      "original_en": "put the bowl on top of the cabinet",
+      "original_zh": "把碗放到柜子顶部。",
+      "caption_en": "A robotic arm approaches the bowl, positions its open gripper around the bowl, closes the gripper to grasp it, lifts it from the table, carries it above the cabinet, lowers it onto the cabinet top, releases it, and withdraws.",
+      "caption_zh": "机械臂接近碗，将张开的夹爪对准碗，闭合夹爪抓住碗并从桌面抬起，将其搬运到柜子上方，下降放到柜子顶部，松开夹爪并离开。"
+    },
+    {
+      "task_index": 19,
+      "representative_episode_index": 399,
+      "original_en": "open the middle drawer of the cabinet",
+      "original_zh": "打开柜子的中层抽屉。",
+      "caption_en": "A robotic arm moves toward the middle drawer handle, aligns its gripper around the handle, closes the gripper to grasp it, and pulls the drawer outward until it is fully open. The arm releases the handle and withdraws.",
+      "caption_zh": "机械臂移动到中层抽屉把手处，将夹爪对准把手，闭合夹爪抓住把手并向外拉动，直到抽屉完全打开。随后机械臂松开把手并离开。"
+    },
+    {
+      "task_index": 20,
+      "representative_episode_index": 807,
+      "original_en": "pick up the orange juice and place it in the basket",
+      "original_zh": "拿起橙汁纸盒，并把它放进篮子。",
+      "caption_en": "A robotic arm moves its open gripper toward the orange juice carton, aligns the gripper around the carton, closes the gripper to grasp it, lifts it from the surface, carries it over the basket, lowers it into the basket, opens the gripper to release it, and withdraws the empty gripper.",
+      "caption_zh": "机械臂将张开的夹爪移向橙汁纸盒，使夹爪对准纸盒，闭合夹爪完成抓取，将纸盒从放置面抬起，搬运到篮子上方，下降放入篮子，张开夹爪松开纸盒，并将空夹爪移开。"
+    },
+    {
+      "task_index": 21,
+      "representative_episode_index": 808,
+      "original_en": "pick up the ketchup and place it in the basket",
+      "original_zh": "拿起番茄酱瓶，并把它放进篮子。",
+      "caption_en": "A robotic arm moves its open gripper toward the ketchup bottle, aligns the gripper around the bottle, closes the gripper to grasp it, lifts it from the surface, carries it over the basket, lowers it into the basket, opens the gripper to release it, and withdraws the empty gripper.",
+      "caption_zh": "机械臂将张开的夹爪移向番茄酱瓶，使夹爪对准瓶身，闭合夹爪完成抓取，将瓶子从放置面抬起，搬运到篮子上方，下降放入篮子，张开夹爪松开瓶子，并将空夹爪移开。"
+    },
+    {
+      "task_index": 22,
+      "representative_episode_index": 810,
+      "original_en": "pick up the cream cheese and place it in the basket",
+      "original_zh": "拿起奶油奶酪盒，并把它放进篮子。",
+      "caption_en": "A robotic arm moves its open gripper toward the cream cheese box, aligns the gripper around the box, closes the gripper to grasp it, lifts it from the surface, carries it over the basket, lowers it into the basket, opens the gripper to release it, and withdraws the empty gripper.",
+      "caption_zh": "机械臂将张开的夹爪移向奶油奶酪盒，使夹爪对准盒子，闭合夹爪完成抓取，将盒子从放置面抬起，搬运到篮子上方，下降放入篮子，张开夹爪松开盒子，并将空夹爪移开。"
+    },
+    {
+      "task_index": 23,
+      "representative_episode_index": 811,
+      "original_en": "pick up the bbq sauce and place it in the basket",
+      "original_zh": "拿起烧烤酱瓶，并把它放进篮子。",
+      "caption_en": "A robotic arm moves its open gripper toward the barbecue sauce bottle, aligns the gripper around the bottle, closes the gripper to grasp it, lifts it from the surface, carries it over the basket, lowers it into the basket, opens the gripper to release it, and withdraws the empty gripper.",
+      "caption_zh": "机械臂将张开的夹爪移向烧烤酱瓶，使夹爪对准瓶身，闭合夹爪完成抓取，将瓶子从放置面抬起，搬运到篮子上方，下降放入篮子，张开夹爪松开瓶子，并将空夹爪移开。"
+    },
+    {
+      "task_index": 24,
+      "representative_episode_index": 813,
+      "original_en": "pick up the alphabet soup and place it in the basket",
+      "original_zh": "拿起字母汤罐头，并把它放进篮子。",
+      "caption_en": "A robotic arm moves its open gripper toward the alphabet soup can, aligns the gripper around the can, closes the gripper to grasp it, lifts it from the surface, carries it over the basket, lowers it into the basket, opens the gripper to release it, and withdraws the empty gripper.",
+      "caption_zh": "机械臂将张开的夹爪移向字母汤罐头，使夹爪对准罐头，闭合夹爪完成抓取，将罐头从放置面抬起，搬运到篮子上方，下降放入篮子，张开夹爪松开罐头，并将空夹爪移开。"
+    },
+    {
+      "task_index": 25,
+      "representative_episode_index": 814,
+      "original_en": "pick up the milk and place it in the basket",
+      "original_zh": "拿起牛奶盒，并把它放进篮子。",
+      "caption_en": "A robotic arm moves its open gripper toward the milk carton, aligns the gripper around the carton, closes the gripper to grasp it, lifts it from the surface, carries it over the basket, lowers it into the basket, opens the gripper to release it, and withdraws the empty gripper.",
+      "caption_zh": "机械臂将张开的夹爪移向牛奶盒，使夹爪对准纸盒，闭合夹爪完成抓取，将牛奶盒从放置面抬起，搬运到篮子上方，下降放入篮子，张开夹爪松开牛奶盒，并将空夹爪移开。"
+    },
+    {
+      "task_index": 26,
+      "representative_episode_index": 816,
+      "original_en": "pick up the salad dressing and place it in the basket",
+      "original_zh": "拿起沙拉酱瓶，并把它放进篮子。",
+      "caption_en": "A robotic arm moves its open gripper toward the salad dressing bottle, aligns the gripper around the bottle, closes the gripper to grasp it, lifts it from the surface, carries it over the basket, lowers it into the basket, opens the gripper to release it, and withdraws the empty gripper.",
+      "caption_zh": "机械臂将张开的夹爪移向沙拉酱瓶，使夹爪对准瓶身，闭合夹爪完成抓取，将瓶子从放置面抬起，搬运到篮子上方，下降放入篮子，张开夹爪松开瓶子，并将空夹爪移开。"
+    },
+    {
+      "task_index": 27,
+      "representative_episode_index": 819,
+      "original_en": "pick up the butter and place it in the basket",
+      "original_zh": "拿起黄油包装，并把它放进篮子。",
+      "caption_en": "A robotic arm moves its open gripper toward the butter package, aligns the gripper around the package, closes the gripper to grasp it, lifts it from the surface, carries it over the basket, lowers it into the basket, opens the gripper to release it, and withdraws the empty gripper.",
+      "caption_zh": "机械臂将张开的夹爪移向黄油包装，使夹爪对准包装，闭合夹爪完成抓取，将包装从放置面抬起，搬运到篮子上方，下降放入篮子，张开夹爪松开包装，并将空夹爪移开。"
+    },
+    {
+      "task_index": 28,
+      "representative_episode_index": 821,
+      "original_en": "pick up the tomato sauce and place it in the basket",
+      "original_zh": "拿起番茄酱罐头，并把它放进篮子。",
+      "caption_en": "A robotic arm moves its open gripper toward the tomato sauce can, aligns the gripper around the can, closes the gripper to grasp it, lifts it from the surface, carries it over the basket, lowers it into the basket, opens the gripper to release it, and withdraws the empty gripper.",
+      "caption_zh": "机械臂将张开的夹爪移向番茄酱罐头，使夹爪对准罐头，闭合夹爪完成抓取，将罐头从放置面抬起，搬运到篮子上方，下降放入篮子，张开夹爪松开罐头，并将空夹爪移开。"
+    },
+    {
+      "task_index": 29,
+      "representative_episode_index": 823,
+      "original_en": "pick up the chocolate pudding and place it in the basket",
+      "original_zh": "拿起巧克力布丁包装，并把它放进篮子。",
+      "caption_en": "A robotic arm moves its open gripper toward the chocolate pudding package, aligns the gripper around the package, closes the gripper to grasp it, lifts it from the surface, carries it over the basket, lowers it into the basket, opens the gripper to release it, and withdraws the empty gripper.",
+      "caption_zh": "机械臂将张开的夹爪移向巧克力布丁包装，使夹爪对准包装，闭合夹爪完成抓取，将包装从放置面抬起，搬运到篮子上方，下降放入篮子，张开夹爪松开包装，并将空夹爪移开。"
+    },
+    {
+      "task_index": 30,
+      "representative_episode_index": 1261,
+      "original_en": "pick up the black bowl next to the cookie box and place it on the plate",
+      "original_zh": "拿起饼干盒旁边的黑碗，并把它放到盘子上。",
+      "caption_en": "A robotic arm moves its open gripper toward the black bowl next to the cookie box, aligns the gripper around the bowl, closes the gripper to grasp it, lifts it from the table, carries it over the plate, lowers it onto the center of the plate, releases it, and withdraws.",
+      "caption_zh": "机械臂将张开的夹爪移向饼干盒旁边的黑碗，使夹爪对准碗，闭合夹爪完成抓取，将碗从桌面抬起，搬运到盘子上方，下降放到盘子中央，松开夹爪并离开。"
+    },
+    {
+      "task_index": 31,
+      "representative_episode_index": 1262,
+      "original_en": "pick up the black bowl in the top drawer of the wooden cabinet and place it on the plate",
+      "original_zh": "拿起木柜顶层抽屉里的黑碗，并把它放到盘子上。",
+      "caption_en": "With the top drawer already open, a robotic arm reaches into the drawer, aligns its open gripper around the black bowl, closes the gripper to grasp it, lifts the bowl out of the drawer, carries it over the plate, lowers it onto the center of the plate, releases it, and withdraws.",
+      "caption_zh": "在顶层抽屉已经打开的情况下，机械臂伸入抽屉，将张开的夹爪对准黑碗，闭合夹爪完成抓取，将碗从抽屉中抬出，搬运到盘子上方，下降放到盘子中央，松开夹爪并离开。"
+    },
+    {
+      "task_index": 32,
+      "representative_episode_index": 1264,
+      "original_en": "pick up the black bowl on the ramekin and place it on the plate",
+      "original_zh": "拿起放在小烤盅上的黑碗，并把它放到盘子上。",
+      "caption_en": "A robotic arm moves its open gripper toward the black bowl resting on the ramekin, aligns the gripper around the bowl, closes the gripper to grasp it, lifts it clear of the ramekin, carries it over the plate, lowers it onto the center of the plate, releases it, and withdraws.",
+      "caption_zh": "机械臂将张开的夹爪移向放在小烤盅上的黑碗，使夹爪对准碗，闭合夹爪完成抓取，将碗从小烤盅上抬起，搬运到盘子上方，下降放到盘子中央，松开夹爪并离开。"
+    },
+    {
+      "task_index": 33,
+      "representative_episode_index": 1267,
+      "original_en": "pick up the black bowl on the stove and place it on the plate",
+      "original_zh": "拿起炉灶上的黑碗，并把它放到盘子上。",
+      "caption_en": "A robotic arm moves its open gripper toward the black bowl on the stove, aligns the gripper around the bowl, closes the gripper to grasp it, lifts it from the stove, carries it over the plate, lowers it onto the center of the plate, releases it, and withdraws.",
+      "caption_zh": "机械臂将张开的夹爪移向炉灶上的黑碗，使夹爪对准碗，闭合夹爪完成抓取，将碗从炉灶上抬起，搬运到盘子上方，下降放到盘子中央，松开夹爪并离开。"
+    },
+    {
+      "task_index": 34,
+      "representative_episode_index": 1272,
+      "original_en": "pick up the black bowl between the plate and the ramekin and place it on the plate",
+      "original_zh": "拿起盘子和小烤盅之间的黑碗，并把它放到盘子上。",
+      "caption_en": "A robotic arm moves its open gripper toward the black bowl between the plate and the ramekin, aligns the gripper around the bowl, closes the gripper to grasp it, lifts it from the table, carries it over the plate, lowers it onto the center of the plate, releases it, and withdraws.",
+      "caption_zh": "机械臂将张开的夹爪移向盘子和小烤盅之间的黑碗，使夹爪对准碗，闭合夹爪完成抓取，将碗从桌面抬起，搬运到盘子上方，下降放到盘子中央，松开夹爪并离开。"
+    },
+    {
+      "task_index": 35,
+      "representative_episode_index": 1278,
+      "original_en": "pick up the black bowl on the cookie box and place it on the plate",
+      "original_zh": "拿起放在饼干盒上的黑碗，并把它放到盘子上。",
+      "caption_en": "A robotic arm moves its open gripper toward the black bowl resting on the cookie box, aligns the gripper around the bowl, closes the gripper to grasp it, lifts it clear of the box, carries it over the plate, lowers it onto the center of the plate, releases it, and withdraws.",
+      "caption_zh": "机械臂将张开的夹爪移向放在饼干盒上的黑碗，使夹爪对准碗，闭合夹爪完成抓取，将碗从饼干盒上抬起，搬运到盘子上方，下降放到盘子中央，松开夹爪并离开。"
+    },
+    {
+      "task_index": 36,
+      "representative_episode_index": 1280,
+      "original_en": "pick up the black bowl next to the plate and place it on the plate",
+      "original_zh": "拿起盘子旁边的黑碗，并把它放到盘子上。",
+      "caption_en": "A robotic arm moves its open gripper toward the black bowl next to the plate, aligns the gripper around the bowl, closes the gripper to grasp it, lifts it from the table, carries it over the plate, lowers it onto the center of the plate, releases it, and withdraws.",
+      "caption_zh": "机械臂将张开的夹爪移向盘子旁边的黑碗，使夹爪对准碗，闭合夹爪完成抓取，将碗从桌面抬起，搬运到盘子上方，下降放到盘子中央，松开夹爪并离开。"
+    },
+    {
+      "task_index": 37,
+      "representative_episode_index": 1281,
+      "original_en": "pick up the black bowl next to the ramekin and place it on the plate",
+      "original_zh": "拿起小烤盅旁边的黑碗，并把它放到盘子上。",
+      "caption_en": "A robotic arm moves its open gripper toward the black bowl next to the ramekin, aligns the gripper around the bowl, closes the gripper to grasp it, lifts it from the table, carries it over the plate, lowers it onto the center of the plate, releases it, and withdraws.",
+      "caption_zh": "机械臂将张开的夹爪移向小烤盅旁边的黑碗，使夹爪对准碗，闭合夹爪完成抓取，将碗从桌面抬起，搬运到盘子上方，下降放到盘子中央，松开夹爪并离开。"
+    },
+    {
+      "task_index": 38,
+      "representative_episode_index": 1283,
+      "original_en": "pick up the black bowl from table center and place it on the plate",
+      "original_zh": "拿起桌面中央的黑碗，并把它放到盘子上。",
+      "caption_en": "A robotic arm moves its open gripper toward the black bowl at the center of the table, aligns the gripper around the bowl, closes the gripper to grasp it, lifts it from the table, carries it over the plate, lowers it onto the center of the plate, releases it, and withdraws.",
+      "caption_zh": "机械臂将张开的夹爪移向桌面中央的黑碗，使夹爪对准碗，闭合夹爪完成抓取，将碗从桌面抬起，搬运到盘子上方，下降放到盘子中央，松开夹爪并离开。"
+    },
+    {
+      "task_index": 39,
+      "representative_episode_index": 1290,
+      "original_en": "pick up the black bowl on the wooden cabinet and place it on the plate",
+      "original_zh": "拿起木柜顶部的黑碗，并把它放到盘子上。",
+      "caption_en": "A robotic arm moves its open gripper toward the black bowl on top of the wooden cabinet, aligns the gripper around the bowl, closes the gripper to grasp it, lifts it from the cabinet, carries it over the plate, lowers it onto the center of the plate, releases it, and withdraws.",
+      "caption_zh": "机械臂将张开的夹爪移向木柜顶部的黑碗，使夹爪对准碗，闭合夹爪完成抓取，将碗从柜子上抬起，搬运到盘子上方，下降放到盘子中央，松开夹爪并离开。"
+    }
+  ]
+}

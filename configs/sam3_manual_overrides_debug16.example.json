@@ -1,0 +1,20 @@
+{
+  "samples": {
+    "8": {
+      "objects": [
+        {
+          "name": "chocolate_pudding",
+          "role": "object",
+          "source": "manual_box_seed",
+          "interpolate": true,
+          "frames": {
+            "4": { "xyxy_abs": [84, 238, 124, 302] },
+            "8": { "xyxy_abs": [92, 276, 126, 331] },
+            "12": { "xyxy_abs": [118, 294, 160, 348] },
+            "16": { "xyxy_abs": [97, 284, 150, 330] }
+          }
+        }
+      ]
+    }
+  }
+}

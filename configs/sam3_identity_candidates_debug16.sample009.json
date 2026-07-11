@@ -1,0 +1,55 @@
+{
+  "sample": "sample_009",
+  "task_text": "pick up the alphabet soup and place it in the basket",
+  "note": "Identity decision aid only. These boxes are not training-mask overrides.",
+  "candidates": [
+    {
+      "id": "A_current_top_red_box_right",
+      "label": "current top manual candidate: right red box/can",
+      "frame": 0,
+      "view": "top",
+      "xyxy_abs": [168, 108, 199, 151],
+      "status": "current_manual"
+    },
+    {
+      "id": "B_center_round_can_top",
+      "label": "top center round can",
+      "frame": 0,
+      "view": "top",
+      "xyxy_abs": [88, 130, 121, 171],
+      "status": "candidate"
+    },
+    {
+      "id": "C_green_bottle_top",
+      "label": "top green bottle/can",
+      "frame": 0,
+      "view": "top",
+      "xyxy_abs": [129, 104, 153, 165],
+      "status": "candidate"
+    },
+    {
+      "id": "D_current_bottom_redwhite_box",
+      "label": "current bottom early candidate: red-white box",
+      "frame": 0,
+      "view": "bottom",
+      "xyxy_abs": [4, 220, 51, 266],
+      "status": "current_manual"
+    },
+    {
+      "id": "E_bottom_green_can",
+      "label": "bottom green can",
+      "frame": 4,
+      "view": "bottom",
+      "xyxy_abs": [40, 296, 84, 334],
+      "status": "candidate"
+    },
+    {
+      "id": "F_bottom_round_can",
+      "label": "bottom round can / lid",
+      "frame": 4,
+      "view": "bottom",
+      "xyxy_abs": [82, 225, 130, 271],
+      "status": "candidate"
+    }
+  ]
+}

@@ -412,6 +412,7 @@ def create_train_dataloader(config: OmegaConf, rank: int, world_size: int) -> Da
         view_layout=config.dataset.get("view_layout", "single"),
         task_language_embedding_dir=config.dataset.get("task_language_embedding_dir", None),
         task_language_embedding_pattern=config.dataset.get("task_language_embedding_pattern", "task_{task_index:06d}.pt"),
+        task_language_caption_version=config.dataset.get("task_language_caption_version", None),
         load_state=config.dataset.get(
             "load_state",
             config.common.get("state_condition_mode", "none") != "none",

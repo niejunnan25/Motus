@@ -1,0 +1,115 @@
+{
+  "samples": {
+    "7": {
+      "objects": [
+        {
+          "name": "wine_bottle_top",
+          "role": "object",
+          "source": "manual_box_seed_v2",
+          "interpolate": true,
+          "frames": {
+            "0": { "xyxy_abs": [115, 78, 130, 110] },
+            "8": { "xyxy_abs": [115, 78, 130, 112] },
+            "16": { "xyxy_abs": [134, 67, 151, 103] }
+          }
+        },
+        {
+          "name": "wine_bottle_bottom",
+          "role": "object",
+          "source": "manual_box_seed_v2",
+          "interpolate": true,
+          "frames": {
+            "0": { "xyxy_abs": [84, 322, 113, 392] },
+            "4": { "xyxy_abs": [88, 322, 116, 394] },
+            "8": { "xyxy_abs": [89, 323, 119, 394] },
+            "12": { "xyxy_abs": [101, 314, 132, 389] },
+            "16": { "xyxy_abs": [105, 326, 136, 397] }
+          }
+        }
+      ]
+    },
+    "8": {
+      "objects": [
+        {
+          "name": "chocolate_pudding_top",
+          "role": "object",
+          "source": "manual_box_seed_v2",
+          "xyxy_abs": [124, 112, 155, 150]
+        },
+        {
+          "name": "chocolate_pudding_bottom",
+          "role": "object",
+          "source": "manual_box_seed_v2",
+          "interpolate": true,
+          "frames": {
+            "4": { "xyxy_abs": [84, 238, 124, 302] },
+            "8": { "xyxy_abs": [92, 276, 126, 331] },
+            "12": { "xyxy_abs": [118, 294, 160, 348] },
+            "16": { "xyxy_abs": [97, 284, 150, 330] }
+          }
+        }
+      ]
+    },
+    "9": {
+      "objects": [
+        {
+          "name": "alphabet_soup_top",
+          "role": "object",
+          "source": "manual_box_seed_v2",
+          "xyxy_abs": [168, 108, 199, 151]
+        },
+        {
+          "name": "alphabet_soup_bottom_early",
+          "role": "object",
+          "source": "manual_box_seed_v2",
+          "interpolate": false,
+          "frames": {
+            "0": { "xyxy_abs": [4, 220, 51, 266] },
+            "1": { "xyxy_abs": [5, 220, 52, 266] }
+          }
+        }
+      ]
+    },
+    "12": {
+      "objects": [
+        {
+          "name": "ketchup_top",
+          "role": "object",
+          "source": "manual_box_seed_v2",
+          "xyxy_abs": [121, 54, 145, 96]
+        },
+        {
+          "name": "ketchup_bottom",
+          "role": "object",
+          "source": "manual_box_seed_v2",
+          "interpolate": true,
+          "frames": {
+            "8": { "xyxy_abs": [126, 266, 165, 300] },
+            "12": { "xyxy_abs": [129, 289, 156, 318] },
+            "16": { "xyxy_abs": [58, 300, 99, 324] }
+          }
+        }
+      ]
+    },
+    "13": {
+      "objects": [
+        {
+          "name": "black_bowl_bottom",
+          "role": "object",
+          "source": "manual_box_seed_v2",
+          "xyxy_abs": [0, 318, 70, 414]
+        }
+      ]
+    },
+    "14": {
+      "objects": [
+        {
+          "name": "black_bowl_bottom",
+          "role": "object",
+          "source": "manual_box_seed_v2",
+          "xyxy_abs": [0, 322, 66, 414]
+        }
+      ]
+    }
+  }
+}
