@@ -669,6 +669,40 @@ class VideoBridgeDataset(data.Dataset):
     def __len__(self) -> int:
         return len(self.episodes) * 100
 
+    def get_episode_frame_count(self, episode_index: int) -> int:
+        """Return the source-frame count for one deterministic episode."""
+        if not self.episodes:
+            raise IndexError("VideoBridgeDataset has no episodes")
+        episode = self.episodes[episode_index % len(self.episodes)]
+        return self._episode_frame_count(episode)
+
+    def load_episode_frames(self, episode_index: int, frame_indices: List[int]) -> torch.Tensor:
+        """Load exact source frames without applying bridge-window sampling."""
+        if not self.episodes:
+            raise IndexError("VideoBridgeDataset has no episodes")
+        episode = self.episodes[episode_index % len(self.episodes)]
+        total_frames = self._episode_frame_count(episode)
+        indices = [int(index) for index in frame_indices]
+        if any(index < 0 or index >= total_frames for index in indices):
+            raise IndexError(
+                f"Frame indices out of bounds for {episode.get('episode_name')}: "
+                f"indices={indices}, total_frames={total_frames}"
+            )
+        return self._load_episode_frames(episode, indices)
+
+    def load_episode_language_embedding(self, episode_index: int) -> Optional[torch.Tensor]:
+        """Load the language embedding associated with one deterministic episode."""
+        if not self.episodes:
+            raise IndexError("VideoBridgeDataset has no episodes")
+        episode = self.episodes[episode_index % len(self.episodes)]
+        return self._load_language_embedding(episode.get("lang_path"))
+
+    def get_episode_metadata(self, episode_index: int) -> Dict[str, Any]:
+        """Return a copy of episode metadata suitable for cache manifests."""
+        if not self.episodes:
+            raise IndexError("VideoBridgeDataset has no episodes")
+        return dict(self.episodes[episode_index % len(self.episodes)])
+
     def _uniform_frame_indices(self, total_frames: int, *, jitter: bool) -> List[int]:
         frame_count = self.num_video_frames + 1
         if total_frames < frame_count:

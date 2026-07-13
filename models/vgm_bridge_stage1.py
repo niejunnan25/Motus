@@ -3,7 +3,7 @@ import math
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import torch
 import torch.nn as nn
@@ -446,7 +446,8 @@ class VGMBridgeStage1(nn.Module):
         context: List[torch.Tensor],
         seq_len: int,
         token_residual: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+        return_hidden_states: bool = False,
+    ) -> Any:
         """Run WAN with an optional token residual injected after patch embedding."""
         wan_model = self.video_model.wan_model
         device = wan_model.patch_embedding.weight.device
@@ -499,8 +500,19 @@ class VGMBridgeStage1(nn.Module):
             context_lens=None,
         )
 
+        hidden_states = []
         for block in wan_model.blocks:
             x = block(x, **kwargs)
+
+            if return_hidden_states:
+                hidden_states.append(x)
+
+        if return_hidden_states:
+            return {
+                "hidden_states": hidden_states,
+                "grid_sizes": grid_sizes,
+                "seq_lens": seq_lens,
+            }
 
         x = wan_model.head(x, e)
         x = wan_model.unpatchify(x, grid_sizes)
@@ -1138,8 +1150,9 @@ class VGMBridgeStage1(nn.Module):
         last_state: Optional[torch.Tensor] = None,
         num_inference_steps: int = 30,
         generator: Optional[torch.Generator] = None,
+        return_latent: bool = False,
     ) -> torch.Tensor:
-        """Generate a conditioned video in pixel space [B, T, C, H, W]."""
+        """Generate a bridge, returning pixels by default or the final clean latent."""
         was_training = self.training
         self.eval()
         try:
@@ -1261,6 +1274,9 @@ class VGMBridgeStage1(nn.Module):
                 latent = latent + pred * (sigma_next - sigma)
                 latent = latent * (1 - known_mask) + condition_latent * known_mask
 
+            if return_latent:
+                return latent.float()
+
             if self.role_mask_fusion_mode == "latent_channel":
                 decoded_rgb = self.video_model.decode_video(latent[:, : self.latent_channels].to(self.dtype)).float()
                 decoded_role = self.video_model.decode_video(latent[:, self.latent_channels :].to(self.dtype)).float()
@@ -1269,5 +1285,92 @@ class VGMBridgeStage1(nn.Module):
                 decoded = self.video_model.decode_video(latent.to(self.dtype)).float()
             decoded = (decoded.clamp(-1.0, 1.0) + 1.0) * 0.5
             return decoded.permute(0, 2, 1, 3, 4).contiguous()
+        finally:
+            self.train(was_training)
+
+    @torch.no_grad()
+    def extract_bridge_hidden_states(
+        self,
+        trajectory_latent: torch.Tensor,
+        first_frame: torch.Tensor,
+        last_frame: torch.Tensor,
+        language_embeddings: Optional[torch.Tensor] = None,
+        feature_timestep: float = 0.0,
+    ) -> Dict[str, Any]:
+        """Run a clean bridge latent once and expose all WAN block hidden states.
+
+        This path is used by the frozen, WVM-style Progress expert. It preserves
+        the V1-proper condition/mask/endpoint inputs while keeping Progress
+        strictly read-only with respect to the video branch.
+        """
+        if self.role_mask_fusion_mode != "none":
+            raise NotImplementedError(
+                "Progress hidden-state extraction currently supports RGB-only VGM checkpoints"
+            )
+
+        was_training = self.training
+        self.eval()
+        try:
+            trajectory_latent = trajectory_latent.to(device=self.device, dtype=self.dtype)
+            first_frame = first_frame.to(device=self.device, dtype=self.dtype)
+            last_frame = last_frame.to(device=self.device, dtype=self.dtype)
+            batch_size = trajectory_latent.shape[0]
+            if first_frame.shape[0] != batch_size or last_frame.shape[0] != batch_size:
+                raise ValueError("trajectory_latent, first_frame, and last_frame batch sizes must match")
+
+            condition_video = self._make_condition_video(
+                first_frame=first_frame,
+                last_frame=last_frame,
+            )
+            condition_latent = self._encode_condition_latent(
+                first_frame_norm=(first_frame * 2.0 - 1.0).unsqueeze(2),
+                condition_video=condition_video,
+                latent_template=trajectory_latent,
+            )
+            if condition_latent.shape != trajectory_latent.shape:
+                raise ValueError(
+                    "Cached trajectory latent is incompatible with the configured VGM: "
+                    f"trajectory={tuple(trajectory_latent.shape)}, condition={tuple(condition_latent.shape)}"
+                )
+
+            if self.config.conditioning_mode == "v0":
+                known_mask = self._known_condition_mask(condition_latent)
+            else:
+                known_mask = self._first_condition_mask(condition_latent)
+            frame_mask = self._frame_condition_mask(
+                batch_size,
+                condition_latent.device,
+                condition_latent.dtype,
+            )
+            model_input = self._build_model_input(
+                noisy_video_latent=trajectory_latent,
+                condition_latent=condition_latent,
+                frame_mask=frame_mask,
+            )
+            seq_len = self._wan_seq_len(trajectory_latent)
+            token_residual = self._endpoint_token_residual(
+                last_frame=last_frame,
+                last_role_mask=None,
+                target_latent=trajectory_latent,
+                seq_len=seq_len,
+            )
+            timestep = trajectory_latent.new_full((batch_size,), float(feature_timestep))
+            timestep_tokens = self._timestep_tokens(
+                timestep=timestep,
+                latent=trajectory_latent,
+                known_mask=known_mask,
+                seq_len=seq_len,
+            )
+            context = self._context_list(language_embeddings, batch_size, state_tokens=None)
+            latent_list = [model_input[index] for index in range(batch_size)]
+            with torch.autocast(device_type="cuda", dtype=self.video_model.precision):
+                return self._forward_wan(
+                    latent_list=latent_list,
+                    timestep_tokens=timestep_tokens,
+                    context=context,
+                    seq_len=seq_len,
+                    token_residual=token_residual,
+                    return_hidden_states=True,
+                )
         finally:
             self.train(was_training)

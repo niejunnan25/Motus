@@ -1,0 +1,69 @@
+training_mode: "progress_stage2"
+
+source:
+  vgm_config: "configs/vgm_bridge_v1_proper_detailed_caption_v1_53f_full_jitter.yaml"
+  vgm_checkpoint: "/mnt/workspace1/users/niejunnan/codebase/Motus/checkpoints/vgm_bridge_v1_proper_detailed_caption_v1_53f_full_jitter/vgm_bridge_v1_proper_lerobot_video_448x224_detailed_caption_v1_53f_full_jitter_2gpu_gbs8_30k/checkpoint_step_30000"
+
+cache:
+  cache_dir: "/mnt/workspace1/users/niejunnan/cache/motus_progress/v1_proper_detailed_53f_step30000_s50_53slot_v2"
+  num_inference_steps: 50
+  current_encode_batch_size: 16
+  trajectory_frame_encode_batch_size: 16
+  current_frame_stride: 1
+  validation_fraction: 0.1
+  dtype: "float16"
+  seed: 20260713
+
+progress_model:
+  fusion_mode: "serial_latent"
+  # The output class k is the generated trajectory frame k, k=0...52.
+  num_progress_bins: 53
+  latent_channels: 48
+  hidden_dim: 512
+  num_heads: 8
+  num_layers: 6
+  ffn_multiplier: 4
+  patch_size: [1, 2, 2]
+  # Shared by current observations and every independently encoded memory frame.
+  frame_num_tokens: 16
+  video_hidden_dim: 3072
+  dropout: 0.0
+
+loss:
+  # Gaussian soft-label standard deviation measured in generated-frame bins.
+  target_sigma_bins: 2.0
+  regression_weight: 1.0
+  ranking_weight: 0.1
+  ranking_minimum_gap: 0.05
+  ranking_temperature: 0.1
+
+training:
+  # One optimizer step consumes one complete episode. Frames are split into
+  # query micro-batches only to bound activation memory.
+  query_batch_size: 64
+  queries_per_episode: 0
+  # One epoch consumes every frame from every train episode. With 1693 total
+  # episodes and an 8-GPU run, 20 epochs are about 3860 global optimizer steps.
+  max_epochs: 20
+  # Safety ceiling only. The cosine schedule is derived from the actual
+  # distributed steps/epoch and max_epochs, rather than this legacy-style cap.
+  max_steps: 50000
+  seed: 20260713
+  learning_rate: 1.0e-4
+  weight_decay: 0.01
+  warmup_steps: 250
+  grad_clip_norm: 1.0
+  max_episodes: null
+
+system:
+  checkpoint_dir: "./checkpoints/progress_stage2"
+  save_interval: 250
+  log_interval: 1
+  checkpoint_limit: 20
+  num_workers: 2
+  pin_memory: true
+
+logging:
+  report_to: "wandb"
+  wandb_project: "motus-progress"
+  run_name: "progress_v1_proper_serial_latent_53bin_s50_allframes_v2"
