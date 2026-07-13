@@ -684,14 +684,22 @@ class VideoBridgeDataset(data.Dataset):
         for frame_pos in range(1, frame_count - 1):
             left = (targets[frame_pos - 1] + targets[frame_pos]) * 0.5
             right = (targets[frame_pos] + targets[frame_pos + 1]) * 0.5
-            lo = max(start_idx + 1, int(np.ceil(left)))
+            # Assign an integer midpoint to the earlier bin only. Using ceil(left)
+            # for the next bin would let adjacent bins sample the same frame.
+            lo = max(start_idx + 1, int(np.floor(left)) + 1)
             hi = min(end_idx - 1, int(np.floor(right)))
             if lo <= hi:
                 indices.append(random.randint(lo, hi))
             else:
                 indices.append(int(round(targets[frame_pos])))
         indices.append(end_idx)
-        return [int(max(start_idx, min(end_idx, value))) for value in indices]
+        indices = [int(max(start_idx, min(end_idx, value))) for value in indices]
+        if any(left >= right for left, right in zip(indices, indices[1:])):
+            raise RuntimeError(
+                f"Uniform frame bins must produce strictly increasing indices: "
+                f"total_frames={total_frames}, indices={indices}"
+            )
+        return indices
 
     def _select_indices(self, total_frames: int) -> Tuple[int, List[int]]:
         if self.bridge_sampling_mode == "full_episode_uniform":

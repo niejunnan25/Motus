@@ -14,6 +14,9 @@ export HF_DATASETS_CACHE="/mnt/workspace1/users/niejunnan/huggingface/datasets"
 export XDG_CACHE_HOME="/mnt/workspace1/users/niejunnan/.cache"
 
 mkdir -p "${LOG_ROOT}"
+rm -f "${OUTPUT_ROOT}/_SUCCESS"
+date '+started_at=%F %T' >"${OUTPUT_ROOT}/_RUNNING"
+trap 'rm -f "${OUTPUT_ROOT}/_RUNNING"' EXIT
 cd "${ROOT}"
 
 checkpoint() {
