@@ -377,19 +377,31 @@ def role_mask_metrics(
     role_mask_palette: Optional[Dict[Any, Any]] = None,
 ) -> Dict[str, float]:
     """Measure decoded role masks without mixing their easy background into RGB metrics."""
-    if render_mode == "binary":
-        gt_foreground = gt.mean(dim=2) >= 0.5
-        pred_foreground = pred.mean(dim=2) >= 0.5
+    def foreground_metrics(gt_foreground: torch.Tensor, pred_foreground: torch.Tensor) -> Dict[str, float]:
         intersection = (gt_foreground & pred_foreground).sum().float()
         gt_count = gt_foreground.sum().float()
         pred_count = pred_foreground.sum().float()
         union = (gt_foreground | pred_foreground).sum().float()
         return {
-            "role_mask_iou": float((intersection / union.clamp_min(1.0)).cpu()),
-            "role_mask_f1": float((2 * intersection / (gt_count + pred_count).clamp_min(1.0)).cpu()),
-            "role_mask_precision": float((intersection / pred_count.clamp_min(1.0)).cpu()),
-            "role_mask_recall": float((intersection / gt_count.clamp_min(1.0)).cpu()),
+            "role_mask_foreground_iou": float((intersection / union.clamp_min(1.0)).cpu()),
+            "role_mask_foreground_f1": float((2 * intersection / (gt_count + pred_count).clamp_min(1.0)).cpu()),
+            "role_mask_foreground_precision": float((intersection / pred_count.clamp_min(1.0)).cpu()),
+            "role_mask_foreground_recall": float((intersection / gt_count.clamp_min(1.0)).cpu()),
         }
+
+    if render_mode == "binary":
+        gt_foreground = gt.mean(dim=2) >= 0.5
+        pred_foreground = pred.mean(dim=2) >= 0.5
+        metrics = foreground_metrics(gt_foreground, pred_foreground)
+        metrics.update(
+            {
+                "role_mask_iou": metrics["role_mask_foreground_iou"],
+                "role_mask_f1": metrics["role_mask_foreground_f1"],
+                "role_mask_precision": metrics["role_mask_foreground_precision"],
+                "role_mask_recall": metrics["role_mask_foreground_recall"],
+            }
+        )
+        return metrics
 
     configured_palette = role_mask_palette or {
         0: [0, 0, 0],
@@ -411,7 +423,7 @@ def role_mask_metrics(
 
     gt_role = nearest_role(gt)
     pred_role = nearest_role(pred)
-    metrics: Dict[str, float] = {}
+    metrics = foreground_metrics(gt_role != 0, pred_role != 0)
     role_names = {1: "active", 2: "target", 4: "robot"}
     ious = []
     for role_index, role_name in role_names.items():

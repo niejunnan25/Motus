@@ -1,0 +1,65 @@
+{
+  "evaluation_dataset": "LIBERO success50 role-mask detailed-caption v1",
+  "num_samples": 16,
+  "frame_count": 53,
+  "seed": 50,
+  "num_inference_steps": 50,
+  "models": [
+    {
+      "label": "Mosaic Binary V1-proper",
+      "slug": "mosaic_binary_v1",
+      "render_mode": "binary",
+      "condition": "spatial mosaic | binary role mask | no state",
+      "eval_dir": "/mnt/workspace1/users/niejunnan/codebase/Motus/eval_outputs/vgm_role_mask_8way_step30000_s50_16samples/mosaic_binary_v1"
+    },
+    {
+      "label": "Mosaic Binary V2-B+",
+      "slug": "mosaic_binary_v2plus",
+      "render_mode": "binary",
+      "condition": "spatial mosaic | binary role mask | first + last + delta state",
+      "eval_dir": "/mnt/workspace1/users/niejunnan/codebase/Motus/eval_outputs/vgm_role_mask_8way_step30000_s50_16samples/mosaic_binary_v2plus"
+    },
+    {
+      "label": "Mosaic Color V1-proper",
+      "slug": "mosaic_color_v1",
+      "render_mode": "role_color",
+      "condition": "spatial mosaic | color role mask | no state",
+      "eval_dir": "/mnt/workspace1/users/niejunnan/codebase/Motus/eval_outputs/vgm_role_mask_8way_step30000_s50_16samples/mosaic_color_v1"
+    },
+    {
+      "label": "Mosaic Color V2-B+",
+      "slug": "mosaic_color_v2plus",
+      "render_mode": "role_color",
+      "condition": "spatial mosaic | color role mask | first + last + delta state",
+      "eval_dir": "/mnt/workspace1/users/niejunnan/codebase/Motus/eval_outputs/vgm_role_mask_8way_step30000_s50_16samples/mosaic_color_v2plus"
+    },
+    {
+      "label": "Channel Binary V1-proper",
+      "slug": "channel_binary_v1",
+      "render_mode": "binary",
+      "condition": "latent-channel fusion | binary role mask | no state",
+      "eval_dir": "/mnt/workspace1/users/niejunnan/codebase/Motus/eval_outputs/vgm_role_mask_8way_step30000_s50_16samples/channel_binary_v1"
+    },
+    {
+      "label": "Channel Binary V2-B+",
+      "slug": "channel_binary_v2plus",
+      "render_mode": "binary",
+      "condition": "latent-channel fusion | binary role mask | first + last + delta state",
+      "eval_dir": "/mnt/workspace1/users/niejunnan/codebase/Motus/eval_outputs/vgm_role_mask_8way_step30000_s50_16samples/channel_binary_v2plus"
+    },
+    {
+      "label": "Channel Color V1-proper",
+      "slug": "channel_color_v1",
+      "render_mode": "role_color",
+      "condition": "latent-channel fusion | color role mask | no state",
+      "eval_dir": "/mnt/workspace1/users/niejunnan/codebase/Motus/eval_outputs/vgm_role_mask_8way_step30000_s50_16samples/channel_color_v1"
+    },
+    {
+      "label": "Channel Color V2-B+",
+      "slug": "channel_color_v2plus",
+      "render_mode": "role_color",
+      "condition": "latent-channel fusion | color role mask | first + last + delta state",
+      "eval_dir": "/mnt/workspace1/users/niejunnan/codebase/Motus/eval_outputs/vgm_role_mask_8way_step30000_s50_16samples/channel_color_v2plus"
+    }
+  ]
+}
