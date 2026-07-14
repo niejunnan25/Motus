@@ -29,6 +29,11 @@ progress_model:
   patch_size: [1, 2, 2]
   # Shared by current observations and every independently encoded memory frame.
   frame_num_tokens: 16
+  view_encoding_mode: "joint"
+  num_views: 1
+  tokens_per_view: 16
+  alignment_head_mode: "pooled_cosine"
+  late_interaction_temperature: 0.07
   video_hidden_dim: 3072
   feature_timestep: 0.0
   dropout: 0.0
@@ -37,14 +42,19 @@ loss:
   # Gaussian soft-label standard deviation measured in generated-frame bins.
   target_sigma_bins: 2.0
   regression_weight: 1.0
-  ranking_weight: 0.1
+  ranking_weight: 0.0
   ranking_minimum_gap: 0.05
   ranking_temperature: 0.1
 
 training:
-  # The frozen 5B WAN is evaluated once per episode. All source frames reuse
-  # those 30 hidden-state memories in smaller query micro-batches.
+  # E: complete episodes loaded by each GPU for one optimizer step. The frozen
+  # 5B WAN cost scales with E, so start Layerwise mixed batching conservatively.
+  episode_batch_size: 1
+  # Number of episode memories (and frozen-WAN feature passes) in one forward.
+  episode_micro_batch_size: 1
+  # Maximum flattened query count in one forward.
   query_batch_size: 8
+  # Q=0 preserves the archived all-frame baseline. Mixed E>1 requires Q>0.
   queries_per_episode: 0
   # Same 20 complete passes over all frames as the serial ablation. The frozen
   # WAN feature pass is performed once per episode visit, not once per frame.

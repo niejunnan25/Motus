@@ -27,6 +27,25 @@ from train.eval_vgm_bridge_stage1 import build_dataset, build_model
 
 logger = logging.getLogger(__name__)
 
+# 维度约定：N=一个 episode 中的查询帧数，F=生成轨迹帧数（正式配置为 53），
+# C_img=RGB 通道数（3），C_z=VAE latent 通道数（正式配置为 48），
+# T_z/H_z/W_z=latent 的时间/空间尺寸，H_img/W_img=输入图像尺寸。
+
+# Progress Stage 2 审阅边界：
+# - 首次引入 53-frame Progress 训练的基线为分支 codex/vgm-bridge-stage1、
+#   commit e026a6b（Add 53-frame trajectory progress training）。
+# - 讨论中的 z_trajectory 在代码里统一命名为 trajectory_latent。
+# - V1-proper VGM 先用 first + goal + language 做 50 步采样，只生成一次轨迹；
+#   Stage 2 训练不会为每一张在线观测重复执行这 50 步采样。
+#
+# 本文件负责的完整数据流：
+# first/goal/language
+# -> trajectory_latent [1,C_z,T_z=14,H_z,W_z]
+# -> Wan VAE decode -> 53 张 RGB 图 [F=53,C_img,H_img,W_img]
+# -> 每张图单独 Wan VAE encode -> [F=53,C_z,1,H_z,W_z]
+# -> 真实 episode 的每张查询图也单独 encode -> [N,C_z,1,H_z,W_z]
+# -> 连同 progress [N] 一起写入一次性缓存，供两种 Progress 模型复用。
+
 
 def setup_logging(rank: int, level: str) -> None:
     logging.basicConfig(
@@ -116,23 +135,42 @@ def encode_frames_independently(
     cache_dtype: torch.dtype,
 ) -> torch.Tensor:
     """VAE-encode every RGB frame as an independent one-frame video."""
+    # 输入 frames: [N, C_img, H_img, W_img]。这里故意不把 N 帧作为连续视频编码，
+    # 而是让每张图片都成为独立的单帧视频，从而得到 N 个可单独寻址的 Progress slot。
+    # 对生成轨迹调用时 N=F=53；对真实 episode 调用时 N=该 episode 选中的查询帧数。
+    # 这里只检查 rank=4，避免把 [B,F,C,H,W] 整段视频误传进来。
     if frames.ndim != 4:
         raise ValueError(f"Expected frame tensor [N,C,H,W], got {tuple(frames.shape)}")
+    # batch_size 只是 VAE 编码时的 micro-batch 大小，不改变 N 个帧各自独立编码的语义。
     if batch_size < 1:
         raise ValueError("Frame VAE encode batch size must be positive")
+    # latents 中每一项稍后都是一个 CPU tensor: [B_e, C_z, 1, H_z, W_z]。
     latents = []
+    # start 依次取 0, B_e, 2*B_e...；最后一个 chunk 可以小于 batch_size。
     for start in range(0, frames.shape[0], batch_size):
+        # frame_batch: [B_e, C_img, H_img, W_img]，B_e 是 VAE 编码 micro-batch。
         frame_batch = frames[start : start + batch_size]
-        pixels = (
-            frame_batch.to(device=model.device, dtype=model.dtype) * 2.0 - 1.0
-        ).unsqueeze(2)
+        # 仅改变设备和精度，形状仍为 [B_e, C_img, H_img, W_img]。
+        frame_batch = frame_batch.to(device=model.device, dtype=model.dtype)
+        # Wan VAE 接收 [-1,1] 像素；数值范围由 [0,1] 线性映射到 [-1,1]，形状不变。
+        pixels = frame_batch * 2.0 - 1.0
+        # 在 dim=2 插入长度为 1 的时间维：
+        # [B_e, C_img, H_img, W_img] -> [B_e, C_img, 1, H_img, W_img]。
+        pixels = pixels.unsqueeze(2)
+        # chunk_latents: [B_e, C_z, 1, H_z, W_z]。
+        # 每个输入样本只有一帧，因此每个输出样本必须也只有一个 temporal latent slice。
         chunk_latents = model.video_model.encode_video(pixels)
+        # 同时检查 rank=5 和 T_z=1，防止 VAE/API 改动后悄悄破坏 53-slot 对齐定义。
         if chunk_latents.ndim != 5 or chunk_latents.shape[2] != 1:
             raise RuntimeError(
                 "Independent single-frame VAE encoding must produce [B,C,1,H,W], "
                 f"got {tuple(chunk_latents.shape)}"
             )
-        latents.append(chunk_latents.detach().cpu().to(cache_dtype))
+        # 缓存不参与 VAE 反向传播：detach 去掉计算图，cpu 搬出显存，to 转成缓存精度。
+        # 形状始终保持 [B_e, C_z, 1, H_z, W_z]。
+        cached_chunk = chunk_latents.detach().cpu().to(cache_dtype)
+        latents.append(cached_chunk)
+    # 沿帧/样本维 dim=0 拼回原顺序：若生成轨迹 N=53，则返回 [53,C_z,1,H_z,W_z]。
     return torch.cat(latents, dim=0)
 
 
@@ -144,15 +182,22 @@ def encode_current_latents(
     batch_size: int,
     cache_dtype: torch.dtype,
 ) -> torch.Tensor:
+    # indices 长度就是 N；每个元素是当前 episode 中一张真实 source frame 的绝对下标。
     if batch_size < 1:
         raise ValueError("Current-frame VAE encode batch size must be positive")
+    # 每个列表元素稍后为 [B_e,C_z,1,H_z,W_z]，最终沿 dim=0 拼成 N 张查询。
     latents = []
+    # 真实帧也按 micro-batch 读取和编码，避免一次把完整 episode 塞进显存。
     for start in range(0, len(indices), batch_size):
+        # chunk_indices 长度为 B_e（最后一组可能更短），不改变原 episode 顺序。
         chunk_indices = indices[start : start + batch_size]
+        # frames: [B_e, C_img, H_img, W_img]，来自真实 source episode。
         frames = dataset.load_episode_frames(episode_index, chunk_indices)
+        # 调用与 53 张生成帧完全相同的单帧 VAE 路径，得到 [B_e,C_z,1,H_z,W_z]。
         latents.append(
             encode_frames_independently(model, frames, batch_size, cache_dtype)
         )
+    # 沿查询帧维 dim=0 拼接，返回全部在线查询: [N,C_z,1,H_z,W_z]。
     return torch.cat(latents, dim=0)
 
 
@@ -162,16 +207,36 @@ def decode_generated_trajectory_frames(
     expected_frames: int,
 ) -> torch.Tensor:
     """Decode the final VGM latent into the explicit frame sequence used as memory."""
-    decoded = model.video_model.decode_video(trajectory_latent.to(model.dtype)).float()
+    # 关键设计：这里没有把 14 个 temporal latent slice 插值成 53 个分类位置。
+    # 14 个 slice 是 Wan VAE 的时间压缩表示，并不天然等价于 14 张可匹配图片；因此先用
+    # 同一个 Wan VAE 完整解码出 53 张图片，再在后续逐帧独立编码，建立 53 个显式 slot。
+    # trajectory_latent: [1,C_z,T_z,H_z,W_z]；正式 53F 配置中 T_z=14。
+    # 转成 VAE 精度只改变 dtype，不改变形状。
+    trajectory_latent = trajectory_latent.to(model.dtype)
+    # Wan VAE temporal decoder 把 14 个压缩 slice 还原为完整视频：
+    # [1,C_z,T_z=14,H_z,W_z] -> [1,C_img,F=53,H_img,W_img]，像素范围约为 [-1,1]。
+    decoded = model.video_model.decode_video(trajectory_latent)
+    # 后续像素变换和缓存前重编码统一用 float32；形状仍为 [1,C_img,F,H_img,W_img]。
+    decoded = decoded.float()
+    # 必须是单 episode 的 5D 视频；这里不允许把多个 episode 混成一条 53-frame memory。
     if decoded.ndim != 5 or decoded.shape[0] != 1:
         raise RuntimeError(
             f"Expected decoded trajectory [1,C,F,H,W], got {tuple(decoded.shape)}"
         )
-    decoded = ((decoded.clamp(-1.0, 1.0) + 1.0) * 0.5).permute(0, 2, 1, 3, 4)
+    # 截断 VAE 可能产生的轻微越界值；形状不变，数值严格落在 [-1,1]。
+    decoded = decoded.clamp(-1.0, 1.0)
+    # 线性映射到数据集统一使用的 [0,1] RGB 范围；形状仍为 [1,C_img,F,H_img,W_img]。
+    decoded = (decoded + 1.0) * 0.5
+    # 把时间维移到通道维之前：
+    # [1,C_img,F,H_img,W_img] -> [1,F,C_img,H_img,W_img]。
+    decoded = decoded.permute(0, 2, 1, 3, 4)
+    # Progress 输出空间固定为 F=53；若 VAE 解出的帧数不等于配置 bin 数，立即终止缓存。
     if decoded.shape[1] != expected_frames:
         raise RuntimeError(
             f"VGM decoded {decoded.shape[1]} frames but Progress requires {expected_frames} bins"
         )
+    # decoded[0] 去掉唯一的 episode batch 维；contiguous 为后续逐帧 batch 切片整理内存。
+    # 返回 [F=53,C_img,H_img,W_img]，这 53 张图接下来会各自独立 VAE encode。
     return decoded[0].contiguous()
 
 
@@ -218,16 +283,25 @@ def cache_episode(
     )
 
     if not cache_path.exists() or overwrite:
+        # endpoint_frames: [2, C_img, H_img, W_img]；first/last 各为 [1, C_img, H_img, W_img]。
         endpoint_frames = dataset.load_episode_frames(
             episode_index, [0, total_frames - 1]
         )
+        # 保留 batch 维，first_frame: [1,C_img,H_img,W_img]。
         first_frame = endpoint_frames[0:1]
+        # 保留 batch 维，last_frame: [1,C_img,H_img,W_img]。
         last_frame = endpoint_frames[1:2]
+        # 每个 episode 用稳定 seed 建立独立 CUDA RNG，使同 checkpoint 的缓存可以复现。
         generator = torch.Generator(device=model.device).manual_seed(episode_seed)
+        # language_embedding 原为 [L_text,D_text]；增加 batch 后为 [1,L_text,D_text]，也允许 None。
         language_batch = (
             language_embedding.unsqueeze(0) if language_embedding is not None else None
         )
 
+        # 最终去噪后的 z_trajectory/trajectory_latent:
+        # [1, C_z, T_z, H_z, W_z]，正式 53F 配置中 T_z=14。
+        # first/last 提供首尾视觉条件；language_batch 提供任务语义；generator 固定初始噪声。
+        # num_inference_steps 正式配置为 50；return_latent=True 阻止内部 VAE decode。
         trajectory_latent = model.sample_bridge(
             first_frame=first_frame,
             last_frame=last_frame,
@@ -236,19 +310,27 @@ def cache_episode(
             generator=generator,
             return_latent=True,
         )
+        # cache_dtype 只决定落盘精度（正式为 float16），不改变上面 VGM 推理使用的精度。
         cache_dtype = tensor_cache_dtype(cache_dtype_name)
+        # 先解码成显式生成轨迹: [F=53, C_img, H_img, W_img]。
         trajectory_frames = decode_generated_trajectory_frames(
             model,
             trajectory_latent,
             num_progress_bins,
         )
+        # 再逐帧独立编码成 53 个 memory slot:
+        # trajectory_frame_latents: [F=53, C_z, 1, H_z, W_z]。
         trajectory_frame_latents = encode_frames_independently(
             model,
             trajectory_frames,
             trajectory_frame_encode_batch_size,
             cache_dtype,
         )
+        # RGB 解码结果只是建立 53 个显式 slot 的中间产物。缓存只保留逐帧 latent，
+        # 不保留这批 RGB tensor，避免每个 episode 重复占用大量磁盘空间。
         del trajectory_frames
+        # 真实 episode 查询帧走完全相同的单帧 VAE 路径:
+        # current_latents: [N, C_z, 1, H_z, W_z]。
         current_latents = encode_current_latents(
             model,
             dataset,
@@ -257,6 +339,11 @@ def cache_episode(
             int(config.cache.get("current_encode_batch_size", 16)),
             cache_dtype,
         )
+        # indices 先转为 [N] float32 tensor，再逐元素除以同一个标量 total_frames-1。
+        # progress: [N]，第 i 个查询的监督值为 source_frame_index/(total_frames-1)。
+        # 这是当前最重要的监督假设：标签来自 source episode 的归一化时间，而不是先计算
+        # 当前真实图和 53 张生成图的视觉相似度后再选择最近帧。因此 source 进度 0.5 会被
+        # 监督到生成轨迹第 26 帧附近，默认两条轨迹在时间上单调且近似线性对齐。
         progress = torch.tensor(indices, dtype=torch.float32) / float(total_frames - 1)
         payload = {
             "schema_version": SCHEMA_VERSION,
@@ -265,13 +352,20 @@ def cache_episode(
             "task_index": metadata.get("task_index"),
             "total_frames": total_frames,
             "num_progress_bins": num_progress_bins,
+            # 去掉 batch 维后保存: [C_z, T_z, H_z, W_z]；仅 Layerwise 分支直接使用。
             "trajectory_latent": trajectory_latent[0].detach().cpu().to(cache_dtype),
+            # [F=53, C_z, 1, H_z, W_z]；Serial 与 Layerwise 都用于最终 53-bin 对齐。
             "trajectory_frame_latents": trajectory_frame_latents,
+            # [N, C_z, 1, H_z, W_z]；每一项对应一张真实在线观测。
             "current_latents": current_latents,
+            # [N]。
             "progress": progress,
+            # [N] int64；保留原始 source frame 下标，便于评估和排查标签。
             "frame_indices": torch.tensor(indices, dtype=torch.long),
+            # 去掉 batch 后各为 [C_img,H_img,W_img] uint8，仅 Layerwise 重放条件和可视化使用。
             "first_frame": (first_frame[0].clamp(0, 1) * 255.0).round().to(torch.uint8),
             "last_frame": (last_frame[0].clamp(0, 1) * 255.0).round().to(torch.uint8),
+            # 字符串路径，不在每个 episode payload 中重复保存 [L_text,D_text] embedding tensor。
             "language_file": language_file,
             "vgm_config": vgm_config_path,
             "vgm_checkpoint": str(config.source.vgm_checkpoint),
@@ -419,6 +513,12 @@ def main() -> None:
     if vgm_config.common.get("role_mask_fusion_mode", "none") != "none":
         raise NotImplementedError(
             "Initial Progress experiments require an RGB-only V1-proper checkpoint"
+        )
+    if vgm_config.common.get("state_condition_mode", "none") != "none":
+        raise NotImplementedError(
+            "Progress cache generation currently requires a state-free VGM source. "
+            "State-conditioned V2-B checkpoints need an explicit endpoint-state input "
+            "policy and must use a separate cache pipeline."
         )
     num_progress_bins = int(config.progress_model.get("num_progress_bins", 53))
     generated_frames = int(vgm_config.common.num_video_frames) + 1

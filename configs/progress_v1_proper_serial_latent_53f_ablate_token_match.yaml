@@ -16,7 +16,6 @@ cache:
 
 progress_model:
   fusion_mode: "serial_latent"
-  # The output class k is the generated trajectory frame k, k=0...52.
   num_progress_bins: 53
   latent_channels: 48
   hidden_dim: 512
@@ -24,20 +23,17 @@ progress_model:
   num_layers: 6
   ffn_multiplier: 4
   patch_size: [1, 2, 2]
-  # Shared by current observations and every independently encoded memory frame.
   frame_num_tokens: 16
-  # Archived baseline: encode the vertically concatenated views jointly.
   view_encoding_mode: "joint"
   num_views: 1
   tokens_per_view: 16
-  # Archived baseline: mean-pool each frame's tokens before cosine matching.
-  alignment_head_mode: "pooled_cosine"
+  # A3: retain all 16 local tokens in the final frame-to-query matching head.
+  alignment_head_mode: "token_late_interaction"
   late_interaction_temperature: 0.07
   video_hidden_dim: 3072
   dropout: 0.0
 
 loss:
-  # Gaussian soft-label standard deviation measured in generated-frame bins.
   target_sigma_bins: 2.0
   regression_weight: 1.0
   ranking_weight: 0.0
@@ -45,23 +41,11 @@ loss:
   ranking_temperature: 0.1
 
 training:
-  # E: complete episodes loaded by each GPU for one optimizer step.
-  # Keep E=1 for the archived all-frame baseline; set E>1 with a fixed Q below
-  # to enable episode-query mixed batching.
   episode_batch_size: 1
-  # Number of episode memories encoded together in one forward. For example,
-  # E=8, E_micro=2, Q=8, query_batch_size=16 gives four forwards per step.
   episode_micro_batch_size: 1
-  # Maximum flattened query count in one forward.
   query_batch_size: 64
-  # Q=0 uses every frame and is supported only for E=1. Mixed E>1 requires a
-  # positive fixed Q so every episode contributes equal query weight.
   queries_per_episode: 0
-  # One epoch consumes every frame from every train episode. With 1693 total
-  # episodes and an 8-GPU run, 20 epochs are about 3860 global optimizer steps.
   max_epochs: 20
-  # Safety ceiling only. The cosine schedule is derived from the actual
-  # distributed steps/epoch and max_epochs, rather than this legacy-style cap.
   max_steps: 50000
   seed: 20260713
   learning_rate: 1.0e-4
@@ -81,4 +65,4 @@ system:
 logging:
   report_to: "wandb"
   wandb_project: "motus-progress"
-  run_name: "progress_v1_proper_serial_latent_53bin_s50_allframes_v2"
+  run_name: "progress_v1_proper_serial_53bin_ablate_token_match_s50_allframes_v2"
