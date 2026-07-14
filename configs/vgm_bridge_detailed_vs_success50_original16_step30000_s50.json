@@ -1,0 +1,45 @@
+{
+  "evaluation_dataset": "original LIBERO detailed-caption v1",
+  "num_samples": 16,
+  "frame_count": 53,
+  "seed": 50,
+  "num_inference_steps": 50,
+  "models": [
+    {
+      "label": "V1-proper detailed",
+      "slug": "baseline_v1",
+      "condition": "mask + first/last endpoint | no state | original LIBERO training",
+      "eval_dir": "/mnt/workspace1/users/niejunnan/codebase/Motus/eval_outputs/vgm_bridge_detailed_vs_success50_original16_step30000_s50/baseline_v1"
+    },
+    {
+      "label": "V1-proper success50 detailed",
+      "slug": "success50_v1",
+      "condition": "mask + first/last endpoint | no state | success50 training",
+      "eval_dir": "/mnt/workspace1/users/niejunnan/codebase/Motus/eval_outputs/vgm_bridge_detailed_vs_success50_original16_step30000_s50/success50_v1"
+    },
+    {
+      "label": "V2-B state detailed",
+      "slug": "baseline_v2_state",
+      "condition": "mask + first/last endpoint | first state | original LIBERO training",
+      "eval_dir": "/mnt/workspace1/users/niejunnan/codebase/Motus/eval_outputs/vgm_bridge_detailed_vs_success50_original16_step30000_s50/baseline_v2_state"
+    },
+    {
+      "label": "V2-B state success50 detailed",
+      "slug": "success50_v2_state",
+      "condition": "mask + first/last endpoint | first state | success50 training",
+      "eval_dir": "/mnt/workspace1/users/niejunnan/codebase/Motus/eval_outputs/vgm_bridge_detailed_vs_success50_original16_step30000_s50/success50_v2_state"
+    },
+    {
+      "label": "V2-B+ first/last/delta detailed",
+      "slug": "baseline_v2_plus",
+      "condition": "mask + first/last endpoint | first + last + delta state | original LIBERO training",
+      "eval_dir": "/mnt/workspace1/users/niejunnan/codebase/Motus/eval_outputs/vgm_bridge_detailed_vs_success50_original16_step30000_s50/baseline_v2_plus"
+    },
+    {
+      "label": "V2-B+ first/last/delta success50 detailed",
+      "slug": "success50_v2_plus",
+      "condition": "mask + first/last endpoint | first + last + delta state | success50 training",
+      "eval_dir": "/mnt/workspace1/users/niejunnan/codebase/Motus/eval_outputs/vgm_bridge_detailed_vs_success50_original16_step30000_s50/success50_v2_plus"
+    }
+  ]
+}
