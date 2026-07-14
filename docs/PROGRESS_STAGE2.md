@@ -229,8 +229,12 @@ source frames and `query_batch_size` remains an activation micro-batch. Accelera
 uses even distributed batches by default, so when the episode count is not
 divisible by `world_size*E`, at most `world_size*E-1` episode visits are repeated
 at the epoch boundary to keep all DDP ranks on the same number of optimizer
-steps. To enable mixed batching, set `E>1`, choose a positive fixed `Q`, and ensure
-`episode_micro_batch_size*Q <= query_batch_size`. The current LIBERO source has
+steps. Episode lengths can differ across ranks, so the trainer gathers each
+rank's query-chunk count and pads shorter ranks with zero-gradient forwards.
+This preserves every real frame and makes all ranks enter DDP synchronization
+on the same final backward. To enable mixed batching, set `E>1`, choose a
+positive fixed `Q`, and ensure `episode_micro_batch_size*Q <= query_batch_size`.
+The current LIBERO source has
 1,693 episodes and 273,465 frames. Increasing `E` reduces optimizer steps per
 epoch, so comparisons must hold total optimizer steps or total query exposures
 constant rather than blindly reusing the same epoch count. The cosine schedule

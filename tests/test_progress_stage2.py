@@ -24,6 +24,8 @@ from train.train_progress_stage2 import (
     extract_episode_video_features,
     model_config_from_yaml,
     prepare_episode_queries,
+    query_chunk_bounds,
+    synchronize_forward_count,
 )
 
 
@@ -40,6 +42,40 @@ def small_config(fusion_mode: str, num_layers: int) -> ProgressStage2Config:
         frame_num_tokens=4,
         video_hidden_dim=48,
         dropout=0.0,
+    )
+
+
+def test_variable_length_ddp_chunks_share_one_final_sync_point():
+    class FakeAccelerator:
+        num_processes = 3
+        device = torch.device("cpu")
+
+        @staticmethod
+        def gather(local_count):
+            assert local_count.tolist() == [3]
+            return torch.tensor([3, 5, 4], dtype=torch.long)
+
+    assert synchronize_forward_count(3, FakeAccelerator()) == 5
+    assert query_chunk_bounds(0, query_count=130, query_batch_size=64) == (
+        0,
+        64,
+        False,
+    )
+    assert query_chunk_bounds(2, query_count=130, query_batch_size=64) == (
+        128,
+        130,
+        False,
+    )
+    # Rank 0 has only three real chunks but executes two one-query dummy chunks.
+    assert query_chunk_bounds(3, query_count=130, query_batch_size=64) == (
+        0,
+        1,
+        True,
+    )
+    assert query_chunk_bounds(4, query_count=130, query_batch_size=64) == (
+        0,
+        1,
+        True,
     )
 
 

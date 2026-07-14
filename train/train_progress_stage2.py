@@ -167,6 +167,40 @@ def prepare_episode_queries(
     return current_latents[order], progress[order]
 
 
+def synchronize_forward_count(local_count: int, accelerator: Any) -> int:
+    """Return the largest number of forward chunks used by any DDP rank."""
+    if local_count < 1:
+        raise ValueError("Every rank must execute at least one Progress forward")
+    if int(accelerator.num_processes) <= 1:
+        return local_count
+    count = torch.tensor(
+        [local_count],
+        device=accelerator.device,
+        dtype=torch.long,
+    )
+    gathered = accelerator.gather(count)
+    synchronized_count = int(gathered.max().item())
+    if synchronized_count < local_count:
+        raise RuntimeError(
+            "Synchronized Progress forward count cannot be smaller than the local count"
+        )
+    return synchronized_count
+
+
+def query_chunk_bounds(
+    chunk_number: int,
+    query_count: int,
+    query_batch_size: int,
+) -> tuple[int, int, bool]:
+    """Return a real query slice or a one-query zero-gradient padding slice."""
+    if chunk_number < 0 or query_count < 1 or query_batch_size < 1:
+        raise ValueError("Invalid Progress query chunk arguments")
+    start = chunk_number * query_batch_size
+    if start >= query_count:
+        return 0, 1, True
+    return start, min(start + query_batch_size, query_count), False
+
+
 def prepare_episode_micro_batch(
     episodes: Sequence[Dict[str, Any]],
     queries_per_episode: int,
@@ -514,22 +548,33 @@ def train(config: Any, accelerator: Accelerator, resume_from: Optional[str]) -> 
                 query_count_for_step += query_count
 
                 # Mixed 模式由配置校验保证 E_micro*Q <= query_batch_size，因此这里只会
-                # 有一个 query chunk；旧 E=1,Q=0 全 episode 路径仍可按 B_q 分块。
-                chunk_starts = list(range(0, query_count, query_batch_size))
+                # 有一个 query chunk。旧 E=1,Q=0 全 episode 路径的 N 随 episode 改变，
+                # 多卡时各 rank 的 chunk 数也可能不同。DDP 必须让所有 rank 在同一次
+                # 最终 backward 上进入梯度同步，因此以全局最大 chunk 数补齐短 episode。
+                local_chunk_count = math.ceil(query_count / query_batch_size)
+                chunk_count = (
+                    synchronize_forward_count(local_chunk_count, accelerator)
+                    if queries_per_episode == 0
+                    else local_chunk_count
+                )
                 video_features = extract_episode_video_features(
                     frozen_vgm,
                     config,
                     prepared,
                 )
-                for chunk_number, start in enumerate(chunk_starts):
-                    end = min(start + query_batch_size, query_count)
+                for chunk_number in range(chunk_count):
+                    start, end, is_padding_chunk = query_chunk_bounds(
+                        chunk_number,
+                        query_count,
+                        query_batch_size,
+                    )
                     current_latent_chunk = current_latents[start:end]
                     progress_target_chunk = progress_targets[start:end]
                     query_episode_chunk = query_episode_indices[start:end]
                     chunk_size = end - start
                     is_last_forward = (
                         micro_number == len(micro_starts) - 1
-                        and chunk_number == len(chunk_starts) - 1
+                        and chunk_number == chunk_count - 1
                     )
                     # DDP 只在本 optimizer batch 的最后一次 backward 同步梯度。
                     sync_context = (
@@ -556,29 +601,37 @@ def train(config: Any, accelerator: Accelerator, resume_from: Optional[str]) -> 
                                 episode_ids=query_episode_chunk,
                                 **loss_options,
                             )
-                            # E 条 episode 等权。Mixed 模式每个 micro-batch 完整包含 Q 个
-                            # query；旧 E=1,Q=0 分块时再乘 chunk_size/N，保持旧梯度口径。
-                            episode_fraction = len(micro_episodes) / float(episode_count)
-                            query_fraction = (
-                                1.0
-                                if queries_per_episode > 0
-                                else chunk_size / float(query_count)
-                            )
-                            scaled_loss = (
-                                losses["total_loss"]
-                                * episode_fraction
-                                * query_fraction
-                            )
+                            if is_padding_chunk:
+                                # 该 rank 的真实 query 已耗尽。仍执行同一模型图，使 DDP
+                                # 在全局最后一个 backward 同步；乘 0 后不改变本 rank 梯度。
+                                scaled_loss = losses["total_loss"] * 0.0
+                            else:
+                                # E 条 episode 等权。Mixed 模式每个 micro-batch 完整包含 Q
+                                # 个 query；旧全 episode 路径乘 chunk_size/N，保持梯度口径。
+                                episode_fraction = len(micro_episodes) / float(
+                                    episode_count
+                                )
+                                query_fraction = (
+                                    1.0
+                                    if queries_per_episode > 0
+                                    else chunk_size / float(query_count)
+                                )
+                                scaled_loss = (
+                                    losses["total_loss"]
+                                    * episode_fraction
+                                    * query_fraction
+                                )
                         accelerator.backward(scaled_loss)
 
                     # 固定 Q 的 mixed 模式按 episode 数做宏平均；旧全 episode 路径继续
                     # 按 query 数加权，二者都与各自的反向缩放口径一致。
-                    metric_weight = (
-                        len(micro_episodes)
-                        if queries_per_episode > 0
-                        else chunk_size
-                    )
-                    weighted_metrics(metric_accumulator, losses, metric_weight)
+                    if not is_padding_chunk:
+                        metric_weight = (
+                            len(micro_episodes)
+                            if queries_per_episode > 0
+                            else chunk_size
+                        )
+                        weighted_metrics(metric_accumulator, losses, metric_weight)
                 del video_features, prepared
 
             if float(config.training.get("grad_clip_norm", 0.0)) > 0:
