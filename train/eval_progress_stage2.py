@@ -7,7 +7,6 @@ import argparse
 import csv
 import json
 import logging
-import math
 import sys
 from pathlib import Path
 from typing import Any, Dict, List
@@ -119,7 +118,7 @@ def spearman(prediction: torch.Tensor, target: torch.Tensor) -> float:
 
 
 def pearson(prediction: torch.Tensor, target: torch.Tensor) -> float:
-    """Value-Order Correlation used by robot progress-model evaluations."""
+    """Linear correlation between predicted and target absolute progress."""
     if prediction.numel() < 2:
         return 0.0
     prediction = prediction.float() - prediction.float().mean()
@@ -326,6 +325,7 @@ def main() -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     rows: List[Dict[str, Any]] = []
+    episode_outputs: List[Dict[str, Any]] = []
     all_predictions: List[torch.Tensor] = []
     all_targets: List[torch.Tensor] = []
     query_batch_size = int(config.training.query_batch_size)
@@ -355,6 +355,17 @@ def main() -> None:
             **metrics,
         }
         rows.append(row)
+        episode_outputs.append(
+            {
+                "episode_name": str(episode["episode_name"]),
+                "task_index": episode["task_index"],
+                "total_frames": int(episode["total_frames"]),
+                "frame_indices": episode["frame_indices"].cpu().long().contiguous(),
+                "target": target.float().contiguous(),
+                "prediction": prediction.float().contiguous(),
+                "alignment_probabilities": alignment.float().contiguous(),
+            }
+        )
         all_predictions.append(prediction)
         all_targets.append(target)
         if index < args.num_visualizations:
@@ -403,6 +414,8 @@ def main() -> None:
         "split": args.split,
         "episodes": len(rows),
         "queries": target.numel(),
+        "tasks": len(task_metrics),
+        "task_indices": sorted(task_metrics, key=lambda value: int(value)),
         "query_weighted": {
             "mae": float(error.abs().mean()),
             "rmse": float(error.pow(2).mean().sqrt()),
@@ -421,6 +434,16 @@ def main() -> None:
         writer = csv.DictWriter(file, fieldnames=list(rows[0].keys()))
         writer.writeheader()
         writer.writerows(rows)
+    torch.save(
+        {
+            "schema_version": 1,
+            "config": args.config,
+            "checkpoint": args.checkpoint,
+            "split": args.split,
+            "episodes": episode_outputs,
+        },
+        output_dir / "episode_outputs.pt",
+    )
     logger.info("Progress evaluation complete: %s", output_dir)
 
 

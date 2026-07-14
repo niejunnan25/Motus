@@ -21,6 +21,7 @@ from omegaconf import OmegaConf
 
 sys.path.append(str(Path(__file__).parent.parent))
 
+from data.progress import RoboDopamineBenchDataset
 from data.progress.progress_cache_dataset import SCHEMA_VERSION
 from train.eval_vgm_bridge_stage1 import build_dataset, build_model
 
@@ -60,8 +61,16 @@ def distributed_context() -> tuple[int, int, int]:
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     if world_size > 1 and not dist.is_initialized():
         torch.cuda.set_device(local_rank)
-        dist.init_process_group(backend="nccl")
+        dist.init_process_group(
+            backend="nccl",
+            device_id=torch.device("cuda", local_rank),
+        )
     return rank, world_size, local_rank
+
+
+def distributed_barrier(local_rank: int) -> None:
+    if dist.is_initialized():
+        dist.barrier(device_ids=[int(local_rank)])
 
 
 def stable_seed(text: str, base_seed: int) -> int:
@@ -476,6 +485,49 @@ def merge_manifests(cache_dir: Path) -> None:
         json.dump(summary, file, indent=2, sort_keys=True)
 
 
+def build_cache_dataset(
+    config: Any,
+    vgm_config: Any,
+    max_episodes: int | None,
+) -> Any:
+    benchmark = config.get("benchmark")
+    if benchmark is None:
+        return build_dataset(vgm_config, max_episodes=max_episodes)
+    benchmark_format = str(benchmark.get("format", ""))
+    if benchmark_format != "robo_dopamine":
+        raise ValueError(
+            f"Unsupported benchmark.format={benchmark_format!r}; expected 'robo_dopamine'"
+        )
+    source_views = list(vgm_config.dataset.get("image_columns", []))
+    benchmark_views = list(
+        benchmark.get("view_names", ["cam_high", "cam_left_wrist"])
+    )
+    if source_views and len(benchmark_views) != len(source_views):
+        raise ValueError(
+            "Benchmark view count must match the VGM training view count: "
+            f"benchmark={benchmark_views}, source={source_views}"
+        )
+    return RoboDopamineBenchDataset(
+        benchmark_json=str(benchmark.input_json),
+        images_root=str(benchmark.images_root),
+        language_manifest=str(benchmark.language_manifest),
+        video_size=(
+            int(vgm_config.common.video_height),
+            int(vgm_config.common.video_width),
+        ),
+        view_names=benchmark_views,
+        view_layout=str(
+            benchmark.get(
+                "view_layout", vgm_config.dataset.get("view_layout", "single")
+            )
+        ),
+        require_language_embedding=bool(
+            vgm_config.dataset.get("require_language_embedding", False)
+        ),
+        max_episodes=max_episodes,
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True, help="Progress Stage 2 YAML")
@@ -537,8 +589,8 @@ def main() -> None:
             stale_manifest.unlink()
         OmegaConf.save(config, cache_dir / "cache_config.yaml", resolve=True)
     if world_size > 1:
-        dist.barrier()
-    dataset = build_dataset(vgm_config, max_episodes=args.max_episodes)
+        distributed_barrier(local_rank)
+    dataset = build_cache_dataset(config, vgm_config, args.max_episodes)
     model = build_model(vgm_config, Path(config.source.vgm_checkpoint))
     model.eval()
     for parameter in model.parameters():
@@ -570,12 +622,12 @@ def main() -> None:
 
     write_rank_manifest(cache_dir, rank, entries)
     if world_size > 1:
-        dist.barrier()
+        distributed_barrier(local_rank)
     if rank == 0:
         merge_manifests(cache_dir)
         logger.info("Progress cache complete: %s", cache_dir)
     if world_size > 1:
-        dist.barrier()
+        distributed_barrier(local_rank)
         dist.destroy_process_group()
 
 
