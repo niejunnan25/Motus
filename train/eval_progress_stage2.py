@@ -28,7 +28,10 @@ except Exception:  # pragma: no cover
 sys.path.append(str(Path(__file__).parent.parent))
 
 from data.progress import ProgressEpisodeCacheDataset
-from models.progress_stage2 import build_progress_model
+from models.progress_stage2 import (
+    build_progress_model,
+    build_progress_target_distribution,
+)
 
 if __package__:
     from .train_progress_stage2 import (
@@ -115,6 +118,18 @@ def spearman(prediction: torch.Tensor, target: torch.Tensor) -> float:
     return float((pred_rank * target_rank).sum() / denominator)
 
 
+def pearson(prediction: torch.Tensor, target: torch.Tensor) -> float:
+    """Value-Order Correlation used by robot progress-model evaluations."""
+    if prediction.numel() < 2:
+        return 0.0
+    prediction = prediction.float() - prediction.float().mean()
+    target = target.float() - target.float().mean()
+    denominator = prediction.norm() * target.norm()
+    if denominator <= 0:
+        return 0.0
+    return float((prediction * target).sum() / denominator)
+
+
 def ordering_accuracy(
     prediction: torch.Tensor, target: torch.Tensor, minimum_gap: float = 0.05
 ) -> float:
@@ -131,15 +146,28 @@ def episode_metrics(
     prediction: torch.Tensor,
     target: torch.Tensor,
     alignment: torch.Tensor,
+    target_sigma_bins: float = 2.0,
 ) -> Dict[str, float]:
     error = prediction - target
     monotonic_violations = (prediction[1:] + 1e-4 < prediction[:-1]).float()
     num_bins = alignment.shape[1]
     target_frame = target * float(num_bins - 1)
     matched_frame = alignment.argmax(dim=-1).float()
+    target_distribution = build_progress_target_distribution(
+        target,
+        num_bins=num_bins,
+        sigma_bins=target_sigma_bins,
+    )
+    alignment_cross_entropy = -(
+        target_distribution * alignment.clamp_min(1e-12).log()
+    ).sum(dim=-1)
+    alignment_entropy = -(
+        alignment * alignment.clamp_min(1e-12).log()
+    ).sum(dim=-1)
     return {
         "mae": float(error.abs().mean()),
         "rmse": float(error.pow(2).mean().sqrt()),
+        "voc_pearson": pearson(prediction, target),
         "spearman": spearman(prediction, target),
         "ordering_accuracy": ordering_accuracy(prediction, target),
         "monotonic_violation_rate": (
@@ -149,8 +177,16 @@ def episode_metrics(
         "end_error": float((prediction[-1] - target[-1]).abs()),
         "expected_frame_mae": float(error.abs().mean() * float(num_bins - 1)),
         "matched_frame_mae": float((matched_frame - target_frame).abs().mean()),
+        "alignment_cross_entropy": float(alignment_cross_entropy.mean()),
+        "alignment_entropy": float(alignment_entropy.mean()),
         "matched_within_one": float(
             ((matched_frame - target_frame).abs() <= 1.0).float().mean()
+        ),
+        "matched_within_three": float(
+            ((matched_frame - target_frame).abs() <= 3.0).float().mean()
+        ),
+        "matched_within_five": float(
+            ((matched_frame - target_frame).abs() <= 5.0).float().mean()
         ),
     }
 
@@ -293,6 +329,7 @@ def main() -> None:
     all_predictions: List[torch.Tensor] = []
     all_targets: List[torch.Tensor] = []
     query_batch_size = int(config.training.query_batch_size)
+    target_sigma_bins = float(config.loss.get("target_sigma_bins", 2.0))
     for index in range(len(dataset)):
         episode = dataset[index]
         prediction, alignment = evaluate_episode(
@@ -305,9 +342,15 @@ def main() -> None:
             device,
         )
         target = episode["progress"].cpu()
-        metrics = episode_metrics(prediction, target, alignment)
+        metrics = episode_metrics(
+            prediction,
+            target,
+            alignment,
+            target_sigma_bins=target_sigma_bins,
+        )
         row = {
             "episode_name": episode["episode_name"],
+            "task_index": episode["task_index"],
             "num_queries": target.numel(),
             **metrics,
         }
@@ -337,7 +380,22 @@ def main() -> None:
     episode_mean = {
         key: sum(float(row[key]) for row in rows) / len(rows)
         for key in rows[0]
-        if key not in {"episode_name", "num_queries"}
+        if key not in {"episode_name", "task_index", "num_queries"}
+    }
+    task_groups: Dict[str, List[Dict[str, Any]]] = {}
+    for row in rows:
+        task_groups.setdefault(str(row["task_index"]), []).append(row)
+    task_metrics = {
+        task_index: {
+            key: sum(float(row[key]) for row in task_rows) / len(task_rows)
+            for key in task_rows[0]
+            if key not in {"episode_name", "task_index", "num_queries"}
+        }
+        for task_index, task_rows in task_groups.items()
+    }
+    task_macro = {
+        key: sum(metrics[key] for metrics in task_metrics.values()) / len(task_metrics)
+        for key in next(iter(task_metrics.values()))
     }
     summary = {
         "config": args.config,
@@ -352,6 +410,8 @@ def main() -> None:
         # Sequence metrics must be computed within each episode. Concatenating
         # episodes creates artificial end-to-start transitions.
         "episode_mean": episode_mean,
+        "task_macro": task_macro,
+        "per_task": task_metrics,
     }
     with (output_dir / "metrics.json").open("w", encoding="utf-8") as file:
         json.dump(summary, file, indent=2)

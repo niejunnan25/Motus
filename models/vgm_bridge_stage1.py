@@ -109,6 +109,7 @@ class VGMBridgeStage1Config:
     video_height: int = 384
     video_width: int = 320
     batch_size: int = 1
+    # 0 表示 first-only；正数表示末尾连续多少个采样帧作为已知条件。
     tail_condition_frames: int = 1
     conditioning_mode: str = "v0"
     mask_channels: int = 4
@@ -174,8 +175,12 @@ class VGMBridgeStage1(nn.Module):
             raise ValueError("tail_condition_frames must be >= 0")
         if config.tail_condition_frames > config.num_video_frames:
             raise ValueError("tail_condition_frames must be <= num_video_frames")
-        if config.conditioning_mode in {"v0_5_endpoint", "v1_mask_endpoint"} and config.tail_condition_frames < 1:
-            raise ValueError("Endpoint conditioning modes require tail_condition_frames >= 1")
+        self.condition_on_last_frame = config.tail_condition_frames > 0
+        if (
+            config.conditioning_mode in {"v0_5_endpoint", "v1_mask_endpoint"}
+            and not self.condition_on_last_frame
+        ):
+            raise ValueError("Endpoint conditioning modes require last-frame conditioning")
         if config.mask_channels < 1:
             raise ValueError("mask_channels must be >= 1")
         self.dtype = {
@@ -248,11 +253,13 @@ class VGMBridgeStage1(nn.Module):
 
         logger.info(
             "Initialized VGMBridgeStage1: conditioning_mode=%s, num_video_frames=%s, "
-            "tail_condition_frames=%s, state_condition_mode=%s, role_mask_fusion_mode=%s, interaction_loss=%s, "
+            "tail_condition_frames=%s, condition_on_last_frame=%s, state_condition_mode=%s, "
+            "role_mask_fusion_mode=%s, interaction_loss=%s, "
             "interaction_weight_mode=%s, video_size=%sx%s",
             config.conditioning_mode,
             config.num_video_frames,
             config.tail_condition_frames,
+            self.condition_on_last_frame,
             config.state_condition_mode,
             config.role_mask_fusion_mode,
             self.use_interaction_loss,
@@ -449,40 +456,60 @@ class VGMBridgeStage1(nn.Module):
         return_hidden_states: bool = False,
     ) -> Any:
         """Run WAN with an optional token residual injected after patch embedding."""
+        # wan_model 是 Video DiT 主干；正式 TI2V-5B 的 D_video=3072，共有 30 个 block。
         wan_model = self.video_model.wan_model
+        # patch embedding 参数所在设备就是本次 WAN 前向应使用的 CUDA device。
         device = wan_model.patch_embedding.weight.device
+        # Rotary 位置频率不是 Parameter，首次调用时可能仍在 CPU；这里只搬设备，不改形状。
         if wan_model.freqs.device != device:
             wan_model.freqs = wan_model.freqs.to(device)
 
+        # latent_list 中每项为 [C_in, T_z, H_z, W_z]；patch embedding 后每项为
+        # [1, D_video, G_t, G_h, G_w]。
+        # 正式 V1-proper 的 C_in=2*C_z+mask_channels；普通无 mask 模式的 C_in=C_z。
         x = [wan_model.patch_embedding(item.unsqueeze(0)) for item in latent_list]
+        # 每个 item.shape[2:] 是 (G_t,G_h,G_w)；stack 后 grid_sizes: [B,3]。
         grid_sizes = torch.stack(
             [torch.tensor(item.shape[2:], dtype=torch.long, device=device) for item in x]
         )
+        # 每项展平为 [1, L, D_video]，其中 L=G_t*G_h*G_w。
         x = [item.flatten(2).transpose(1, 2) for item in x]
+        # seq_lens: [B]，记录 padding 前每个样本的真实 token 数；同尺寸 batch 中通常都等于 L。
         seq_lens = torch.tensor([item.size(1) for item in x], dtype=torch.long, device=device)
+        # 外部计算的 seq_len 必须至少容纳最大的真实序列，否则 padding 目标非法。
         if seq_lens.max() > seq_len:
             raise ValueError(f"WAN seq_len={seq_len} is smaller than max sequence length={seq_lens.max().item()}")
+        # padding 并拼接 batch 后 x: [B, seq_len, D_video]。
+        # 每项右侧补 [1,seq_len-L,D_video] 的零 token；最外层 cat 沿 dim=0 合并 B。
         x = torch.cat(
             [
                 torch.cat([item, item.new_zeros(1, seq_len - item.size(1), item.size(2))], dim=1)
                 for item in x
             ]
         )
+        # endpoint adapter 输出 token_residual: [B,seq_len,D_video]；它把单张 last frame
+        # 的目标信息逐 token 加到 patch embedding 后的 Video DiT 输入中。未启用时为 None。
         if token_residual is not None:
             x = x + token_residual.to(device=x.device, dtype=x.dtype)
 
+        # 若调用方只给每个样本一个 timestep [B]，复制到每个视频 token 得到 [B,seq_len]。
         if timestep_tokens.dim() == 1:
             timestep_tokens = timestep_tokens.unsqueeze(1).expand(timestep_tokens.size(0), seq_len)
         with torch.amp.autocast("cuda", dtype=torch.float32):
+            # bt=B；timestep_flat: [B*seq_len]，每个 token 都有自己的时间条件条目。
             bt = timestep_tokens.size(0)
             timestep_flat = timestep_tokens.flatten()
+            # sinusoidal embedding 后恢复 batch/token 结构，再经 MLP 得到 e: [B,seq_len,D_video]。
             e = wan_model.time_embedding(
                 sinusoidal_embedding_1d(wan_model.freq_dim, timestep_flat)
                 .unflatten(0, (bt, seq_len))
                 .float()
             )
+            # 每个 block 需要 6 组调制参数；e0: [B,seq_len,6,D_video]。
             e0 = wan_model.time_projection(e).unflatten(2, (6, wan_model.dim))
 
+        # context 中每项为 [L_text_i,D_text]。先补零到固定 text_len，再 stack 成
+        # [B,text_len,D_text]，最后投影为 context_emb: [B,text_len,D_video]。
         context_emb = wan_model.text_embedding(
             torch.stack(
                 [
@@ -491,6 +518,7 @@ class VGMBridgeStage1(nn.Module):
                 ]
             )
         )
+        # kwargs 中的时间、位置和语言条件在 30 个 WAN block 间复用；只有 x 会逐层更新。
         kwargs = dict(
             e=e0,
             seq_lens=seq_lens,
@@ -500,22 +528,31 @@ class VGMBridgeStage1(nn.Module):
             context_lens=None,
         )
 
+        # return_hidden_states=True 时保存每个 WAN block 的 [B, seq_len, D_video] 输出。
+        # 正式 Wan2.2-TI2V-5B 有 30 层，因此最终列表长度为 30。
         hidden_states = []
+        # 第 j 次循环：输入 x_j [B,seq_len,D_video]，输出 x_{j+1} 形状不变。
         for block in wan_model.blocks:
             x = block(x, **kwargs)
 
+            # Layerwise Progress 需要逐层读取，所以保存每层更新后的 x；普通生成不保存。
             if return_hidden_states:
                 hidden_states.append(x)
 
         if return_hidden_states:
+            # hidden_states: List[30 * [B,seq_len,D_video]]；grid_sizes: [B,3]；seq_lens: [B]。
+            # 该分支不执行输出 head，也不把 token 还原为 latent 网格。
             return {
                 "hidden_states": hidden_states,
                 "grid_sizes": grid_sizes,
                 "seq_lens": seq_lens,
             }
 
+        # 普通生成分支：head 把 [B,seq_len,D_video] 映射成每个 patch 的 flow 预测。
         x = wan_model.head(x, e)
+        # unpatchify 按 grid_sizes 将 token 序列恢复为每个样本的 [C_z,T_z,H_z,W_z]。
         x = wan_model.unpatchify(x, grid_sizes)
+        # 沿 batch 维 stack，最终 flow prediction: [B,C_z,T_z,H_z,W_z]，统一转 float32。
         return torch.stack([item.float() for item in x], dim=0)
 
     def _timestep_tokens(
@@ -558,7 +595,7 @@ class VGMBridgeStage1(nn.Module):
             dtype=latent.dtype,
         )
         mask[:, :, 0:1] = 1
-        if int(self.config.tail_condition_frames) > 0:
+        if self.condition_on_last_frame:
             mask[:, :, -1:] = 1
         return mask
 
@@ -651,7 +688,7 @@ class VGMBridgeStage1(nn.Module):
     ) -> torch.Tensor:
         """Build the latent used for hard clamps and optional mask conditioning."""
         should_encode_condition_video = (
-            (self.config.conditioning_mode == "v0" and int(self.config.tail_condition_frames) > 0)
+            (self.config.conditioning_mode == "v0" and self.condition_on_last_frame)
             or self.use_mask_condition
         )
         if should_encode_condition_video:
@@ -682,6 +719,8 @@ class VGMBridgeStage1(nn.Module):
         last_frame: Optional[torch.Tensor] = None,
         tail_frames: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        # first_frame/last_frame: [B,C,H,W]；tail_frames: [B,N_tail,C,H,W]。
+        # 推理只有一张 goal 时，将 last_frame 重复 N_tail 次；有真实尾帧时直接使用。
         batch_size = first_frame.shape[0]
         tail_n = int(self.config.tail_condition_frames)
         if tail_n > 0:
@@ -960,13 +999,13 @@ class VGMBridgeStage1(nn.Module):
                 dim=2,
             )
 
-        last_frame = video_frames[:, -1] if int(self.config.tail_condition_frames) > 0 else None
+        tail_n = int(self.config.tail_condition_frames)
+        last_frame = video_frames[:, -1] if tail_n > 0 else None
         last_role_mask = (
             role_mask_frames[:, -1]
-            if self.use_role_mask and int(self.config.tail_condition_frames) > 0
+            if self.use_role_mask and tail_n > 0
             else None
         )
-        tail_n = int(self.config.tail_condition_frames)
 
         condition_rgb = torch.zeros_like(full_rgb)
         condition_rgb[:, :, 0:1] = full_rgb[:, :, 0:1]
@@ -1208,39 +1247,58 @@ class VGMBridgeStage1(nn.Module):
                     first_frame_norm=(first_frame * 2.0 - 1.0).unsqueeze(2),
                     condition_video=condition_rgb,
                 )
+            # V0 会硬 clamp 首尾 latent slice；V1/V1-proper 只硬 clamp 第一个 slice。
             if self.config.conditioning_mode == "v0":
                 known_mask = self._known_condition_mask(condition_latent)
             else:
                 known_mask = self._first_condition_mask(condition_latent)
+            # frame_mask: [B,F=53]，V1-proper 中第 0 和第 52 个位置为 1，其余为 0；
+            # 它会被重排成 latent mask channel，显式告诉 WAN 哪些原始帧是条件。
             frame_mask = self._frame_condition_mask(batch_size, condition_latent.device, condition_latent.dtype)
 
+            # 从标准高斯初始化待生成视频 latent: [B,C_z,T_z=14,H_z,W_z]。
             latent = torch.randn(
                 condition_latent.shape,
                 device=condition_latent.device,
                 dtype=self.dtype,
                 generator=generator,
             )
+            # latent/condition_latent: [B, C_z, T_z, H_z, W_z]；known_mask 为可广播的
+            # [B, 1, T_z, 1, 1]。正式 53F 配置中 T_z=14；V1-proper 只硬固定首个
+            # latent slice，末帧通过显式 condition/endpoint 输入注入，而不是由 known_mask 固定。
+            # 广播后：known 区域取 condition_latent，unknown 区域保留随机噪声，输出形状不变。
             latent = latent * (1 - known_mask) + condition_latent * known_mask
 
+            # 构造推理期 Rectified-Flow scheduler；训练时间轴仍是 0...999。
             scheduler = FlowMatchScheduler(
                 shift=5.0,
                 sigma_min=0.0,
                 extra_one_step=True,
                 num_train_timesteps=1000,
             )
+            # 根据调用方设置生成离散去噪时间表；正式 Progress 缓存使用 50 步。
             scheduler.set_timesteps(num_inference_steps=num_inference_steps, training=False)
+            # sigmas/timesteps 都是一维时间表 tensor；转到 CUDA 和模型精度供循环索引。
             sigmas = scheduler.sigmas.to(device=self.device, dtype=self.dtype)
             timesteps = scheduler.timesteps.to(device=self.device, dtype=self.dtype)
 
+            # seq_len 是 patchify 后的视频 token 数标量：T_patch*H_patch*W_patch。
             seq_len = self._wan_seq_len(latent)
+            # state_tokens: [B,N_state,D_text] 或 None；当前纯 V1-proper 无 state 时为 None。
             state_tokens = self._state_tokens(first_state=first_state, last_state=last_state)
+            # context 是长度 B 的 list；每项为语言 token（可追加 state token）[L_context,D_text]。
             context = self._context_list(language_embeddings, batch_size, state_tokens=state_tokens)
             endpoint_frame = last_frame
             endpoint_role_mask = last_role_mask
             if endpoint_frame is None and tail_frames is not None and tail_frames.shape[1] > 0:
                 endpoint_frame = tail_frames[:, -1]
-            if endpoint_role_mask is None and tail_role_masks is not None and tail_role_masks.shape[1] > 0:
+            if (
+                endpoint_role_mask is None
+                and tail_role_masks is not None
+                and tail_role_masks.shape[1] > 0
+            ):
                 endpoint_role_mask = tail_role_masks[:, -1]
+            # endpoint adapter 始终读取尾部条件中的最后一张图。
             token_residual = self._endpoint_token_residual(
                 last_frame=endpoint_frame,
                 last_role_mask=endpoint_role_mask,
@@ -1249,19 +1307,26 @@ class VGMBridgeStage1(nn.Module):
             )
 
             for step_idx, timestep in enumerate(timesteps):
+                # 正式缓存配置共有 50 个 timestep。每一步先让 WAN 预测 flow velocity，
+                # 再按 scheduler 的 sigma 差更新 latent，并重新 clamp 已知的首帧 slice。
+                # V1-proper 在通道维拼接 noisy latent、condition latent 和 mask volume：
+                # model_input: [B,2*C_z+mask_channels,T_z,H_z,W_z]。
                 model_input = self._build_model_input(
                     noisy_video_latent=latent,
                     condition_latent=condition_latent,
                     frame_mask=frame_mask,
                 )
+                # timestep 是当前 step 的标量；扩成 [B] 后生成 [B,seq_len] token-wise 时间条件。
                 timestep_tokens = self._timestep_tokens(
                     timestep=timestep.expand(batch_size),
                     latent=latent,
                     known_mask=known_mask,
                     seq_len=seq_len,
                 )
+                # 去掉 batch 维并转成长度 B 的 list；每项 [C_in,T_z,H_z,W_z]，符合 WAN API。
                 latent_list = [model_input[i] for i in range(batch_size)]
                 with torch.autocast(device_type="cuda", dtype=self.video_model.precision):
+                    # pred 是当前 flow velocity: [B,C_z,T_z,H_z,W_z]，与 latent 逐元素对齐。
                     pred = self._forward_wan(
                         latent_list=latent_list,
                         timestep_tokens=timestep_tokens,
@@ -1269,21 +1334,31 @@ class VGMBridgeStage1(nn.Module):
                         seq_len=seq_len,
                         token_residual=token_residual,
                     )
+                # sigma/sigma_next 都是标量；最后一步若没有下一项，就显式使用 0。
                 sigma = sigmas[step_idx]
                 sigma_next = sigmas[step_idx + 1] if step_idx + 1 < len(sigmas) else sigmas.new_zeros(())
+                # Euler 更新：pred 乘标量步长 (sigma_next-sigma)，广播到完整 latent；形状不变。
                 latent = latent + pred * (sigma_next - sigma)
+                # 每一步后重新覆盖 known 首帧 slice，避免数值积分让首帧条件漂移。
+                # V1-proper 不覆盖最后一个 slice，最后一帧仍由显式 mask/endpoint 条件引导生成。
                 latent = latent * (1 - known_mask) + condition_latent * known_mask
 
             if return_latent:
+                # 返回最终去噪的 z_trajectory: [B, C_z, T_z, H_z, W_z]，不做 VAE decode。
+                # Progress 缓存路径使用此分支；普通视频可视化路径则继续执行下面的 VAE decode。
                 return latent.float()
 
             if self.role_mask_fusion_mode == "latent_channel":
+                # Role-mask 实验把 RGB/role latent 按通道拆开，各自 VAE decode 后再沿图像宽度拼接。
                 decoded_rgb = self.video_model.decode_video(latent[:, : self.latent_channels].to(self.dtype)).float()
                 decoded_role = self.video_model.decode_video(latent[:, self.latent_channels :].to(self.dtype)).float()
                 decoded = torch.cat([decoded_rgb, decoded_role], dim=-1)
             else:
+                # 普通 RGB 路径: [B,C_z,T_z,H_z,W_z] -> [B,C_img,F,H_img,W_img]。
                 decoded = self.video_model.decode_video(latent.to(self.dtype)).float()
+            # 像素从 [-1,1] 截断并映射到 [0,1]，维度不变。
             decoded = (decoded.clamp(-1.0, 1.0) + 1.0) * 0.5
+            # 把时间维放到通道前，返回视频 [B,F,C_img,H_img,W_img]。
             return decoded.permute(0, 2, 1, 3, 4).contiguous()
         finally:
             self.train(was_training)
@@ -1311,17 +1386,23 @@ class VGMBridgeStage1(nn.Module):
         was_training = self.training
         self.eval()
         try:
+            # trajectory_latent: [B, C_z, T_z, H_z, W_z]；本路径只供 Layerwise Progress 使用。
             trajectory_latent = trajectory_latent.to(device=self.device, dtype=self.dtype)
+            # first_frame/last_frame 只搬到同一设备和精度，形状均保持 [B,C_img,H_img,W_img]。
             first_frame = first_frame.to(device=self.device, dtype=self.dtype)
             last_frame = last_frame.to(device=self.device, dtype=self.dtype)
+            # batch_size=B，后续要求 latent 和两张 endpoint 图拥有相同 B。
             batch_size = trajectory_latent.shape[0]
             if first_frame.shape[0] != batch_size or last_frame.shape[0] != batch_size:
                 raise ValueError("trajectory_latent, first_frame, and last_frame batch sizes must match")
 
+            # 构造显式首尾条件视频: [B,C_img,F=53,H_img,W_img]；中间 51 帧为零。
             condition_video = self._make_condition_video(
                 first_frame=first_frame,
                 last_frame=last_frame,
             )
+            # 条件 VAE 路径输出 condition_latent: [B,C_z,T_z=14,H_z,W_z]；
+            # first_frame_norm 单独编码，保证第一个 latent slice 是干净的单帧条件。
             condition_latent = self._encode_condition_latent(
                 first_frame_norm=(first_frame * 2.0 - 1.0).unsqueeze(2),
                 condition_video=condition_video,
@@ -1333,36 +1414,49 @@ class VGMBridgeStage1(nn.Module):
                     f"trajectory={tuple(trajectory_latent.shape)}, condition={tuple(condition_latent.shape)}"
                 )
 
+            # known_mask: [B,1,T_z,1,1]；V1-proper 只有 temporal index 0 为 1。
             if self.config.conditioning_mode == "v0":
                 known_mask = self._known_condition_mask(condition_latent)
             else:
                 known_mask = self._first_condition_mask(condition_latent)
+            # frame_mask: [B,F=53]，标出第 0 与第 52 张条件图。
             frame_mask = self._frame_condition_mask(
                 batch_size,
                 condition_latent.device,
                 condition_latent.dtype,
             )
+            # 把 clean trajectory_latent 当作当前 video latent，并拼接 condition/mask；
+            # V1-proper model_input: [B,2*C_z+mask_channels,T_z,H_z,W_z]。
             model_input = self._build_model_input(
                 noisy_video_latent=trajectory_latent,
                 condition_latent=condition_latent,
                 frame_mask=frame_mask,
             )
+            # seq_len 是 patchify 后的有效视频 token 数标量。
             seq_len = self._wan_seq_len(trajectory_latent)
+            # token_residual: [B,seq_len,D_video]，仍使用与 Stage 1 相同的 last-frame adapter。
             token_residual = self._endpoint_token_residual(
                 last_frame=last_frame,
                 last_role_mask=None,
                 target_latent=trajectory_latent,
                 seq_len=seq_len,
             )
+            # 只做一次特征读取，不进行去噪循环；timestep: [B]，正式配置 feature_timestep=0。
             timestep = trajectory_latent.new_full((batch_size,), float(feature_timestep))
+            # timestep_tokens: [B,seq_len]，且 known 首帧 token 按 Stage 1 规则处理。
             timestep_tokens = self._timestep_tokens(
                 timestep=timestep,
                 latent=trajectory_latent,
                 known_mask=known_mask,
                 seq_len=seq_len,
             )
+            # context: 长度 B 的语言 token list；Stage 2 Layerwise 当前不在这里追加 state token。
             context = self._context_list(language_embeddings, batch_size, state_tokens=None)
+            # 按 WAN API 去掉 batch 维，latent_list 中每项 [C_in,T_z,H_z,W_z]。
             latent_list = [model_input[index] for index in range(batch_size)]
+            # 这里不是重新执行 50 步生成，而是把缓存的最终 clean trajectory_latent 在
+            # feature_timestep=0 下通过冻结 WAN 一次，返回 30 个 block hidden state；
+            # 每个形状为 [B, seq_len, D_video]，供同一 episode 的所有 current query 复用。
             with torch.autocast(device_type="cuda", dtype=self.video_model.precision):
                 return self._forward_wan(
                     latent_list=latent_list,

@@ -1,5 +1,6 @@
 import copy
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -27,6 +28,7 @@ from train.train_progress_stage2 import (
     query_chunk_bounds,
     synchronize_forward_count,
 )
+from train.eval_progress_stage2 import episode_metrics, pearson
 
 
 def small_config(fusion_mode: str, num_layers: int) -> ProgressStage2Config:
@@ -120,6 +122,83 @@ def test_progress_yaml_parser_keeps_defaults_and_reads_ablation_fields():
     assert ablation.tokens_per_view == 12
     assert ablation.alignment_head_mode == "token_late_interaction"
     assert ablation.late_interaction_temperature == 0.05
+
+
+def test_checked_in_progress_configs_form_a_controlled_ablation_matrix():
+    root = Path(__file__).resolve().parents[1]
+    names = {
+        "a0": "progress_v1_proper_serial_latent_53f.yaml",
+        "a1": "progress_v1_proper_serial_latent_53f_ablate_patch1.yaml",
+        "a2": "progress_v1_proper_serial_latent_53f_ablate_split_views.yaml",
+        "a3": "progress_v1_proper_serial_latent_53f_ablate_token_match.yaml",
+        "combined": "progress_v1_proper_serial_latent_53f_detail_preserving.yaml",
+        "layerwise": "progress_v1_proper_layerwise_wvm_53f.yaml",
+    }
+    configs = {
+        name: OmegaConf.load(root / "configs" / filename)
+        for name, filename in names.items()
+    }
+    canonical_cache = configs["a0"].cache.cache_dir
+    for config in configs.values():
+        assert config.cache.cache_dir == canonical_cache
+        assert config.progress_model.num_progress_bins == 53
+        assert config.loss.ranking_weight == 0.0
+        assert config.training.queries_per_episode == 0
+        assert config.training.max_epochs == 20
+
+    variable_fields = (
+        "fusion_mode",
+        "num_layers",
+        "patch_size",
+        "view_encoding_mode",
+        "num_views",
+        "tokens_per_view",
+        "alignment_head_mode",
+    )
+    baseline = configs["a0"].progress_model
+    baseline_values = OmegaConf.to_container(baseline, resolve=True)
+
+    def changed_fields(name: str) -> set[str]:
+        current = OmegaConf.to_container(
+            configs[name].progress_model,
+            resolve=True,
+        )
+        return {
+            field
+            for field in variable_fields
+            if current.get(field) != baseline_values.get(field)
+        }
+
+    assert changed_fields("a1") == {"patch_size"}
+    assert changed_fields("a2") == {
+        "view_encoding_mode",
+        "num_views",
+        "tokens_per_view",
+    }
+    assert changed_fields("a3") == {"alignment_head_mode"}
+    assert changed_fields("combined") == {
+        "patch_size",
+        "view_encoding_mode",
+        "num_views",
+        "alignment_head_mode",
+    }
+    assert changed_fields("layerwise") == {"fusion_mode", "num_layers"}
+
+
+def test_progress_eval_reports_voc_alignment_and_tolerance_metrics():
+    target = torch.linspace(0.0, 1.0, 53)
+    alignment = torch.eye(53)
+    prediction = target.clone()
+
+    metrics = episode_metrics(prediction, target, alignment)
+
+    assert pearson(prediction, target) == pytest.approx(1.0)
+    assert metrics["voc_pearson"] == pytest.approx(1.0)
+    assert metrics["matched_within_one"] == pytest.approx(1.0)
+    assert metrics["matched_within_three"] == pytest.approx(1.0)
+    assert metrics["matched_within_five"] == pytest.approx(1.0)
+    assert metrics["alignment_cross_entropy"] >= 0.0
+    assert metrics["alignment_entropy"] == pytest.approx(0.0)
 
 
 def test_frame_encoder_supports_patch_and_split_view_ablations():

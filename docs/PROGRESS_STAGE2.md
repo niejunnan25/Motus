@@ -255,6 +255,10 @@ Use `--cache_dir /absolute/cache/path` when evaluating an isolated smoke cache.
 Evaluation writes aggregate and per-episode metrics plus diagnostics containing
 the GT/predicted Progress curve and the single-frame-to-trajectory alignment
 probability heatmap over columns 0 through 52. Primary comparisons are Progress
-MAE/RMSE, expected-frame MAE, argmax matched-frame MAE, within-one-frame
-accuracy, ordering accuracy, Spearman correlation, monotonic violation rate,
-endpoint calibration, latency, and memory use.
+MAE/RMSE, Pearson VOC, Spearman correlation, ordering accuracy, expected-frame
+MAE, argmax matched-frame MAE, within-one/three/five-frame accuracy, 53-bin
+alignment cross-entropy, distribution entropy, monotonic violation rate, and
+endpoint calibration. Results are reported as query-weighted, episode-macro,
+and task-macro summaries. Runtime and GPU-memory benchmarking should be run
+separately after the final deployment path caches its trajectory features; the
+current evaluator does not claim deployment latency.

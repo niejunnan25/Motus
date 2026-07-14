@@ -440,9 +440,11 @@ def write_rank_manifest(
 def merge_manifests(cache_dir: Path) -> None:
     merged: Dict[str, Dict[str, Any]] = {}
     existing = cache_dir / "manifest.jsonl"
-    sources = ([existing] if existing.exists() else []) + sorted(
-        cache_dir.glob("manifest.rank_*.jsonl")
-    )
+    # Every rank rewrites its complete assignment on each run, including when
+    # the payload files already exist.  Only merge those current-run manifests:
+    # carrying the previous merged manifest forward would retain stale episodes
+    # after a rerun with --max_episodes or a changed source dataset.
+    sources = sorted(cache_dir.glob("manifest.rank_*.jsonl"))
     for source in sources:
         with source.open("r", encoding="utf-8") as file:
             for line in file:

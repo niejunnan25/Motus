@@ -311,7 +311,11 @@ def weighted_video_mse(gt: torch.Tensor, pred: torch.Tensor, weight: torch.Tenso
     return (weighted.sum() / weight.sum().clamp_min(1.0)).item()
 
 
-def pixel_metrics(gt_full: torch.Tensor, pred_full: torch.Tensor, tail_condition_frames: int = 1) -> Dict[str, float]:
+def pixel_metrics(
+    gt_full: torch.Tensor,
+    pred_full: torch.Tensor,
+    tail_condition_frames: int = 1,
+) -> Dict[str, float]:
     frame_count = min(gt_full.shape[1], pred_full.shape[1])
     gt_full = gt_full[:, :frame_count]
     pred_full = pred_full[:, :frame_count]
