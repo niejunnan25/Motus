@@ -1,4 +1,7 @@
 .vscode
+.DS_Store
+artifacts/
+eval_outputs/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
