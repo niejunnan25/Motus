@@ -375,6 +375,11 @@ def create_model_and_optimizer(config: OmegaConf) -> tuple[VGMBridgeStage1, torc
         state_clip=config.common.get("state_clip", 10.0),
         role_mask_fusion_mode=config.common.get("role_mask_fusion_mode", "none"),
         role_mask_loss_weight=config.common.get("role_mask_loss_weight", 1.0),
+        role_mask_training_mode=config.common.get("role_mask_training_mode", "legacy"),
+        role_mask_condition_mode=config.common.get("role_mask_condition_mode", "legacy"),
+        role_mask_prompt_dropout=config.common.get("role_mask_prompt_dropout", 0.5),
+        role_rgb_max_weight=config.common.get("role_rgb_max_weight", 8.0),
+        role_rgb_weight_warmup_steps=config.common.get("role_rgb_weight_warmup_steps", 1000),
         load_pretrained_backbones=getattr(config.model, "load_pretrained_backbones", None),
     )
     model = VGMBridgeStage1(model_config)

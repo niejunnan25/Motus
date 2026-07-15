@@ -8,7 +8,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from models.vgm_bridge_stage1 import VGMBridgeStage1, VGMBridgeStage1Config
-from train.eval_vgm_bridge_stage1 import pixel_metrics, role_mask_metrics
+from train.eval_vgm_bridge_stage1 import pixel_metrics, role_mask_metrics, role_region_pixel_metrics
 
 
 def _tail_conditioning_helper(tail_condition_frames: int) -> VGMBridgeStage1:
@@ -107,3 +107,31 @@ def test_color_role_mask_metrics_include_common_foreground_metrics() -> None:
     assert metrics["role_mask_foreground_f1"] == pytest.approx(0.8)
     assert metrics["role_mask_macro_iou"] == pytest.approx(2.0 / 3.0)
     assert metrics["role_mask_full_foreground_iou"] == pytest.approx(8.0 / 9.0)
+    assert metrics["role_mask_active_centroid_l2"] == pytest.approx(0.0)
+
+
+def test_role_region_pixel_metrics_ignore_background_error() -> None:
+    colors = {
+        0: [0, 0, 0],
+        1: [255, 0, 0],
+        2: [0, 255, 0],
+        4: [0, 0, 255],
+    }
+    gt_rgb = torch.zeros(1, 3, 3, 1, 4)
+    pred_rgb = gt_rgb.clone()
+    pred_rgb[:, 1, :, :, 0] = 1.0
+    pred_rgb[:, 1, :, :, 3] = 1.0
+    gt_role = torch.zeros_like(gt_rgb)
+    gt_role[:, 1, 0, :, 0] = 1.0
+
+    metrics = role_region_pixel_metrics(
+        gt_rgb,
+        pred_rgb,
+        gt_role,
+        "role_color",
+        role_mask_palette=colors,
+        tail_condition_frames=1,
+    )
+
+    assert metrics["rgb_role_foreground_mse"] == pytest.approx(1.0)
+    assert metrics["rgb_role_active_mse"] == pytest.approx(1.0)

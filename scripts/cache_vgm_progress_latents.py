@@ -48,6 +48,20 @@ logger = logging.getLogger(__name__)
 # -> 连同 progress [N] 一起写入一次性缓存，供两种 Progress 模型复用。
 
 
+def supports_rgb_only_progress_cache(vgm_config: Any) -> bool:
+    """Return whether Stage1 sampling needs no external RoleMask prompt."""
+    fusion_mode = vgm_config.common.get("role_mask_fusion_mode", "none")
+    if fusion_mode == "none":
+        return True
+    training_mode = vgm_config.common.get("role_mask_training_mode", "legacy")
+    condition_mode = vgm_config.common.get("role_mask_condition_mode", "legacy")
+    return (
+        fusion_mode == "latent_channel"
+        and training_mode in {"joint_flow", "joint_flow_rgb_weight"}
+        and condition_mode in {"none", "first_prompt_dropout"}
+    )
+
+
 def setup_logging(rank: int, level: str) -> None:
     logging.basicConfig(
         level=getattr(logging, level.upper()),
@@ -564,9 +578,9 @@ def main() -> None:
         raise ValueError(
             "Progress cache currently requires a full_episode_uniform VGM source config"
         )
-    if vgm_config.common.get("role_mask_fusion_mode", "none") != "none":
+    if not supports_rgb_only_progress_cache(vgm_config):
         raise NotImplementedError(
-            "Initial Progress experiments require an RGB-only V1-proper checkpoint"
+            "Progress cache generation cannot use a VGM that requires external RoleMask prompts"
         )
     if vgm_config.common.get("state_condition_mode", "none") != "none":
         raise NotImplementedError(
