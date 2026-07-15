@@ -17,6 +17,8 @@ from models.progress_stage2 import (
     SharedFrameLatentEncoder,
     TemporalAlignmentHead,
     TokenLateInteractionAlignmentHead,
+    _joint_alignment_outputs_from_logits,
+    build_joint_progress_target_distribution,
     build_progress_target_distribution,
     build_progress_model,
     compute_progress_loss,
@@ -24,11 +26,19 @@ from models.progress_stage2 import (
 from train.train_progress_stage2 import (
     extract_episode_video_features,
     model_config_from_yaml,
+    prepare_episode_micro_batch,
+    prepare_episode_pairs,
     prepare_episode_queries,
     query_chunk_bounds,
     synchronize_forward_count,
 )
-from train.eval_progress_stage2 import episode_metrics, pearson
+from train.eval_progress_stage2 import (
+    _balanced_pair_indices,
+    _balanced_pair_metrics,
+    _permute_previous_within_gap,
+    episode_metrics,
+    pearson,
+)
 
 
 def small_config(fusion_mode: str, num_layers: int) -> ProgressStage2Config:
@@ -88,6 +98,12 @@ def test_default_progress_model_preserves_archived_baseline_structure():
     assert model.frame_encoder.view_encoding_mode == "joint"
     assert model.frame_encoder.output_num_tokens == 4
     assert not any("view_embeddings" in name for name in model.state_dict())
+    assert not any(
+        name.startswith(
+            ("previous_type_embedding", "pair_fusion", "joint_alignment_head")
+        )
+        for name in model.state_dict()
+    )
 
 
 def test_progress_yaml_parser_keeps_defaults_and_reads_ablation_fields():
@@ -99,6 +115,7 @@ def test_progress_yaml_parser_keeps_defaults_and_reads_ablation_fields():
     assert legacy.patch_size == (1, 2, 2)
     assert legacy.view_encoding_mode == "joint"
     assert legacy.alignment_head_mode == "pooled_cosine"
+    assert legacy.query_mode == "single_frame"
 
     ablation = model_config_from_yaml(
         OmegaConf.create(
@@ -112,6 +129,9 @@ def test_progress_yaml_parser_keeps_defaults_and_reads_ablation_fields():
                     "tokens_per_view": 12,
                     "alignment_head_mode": "token_late_interaction",
                     "late_interaction_temperature": 0.05,
+                    "query_mode": "two_frame_joint",
+                    "transition_dim": 96,
+                    "transition_score_weight": 0.75,
                 }
             }
         )
@@ -122,6 +142,80 @@ def test_progress_yaml_parser_keeps_defaults_and_reads_ablation_fields():
     assert ablation.tokens_per_view == 12
     assert ablation.alignment_head_mode == "token_late_interaction"
     assert ablation.late_interaction_temperature == 0.05
+    assert ablation.query_mode == "two_frame_joint"
+    assert ablation.transition_dim == 96
+    assert ablation.transition_score_weight == 0.75
+
+
+def test_two_frame_b_configs_form_a_controlled_loss_ablation_matrix():
+    root = Path(__file__).resolve().parents[1]
+    names = {
+        "b0": "progress_v1_proper_b0_single_frame_a2_60ep.yaml",
+        "b1": "progress_v1_proper_b1_two_frame_fused_60ep.yaml",
+        "b2": "progress_v1_proper_b2_joint_only_60ep.yaml",
+        "b3": "progress_v1_proper_b3_joint_abs_60ep.yaml",
+        "b4": "progress_v1_proper_b4_joint_delta_60ep.yaml",
+        "b5": "progress_v1_proper_b5_joint_abs_delta_60ep.yaml",
+    }
+    configs = {
+        name: OmegaConf.load(root / "configs" / filename)
+        for name, filename in names.items()
+    }
+    for config in configs.values():
+        assert config.source == configs["b0"].source
+        assert config.cache == configs["b0"].cache
+        assert config.progress_model.fusion_mode == "serial_latent"
+        assert config.progress_model.view_encoding_mode == "split_height"
+        assert config.progress_model.num_views == 2
+        assert config.progress_model.tokens_per_view == 8
+        assert config.progress_model.num_progress_bins == 53
+        assert config.loss.ranking_weight == 0.0
+        assert config.training.queries_per_episode == 0
+        assert config.training.max_epochs == 60
+        assert config.training.max_steps == 50000
+
+    assert [configs[name].progress_model.query_mode for name in names] == [
+        "single_frame",
+        "two_frame_fused",
+        "two_frame_joint",
+        "two_frame_joint",
+        "two_frame_joint",
+        "two_frame_joint",
+    ]
+    loss_weights = [
+        (
+            float(configs[name].loss.alignment_weight),
+            float(configs[name].loss.joint_weight),
+            float(configs[name].loss.regression_weight),
+            float(configs[name].loss.delta_weight),
+        )
+        for name in names
+    ]
+    assert loss_weights == [
+        (1.0, 0.0, 1.0, 0.0),
+        (1.0, 0.0, 1.0, 0.0),
+        (0.0, 1.0, 0.0, 0.0),
+        (0.0, 1.0, 52.0, 0.0),
+        (0.0, 1.0, 0.0, 32.0),
+        (0.0, 1.0, 52.0, 32.0),
+    ]
+    assert [bool(configs[name].loss.joint_direction_constraint) for name in names] == [
+        False,
+        False,
+        True,
+        True,
+        True,
+        True,
+    ]
+    for name in ("b1", "b2", "b3", "b4", "b5"):
+        assert OmegaConf.to_container(configs[name].pair_sampling, resolve=True) == {
+            "minimum_query_gap": 1,
+            "maximum_query_gap": 8,
+            "evaluation_query_gap": 4,
+            "forward_probability": 0.7,
+            "stay_probability": 0.15,
+            "reverse_probability": 0.15,
+        }
 
 
 def test_checked_in_progress_configs_form_a_controlled_ablation_matrix():
@@ -199,6 +293,53 @@ def test_progress_eval_reports_voc_alignment_and_tolerance_metrics():
     assert metrics["matched_within_five"] == pytest.approx(1.0)
     assert metrics["alignment_cross_entropy"] >= 0.0
     assert metrics["alignment_entropy"] == pytest.approx(0.0)
+
+
+def test_balanced_pair_diagnostic_has_equal_direction_classes_and_perfect_metrics():
+    target = torch.linspace(0.0, 1.0, 12)
+    pairs = _balanced_pair_indices(
+        count=12,
+        evaluation_gap=3,
+        maximum_gap=8,
+        device=torch.device("cpu"),
+    )
+    previous_target = target[pairs["previous_indices"]]
+    current_target = target[pairs["current_indices"]]
+    direction = (current_target - previous_target).sign().long()
+    assert [(direction == value).sum().item() for value in (1, 0, -1)] == [9, 9, 9]
+    direction_probabilities = torch.nn.functional.one_hot(
+        direction + 1,
+        num_classes=3,
+    ).float()
+    metrics = _balanced_pair_metrics(
+        {
+            "progress": current_target,
+            "previous_progress": previous_target,
+            "delta_progress": current_target - previous_target,
+            "direction_probabilities": direction_probabilities,
+        },
+        previous_target,
+        current_target,
+    )
+    assert metrics["balanced_pair_current_mae"] == pytest.approx(0.0)
+    assert metrics["balanced_pair_previous_mae"] == pytest.approx(0.0)
+    assert metrics["balanced_pair_delta_mae"] == pytest.approx(0.0)
+    assert metrics["balanced_pair_direction_accuracy"] == pytest.approx(1.0)
+    assert metrics["balanced_pair_wrong_direction_rate"] == pytest.approx(0.0)
+
+
+def test_previous_shuffle_is_gap_preserving_and_has_no_fixed_points():
+    previous = torch.arange(8, dtype=torch.float32).reshape(8, 1)
+    gaps = torch.tensor([0.0, 0.25, 0.25, 0.25, 0.5, 0.5, 0.5, 0.5])
+    shuffled, valid = _permute_previous_within_gap(previous, gaps)
+
+    assert valid.tolist() == [False, True, True, True, True, True, True, True]
+    assert float(shuffled[0]) == pytest.approx(float(previous[0]))
+    donor_indices = shuffled.squeeze(-1).long()
+    for index in torch.nonzero(valid, as_tuple=False).flatten():
+        donor = int(donor_indices[index])
+        assert donor != int(index)
+        assert float(gaps[donor]) == pytest.approx(float(gaps[index]))
 
 
 def test_frame_encoder_supports_patch_and_split_view_ablations():
@@ -316,6 +457,319 @@ def test_serial_progress_forward_and_loss_backward():
     assert any(parameter.grad is not None for parameter in model.parameters())
 
 
+def test_two_frame_fused_query_outputs_current_alignment_and_uses_previous_frame():
+    torch.manual_seed(17)
+    config = small_config("serial_latent", num_layers=1)
+    config.query_mode = "two_frame_fused"
+    model = build_progress_model(config).eval()
+    previous = torch.randn(3, 4, 1, 8, 8)
+    current = torch.randn(3, 4, 1, 8, 8)
+    memory = torch.randn(1, 53, 4, 1, 8, 8)
+    gap = torch.tensor([0.0, 0.5, 1.0])
+
+    outputs = model(
+        current_latent=current,
+        previous_latent=previous,
+        pair_time_gap=gap,
+        trajectory_frame_latents=memory,
+    )
+    assert outputs["alignment_logits"].shape == (3, 53)
+    assert outputs["progress"].shape == (3,)
+    changed = model(
+        current_latent=current,
+        previous_latent=previous.roll(1, 0),
+        pair_time_gap=gap,
+        trajectory_frame_latents=memory,
+    )
+    assert not torch.allclose(
+        outputs["alignment_logits"], changed["alignment_logits"], atol=1e-7
+    )
+    losses = compute_progress_loss(
+        outputs,
+        torch.tensor([0.1, 0.5, 0.9]),
+        joint_weight=0.0,
+        ranking_weight=0.0,
+    )
+    losses["total_loss"].backward()
+    assert model.pair_fusion.projection[0].weight.grad is not None
+    assert model.previous_type_embedding.grad is not None
+
+
+def test_two_frame_joint_query_is_globally_normalized_and_consistent():
+    torch.manual_seed(19)
+    config = small_config("serial_latent", num_layers=1)
+    config.query_mode = "two_frame_joint"
+    config.transition_dim = 16
+    model = build_progress_model(config)
+    outputs = model(
+        current_latent=torch.randn(3, 4, 1, 8, 8),
+        previous_latent=torch.randn(3, 4, 1, 8, 8),
+        pair_time_gap=torch.tensor([0.0, 0.5, 1.0]),
+        trajectory_frame_latents=torch.randn(1, 53, 4, 1, 8, 8),
+    )
+    assert outputs["joint_alignment_logits"].shape == (3, 53, 53)
+    assert outputs["joint_alignment_probabilities"].shape == (3, 53, 53)
+    torch.testing.assert_close(
+        outputs["joint_alignment_probabilities"].sum(dim=(1, 2)),
+        torch.ones(3),
+    )
+    torch.testing.assert_close(
+        outputs["joint_alignment_probabilities"].sum(dim=1),
+        outputs["alignment_probabilities"],
+    )
+    torch.testing.assert_close(
+        outputs["joint_alignment_probabilities"].sum(dim=2),
+        outputs["previous_alignment_probabilities"],
+    )
+    torch.testing.assert_close(
+        outputs["delta_progress"],
+        outputs["progress"] - outputs["previous_progress"],
+        rtol=1e-5,
+        atol=1e-6,
+    )
+    torch.testing.assert_close(
+        outputs["direction_probabilities"].sum(dim=-1),
+        torch.ones(3),
+    )
+    losses = compute_progress_loss(
+        outputs,
+        torch.tensor([0.2, 0.5, 0.8]),
+        previous_target=torch.tensor([0.1, 0.5, 0.9]),
+        alignment_weight=0.0,
+        joint_weight=1.0,
+        regression_weight=1.0,
+        delta_weight=1.0,
+        ranking_weight=0.0,
+    )
+    losses["total_loss"].backward()
+    assert model.joint_alignment_head.query_projection.weight.grad is not None
+    assert model.joint_alignment_head.memory_projection.weight.grad is not None
+
+
+def test_joint_hard_outputs_use_marginal_maps_consistently():
+    # The globally best pair is (0,0), while the current marginal prefers slot 1.
+    probabilities = torch.tensor([[[0.40, 0.30], [1.0e-6, 0.299999]]])
+    outputs = _joint_alignment_outputs_from_logits(
+        probabilities.log(),
+        num_bins=2,
+    )
+    assert outputs["joint_matched_frame"].item() == 0
+    assert outputs["matched_frame"].item() == 1
+    assert outputs["matched_frame"].item() == int(
+        outputs["alignment_probabilities"].argmax(dim=-1)
+    )
+    assert outputs["previous_matched_frame"].item() == int(
+        outputs["previous_alignment_probabilities"].argmax(dim=-1)
+    )
+    assert outputs["matched_direction"].item() == int(
+        outputs["direction_probabilities"].argmax(dim=-1) - 1
+    )
+
+
+def test_joint_soft_target_and_b2_to_b5_loss_compositions():
+    previous_target = torch.tensor([0.25, 0.75])
+    current_target = torch.tensor([0.50, 0.50])
+    joint_target = build_joint_progress_target_distribution(
+        previous_target,
+        current_target,
+        num_bins=53,
+        sigma_bins=2.0,
+    )
+    assert joint_target.shape == (2, 53, 53)
+    torch.testing.assert_close(joint_target.sum(dim=(1, 2)), torch.ones(2))
+    centers = joint_target.flatten(1).argmax(dim=-1)
+    assert torch.div(centers, 53, rounding_mode="floor").tolist() == [13, 39]
+    assert centers.remainder(53).tolist() == [26, 26]
+
+    direction_previous = torch.tensor([0.5, 0.5, 0.5])
+    source_frame_step = 1.0 / 213.0
+    direction_current = torch.tensor(
+        [0.5, 0.5 + source_frame_step, 0.5 - source_frame_step]
+    )
+    direction_target = build_joint_progress_target_distribution(
+        direction_previous,
+        direction_current,
+        num_bins=53,
+        sigma_bins=2.0,
+    )
+    direction_mass = torch.stack(
+        [
+            direction_target.tril(diagonal=-1).sum(dim=(1, 2)),
+            direction_target.diagonal(dim1=1, dim2=2).sum(dim=1),
+            direction_target.triu(diagonal=1).sum(dim=(1, 2)),
+        ],
+        dim=-1,
+    )
+    assert direction_mass[0].tolist() == pytest.approx([0.0, 1.0, 0.0], abs=1e-6)
+    assert float(direction_mass[1, 0]) == pytest.approx(0.0, abs=1e-6)
+    assert float(direction_mass[1, 1]) > 0.0
+    assert float(direction_mass[1, 2]) > 0.0
+    assert float(direction_mass[2, 0]) > 0.0
+    assert float(direction_mass[2, 1]) > 0.0
+    assert float(direction_mass[2, 2]) == pytest.approx(0.0, abs=1e-6)
+
+    previous_distribution = build_progress_target_distribution(
+        direction_previous,
+        num_bins=53,
+        sigma_bins=2.0,
+    )
+    current_distribution = build_progress_target_distribution(
+        direction_current,
+        num_bins=53,
+        sigma_bins=2.0,
+    )
+    torch.testing.assert_close(
+        direction_target.sum(dim=2),
+        previous_distribution,
+        atol=3e-7,
+        rtol=0.0,
+    )
+    torch.testing.assert_close(
+        direction_target.sum(dim=1),
+        current_distribution,
+        atol=3e-7,
+        rtol=0.0,
+    )
+    positions = torch.arange(53, dtype=direction_target.dtype) / 52.0
+    expected_delta = (
+        direction_target * (positions[None, None, :] - positions[None, :, None])
+    ).sum(dim=(1, 2))
+    torch.testing.assert_close(
+        expected_delta,
+        direction_current - direction_previous,
+        atol=3e-7,
+        rtol=0.0,
+    )
+
+    joint_logits = torch.randn(2, 53, 53, requires_grad=True)
+    outputs = _joint_alignment_outputs_from_logits(joint_logits, num_bins=53)
+    combinations = {
+        "b2": (0.0, 0.0),
+        "b3": (1.0, 0.0),
+        "b4": (0.0, 1.0),
+        "b5": (1.0, 1.0),
+    }
+    for absolute_weight, delta_weight in combinations.values():
+        losses = compute_progress_loss(
+            outputs,
+            current_target,
+            previous_target=previous_target,
+            alignment_weight=0.0,
+            joint_weight=1.0,
+            regression_weight=absolute_weight,
+            delta_weight=delta_weight,
+            ranking_weight=0.0,
+        )
+        expected = (
+            losses["joint_loss"]
+            + absolute_weight * losses["absolute_loss"]
+            + delta_weight * losses["delta_loss"]
+        )
+        torch.testing.assert_close(losses["total_loss"], expected)
+
+
+@pytest.mark.parametrize(
+    ("probabilities", "expected_direction"),
+    [
+        ((1.0, 0.0, 0.0), 1),
+        ((0.0, 1.0, 0.0), 0),
+        ((0.0, 0.0, 1.0), -1),
+    ],
+)
+def test_pair_sampler_produces_valid_forward_stay_and_reverse_labels(
+    probabilities,
+    expected_direction,
+):
+    torch.manual_seed(23)
+    pair = prepare_episode_pairs(
+        torch.randn(20, 4, 1, 8, 8),
+        torch.linspace(0.0, 1.0, 20),
+        queries_per_episode=0,
+        minimum_query_gap=3,
+        maximum_query_gap=5,
+        forward_probability=probabilities[0],
+        stay_probability=probabilities[1],
+        reverse_probability=probabilities[2],
+    )
+    assert pair["current_latents"].shape[0] == 20
+    assert sorted(pair["current_query_indices"].tolist()) == list(range(20))
+    index_gap = (pair["current_query_indices"] - pair["previous_query_indices"]).abs()
+    if expected_direction == 0:
+        assert (pair["pair_directions"] == 0).all()
+        assert (index_gap == 0).all()
+    else:
+        feasible = (
+            pair["current_query_indices"] >= 3
+            if expected_direction == 1
+            else pair["current_query_indices"] + 3 < 20
+        )
+        assert (pair["pair_directions"][feasible] == expected_direction).all()
+        assert (pair["pair_directions"][~feasible] == 0).all()
+        assert bool(((index_gap[feasible] >= 3) & (index_gap[feasible] <= 5)).all())
+        assert (index_gap[~feasible] == 0).all()
+    torch.testing.assert_close(
+        pair["pair_time_gaps"],
+        index_gap.float() / 5.0,
+    )
+
+
+def test_pair_sampler_preserves_b0_current_frame_marginal():
+    torch.manual_seed(29)
+    progress = torch.linspace(0.0, 1.0, 214)
+    pair = prepare_episode_pairs(
+        torch.randn(214, 4, 1, 2, 2),
+        progress,
+        queries_per_episode=0,
+        minimum_query_gap=1,
+        maximum_query_gap=8,
+        forward_probability=0.70,
+        stay_probability=0.15,
+        reverse_probability=0.15,
+    )
+    assert pair["current_query_indices"].unique().numel() == 214
+    assert sorted(pair["current_query_indices"].tolist()) == list(range(214))
+    torch.testing.assert_close(
+        pair["progress_targets"].sort().values,
+        progress,
+    )
+    torch.testing.assert_close(pair["progress_targets"].mean(), progress.mean())
+
+
+def test_two_frame_micro_batch_keeps_each_pair_on_its_episode_memory():
+    episodes = []
+    for episode_index in range(2):
+        episodes.append(
+            {
+                "episode_name": f"episode_{episode_index}",
+                "trajectory_latent": torch.randn(4, 3, 8, 8),
+                "trajectory_frame_latents": torch.randn(53, 4, 1, 8, 8),
+                "current_latents": torch.randn(10, 4, 1, 8, 8),
+                "progress": torch.linspace(0.0, 1.0, 10),
+            }
+        )
+    prepared = prepare_episode_micro_batch(
+        episodes,
+        queries_per_episode=4,
+        query_mode="two_frame_joint",
+        pair_sampling={
+            "minimum_query_gap": 1,
+            "maximum_query_gap": 4,
+            "forward_probability": 0.70,
+            "stay_probability": 0.15,
+            "reverse_probability": 0.15,
+        },
+    )
+    assert prepared["current_latents"].shape[0] == 8
+    assert prepared["previous_latents"].shape[0] == 8
+    assert prepared["query_episode_indices"].tolist() == [0] * 4 + [1] * 4
+    torch.testing.assert_close(
+        prepared["pair_directions"],
+        (prepared["progress_targets"] - prepared["previous_progress_targets"])
+        .sign()
+        .long(),
+    )
+
+
 def test_serial_mixed_episode_batch_matches_independent_episode_forwards():
     # E=2 条轨迹，每条 Q=3 个 query；混合前向必须严格等价于分别运行两条 episode。
     torch.manual_seed(7)
@@ -395,7 +849,9 @@ def test_mixed_episode_micro_batch_gradients_equal_one_full_forward():
         end = start + 2
         micro_outputs = micro_model(
             current_latent=current[start:end],
-            trajectory_frame_latents=trajectory_frames[episode_index : episode_index + 1],
+            trajectory_frame_latents=trajectory_frames[
+                episode_index : episode_index + 1
+            ],
             query_episode_indices=torch.zeros(2, dtype=torch.long),
         )
         micro_loss = compute_progress_loss(
@@ -551,6 +1007,19 @@ def test_progress_cache_dataset_preserves_whole_episode(tmp_path):
     assert collated[0] is sample
     assert collated[1] is sample
 
+    payload["frame_indices"] = torch.tensor([0, 1, 3, 2, 4, 5, 6])
+    torch.save(payload, episode_dir / "episode.pt")
+    with pytest.raises(ValueError, match="frame_indices must be strictly increasing"):
+        dataset[0]
+
+    payload["frame_indices"] = torch.arange(7)
+    payload["progress"] = torch.tensor([0.0, 0.2, 0.4, 0.4, 0.6, 0.8, 1.0])
+    torch.save(payload, episode_dir / "episode.pt")
+    with pytest.raises(
+        ValueError, match="Progress targets must be strictly increasing"
+    ):
+        dataset[0]
+
 
 def test_layerwise_episode_features_preserve_variable_language_lengths():
     # 不同任务的 UMT5 token 数 L_e 可以不同；mixed batch 必须以 list 交给 WAN，
@@ -653,6 +1122,29 @@ def test_zero_ranking_weight_skips_pairwise_path():
     )
     losses["total_loss"].backward()
     assert logits.grad is not None
+
+
+def test_non_joint_model_rejects_joint_or_delta_loss_weights():
+    logits = torch.zeros(2, 53, requires_grad=True)
+    probabilities = logits.softmax(dim=-1)
+    outputs = {
+        "alignment_logits": logits,
+        "progress": (probabilities * torch.linspace(0.0, 1.0, 53)).sum(dim=-1),
+    }
+    with pytest.raises(ValueError, match="require two_frame_joint"):
+        compute_progress_loss(
+            outputs,
+            torch.tensor([0.25, 0.75]),
+            joint_weight=1.0,
+            ranking_weight=0.0,
+        )
+    with pytest.raises(ValueError, match="require two_frame_joint"):
+        compute_progress_loss(
+            outputs,
+            torch.tensor([0.25, 0.75]),
+            delta_weight=1.0,
+            ranking_weight=0.0,
+        )
 
 
 def test_progress_model_rejects_non_53_frame_memory():

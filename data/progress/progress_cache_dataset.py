@@ -9,7 +9,6 @@ from typing import Any, Dict, List, Optional
 import torch
 from torch.utils.data import Dataset
 
-
 SCHEMA_VERSION = 2
 
 # 维度约定：F=53 个生成轨迹位置，N=一个 episode 中的真实查询帧数，
@@ -152,6 +151,10 @@ class ProgressEpisodeCacheDataset(Dataset):
                 f"{tuple(trajectory_frame_latents.shape[1:])} and {tuple(current_latents.shape[1:])} "
                 f"in {cache_path}"
             )
+        if progress.ndim != 1 or frame_indices.ndim != 1:
+            raise ValueError(
+                f"progress and frame_indices must both be [N] in {cache_path}"
+            )
         # 三个 query 级 tensor 的首维必须都是 N，保证 current_latents[i]、progress[i]、
         # frame_indices[i] 描述同一张 source frame。
         if (
@@ -159,12 +162,42 @@ class ProgressEpisodeCacheDataset(Dataset):
             or progress.shape[0] != frame_indices.shape[0]
         ):
             raise ValueError(f"Query tensors have inconsistent lengths in {cache_path}")
+        if current_latents.shape[0] < 1:
+            raise ValueError(f"Progress cache contains no query frames in {cache_path}")
+        integer_dtypes = {
+            torch.uint8,
+            torch.int8,
+            torch.int16,
+            torch.int32,
+            torch.int64,
+        }
+        if frame_indices.dtype not in integer_dtypes:
+            raise ValueError(
+                f"frame_indices must be an integer [N] tensor in {cache_path}"
+            )
+        total_frames = int(payload["total_frames"])
+        if bool((frame_indices < 0).any()) or bool(
+            (frame_indices >= total_frames).any()
+        ):
+            raise ValueError(
+                f"frame_indices must lie in [0,{total_frames - 1}] in {cache_path}"
+            )
+        if frame_indices.numel() > 1 and not bool(
+            (frame_indices[1:] > frame_indices[:-1]).all()
+        ):
+            raise ValueError(
+                f"frame_indices must be strictly increasing in {cache_path}"
+            )
         # progress: [N] 中不允许 NaN/Inf，也不允许超出归一化区间 [0,1]。
         if not torch.isfinite(progress).all() or bool(
             ((progress < 0) | (progress > 1)).any()
         ):
             raise ValueError(
                 f"Progress targets must be finite values in [0,1] in {cache_path}"
+            )
+        if progress.numel() > 1 and not bool((progress[1:] > progress[:-1]).all()):
+            raise ValueError(
+                f"Progress targets must be strictly increasing in {cache_path}"
             )
 
         sample: Dict[str, Any] = {
@@ -184,7 +217,7 @@ class ProgressEpisodeCacheDataset(Dataset):
             "last_frame": payload["last_frame"],
             "episode_name": payload.get("episode_name", entry.get("episode_name")),
             "task_index": payload.get("task_index", entry.get("task_index")),
-            "total_frames": int(payload["total_frames"]),
+            "total_frames": total_frames,
             "num_progress_bins": num_progress_bins,
             "cache_path": str(cache_path),
         }

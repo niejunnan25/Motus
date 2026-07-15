@@ -1,0 +1,82 @@
+training_mode: "progress_stage2"
+
+source:
+  vgm_config: "configs/vgm_bridge_v1_proper_detailed_caption_v1_53f_full_jitter.yaml"
+  vgm_checkpoint: "/mnt/workspace1/users/niejunnan/codebase/Motus/checkpoints/vgm_bridge_v1_proper_detailed_caption_v1_53f_full_jitter/vgm_bridge_v1_proper_lerobot_video_448x224_detailed_caption_v1_53f_full_jitter_2gpu_gbs8_30k/checkpoint_step_30000"
+
+cache:
+  cache_dir: "/mnt/workspace1/users/niejunnan/cache/motus_progress/v1_proper_detailed_53f_step30000_s50_53slot_v2"
+  num_inference_steps: 50
+  current_encode_batch_size: 16
+  trajectory_frame_encode_batch_size: 16
+  current_frame_stride: 1
+  validation_fraction: 0.1
+  dtype: "float16"
+  seed: 20260713
+
+progress_model:
+  fusion_mode: "serial_latent"
+  query_mode: "two_frame_joint"
+  num_progress_bins: 53
+  latent_channels: 48
+  hidden_dim: 512
+  num_heads: 8
+  num_layers: 6
+  ffn_multiplier: 4
+  patch_size: [1, 2, 2]
+  frame_num_tokens: 16
+  view_encoding_mode: "split_height"
+  num_views: 2
+  tokens_per_view: 8
+  alignment_head_mode: "pooled_cosine"
+  transition_dim: 128
+  transition_score_weight: 1.0
+  late_interaction_temperature: 0.07
+  video_hidden_dim: 3072
+  dropout: 0.0
+
+pair_sampling:
+  minimum_query_gap: 1
+  maximum_query_gap: 8
+  evaluation_query_gap: 4
+  forward_probability: 0.70
+  stay_probability: 0.15
+  reverse_probability: 0.15
+
+loss:
+  target_sigma_bins: 2.0
+  joint_direction_constraint: true
+  alignment_weight: 0.0
+  joint_weight: 1.0
+  regression_weight: 52.0
+  delta_weight: 32.0
+  ranking_weight: 0.0
+  ranking_minimum_gap: 0.05
+  ranking_temperature: 0.1
+
+training:
+  episode_batch_size: 1
+  episode_micro_batch_size: 1
+  query_batch_size: 64
+  queries_per_episode: 0
+  max_epochs: 60
+  max_steps: 50000
+  seed: 20260713
+  learning_rate: 1.0e-4
+  weight_decay: 0.01
+  warmup_steps: 250
+  grad_clip_norm: 1.0
+  max_episodes: null
+
+system:
+  checkpoint_dir: "./checkpoints/progress_stage2"
+  save_interval: 2500
+  log_interval: 1
+  checkpoint_limit: 20
+  num_workers: 2
+  pin_memory: true
+
+logging:
+  report_to: "wandb"
+  wandb_project: "motus-progress"
+  run_name: "progress_b5_two_frame_joint_abs_delta_a2_53bin_s50_allframes_60ep"

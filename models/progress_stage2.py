@@ -15,14 +15,15 @@ import torch.nn.functional as F
 # 时间/空间尺寸，K=每帧重采样 token 数（正式配置为 16），D=Progress hidden dim
 # （正式配置为 512），L=WAN 视频 token 数。
 
-# 两个模型共享同一个任务定义：输入一张当前观测及同一条 53-frame 生成轨迹，
-# 输出当前观测对 0...52 每个轨迹位置的匹配 logits [B,53]。它们的区别只在于
-# 当前观测与轨迹信息如何融合，不在标签、输出空间或最终 53-frame memory。
+# 所有模型共享同一个最终任务：根据在线观测及同一条 53-frame 生成轨迹，输出
+# 当前观测对 0...52 每个轨迹位置的匹配 logits [B,53]。query_mode 决定在线观测
+# 是单帧还是 previous/current 双帧；fusion_mode 决定如何读取轨迹 memory。
 
 
 @dataclass
 class ProgressStage2Config:
     fusion_mode: str = "serial_latent"
+    query_mode: str = "single_frame"
     num_progress_bins: int = 53
     latent_channels: int = 48
     hidden_dim: int = 512
@@ -36,6 +37,8 @@ class ProgressStage2Config:
     tokens_per_view: int = 16
     alignment_head_mode: str = "pooled_cosine"
     late_interaction_temperature: float = 0.07
+    transition_dim: int = 128
+    transition_score_weight: float = 1.0
     video_hidden_dim: int = 3072
     dropout: float = 0.0
 
@@ -433,6 +436,233 @@ class TokenLateInteractionAlignmentHead(nn.Module):
         return outputs
 
 
+class TwoFrameQueryFusion(nn.Module):
+    """Fuse previous/current frame tokens while preserving the K-token layout."""
+
+    def __init__(self, hidden_dim: int) -> None:
+        super().__init__()
+        self.gap_embedding = nn.Sequential(
+            nn.Linear(1, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        self.input_norm = nn.LayerNorm(hidden_dim * 4)
+        self.projection = nn.Sequential(
+            nn.Linear(hidden_dim * 4, hidden_dim),
+            nn.GELU(approximate="tanh"),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        self.output_norm = nn.LayerNorm(hidden_dim)
+
+    def forward(
+        self,
+        previous_tokens: torch.Tensor,
+        current_tokens: torch.Tensor,
+        pair_time_gap: torch.Tensor,
+    ) -> torch.Tensor:
+        if previous_tokens.shape != current_tokens.shape:
+            raise ValueError(
+                "Previous/current token shapes must match, got "
+                f"{tuple(previous_tokens.shape)} and {tuple(current_tokens.shape)}"
+            )
+        if pair_time_gap.ndim != 1 or pair_time_gap.shape[0] != current_tokens.shape[0]:
+            raise ValueError(
+                "pair_time_gap must be [B] and align with frame tokens, got "
+                f"{tuple(pair_time_gap.shape)}"
+            )
+        gap = self.gap_embedding(pair_time_gap.float().unsqueeze(-1))
+        gap = gap.to(dtype=current_tokens.dtype).unsqueeze(1)
+        gap = gap.expand(-1, current_tokens.shape[1], -1)
+        features = torch.cat(
+            [
+                previous_tokens,
+                current_tokens,
+                current_tokens - previous_tokens,
+                gap,
+            ],
+            dim=-1,
+        )
+        update = self.projection(self.input_norm(features))
+        return self.output_norm(current_tokens + update)
+
+
+def _joint_alignment_outputs_from_logits(
+    joint_logits: torch.Tensor,
+    *,
+    num_bins: int,
+) -> Dict[str, torch.Tensor]:
+    """Convert globally normalized [B,F,F] transition logits to Progress outputs."""
+    if joint_logits.ndim != 3 or joint_logits.shape[1:] != (num_bins, num_bins):
+        raise ValueError(
+            f"Joint logits must be [B,{num_bins},{num_bins}], got "
+            f"{tuple(joint_logits.shape)}"
+        )
+    joint_probabilities = (
+        joint_logits.flatten(1).softmax(dim=-1).reshape_as(joint_logits)
+    )
+    previous_probabilities = joint_probabilities.sum(dim=2)
+    current_probabilities = joint_probabilities.sum(dim=1)
+    # logsumexp gives marginal logits whose softmax exactly matches the marginals.
+    previous_logits = torch.logsumexp(joint_logits, dim=2)
+    current_logits = torch.logsumexp(joint_logits, dim=1)
+    frame_indices = torch.arange(
+        num_bins,
+        device=joint_logits.device,
+        dtype=joint_probabilities.dtype,
+    )
+    positions = frame_indices / float(num_bins - 1)
+    previous_progress = (previous_probabilities * positions.unsqueeze(0)).sum(dim=-1)
+    progress = (current_probabilities * positions.unsqueeze(0)).sum(dim=-1)
+    slot_delta = positions[None, :] - positions[:, None]
+    delta_progress = (joint_probabilities * slot_delta.unsqueeze(0)).sum(dim=(1, 2))
+    joint_matched_flat = joint_logits.flatten(1).argmax(dim=-1)
+    joint_matched_previous = torch.div(
+        joint_matched_flat,
+        num_bins,
+        rounding_mode="floor",
+    )
+    joint_matched_current = joint_matched_flat.remainder(num_bins)
+    direction_probabilities = torch.stack(
+        [
+            joint_probabilities.tril(diagonal=-1).sum(dim=(1, 2)),
+            joint_probabilities.diagonal(dim1=1, dim2=2).sum(dim=1),
+            joint_probabilities.triu(diagonal=1).sum(dim=(1, 2)),
+        ],
+        dim=-1,
+    )
+    # The shared hard-output contract follows the corresponding marginals.
+    # Keep the global joint MAP separately because its current/previous slots
+    # can differ from the marginal MAPs used by single-frame evaluation.
+    matched_previous = previous_probabilities.argmax(dim=-1)
+    matched_current = current_probabilities.argmax(dim=-1)
+    matched_direction = direction_probabilities.argmax(dim=-1) - 1
+    return {
+        "progress": progress,
+        "previous_progress": previous_progress,
+        "delta_progress": delta_progress,
+        "expected_frame": progress * float(num_bins - 1),
+        "previous_expected_frame": previous_progress * float(num_bins - 1),
+        "matched_frame": matched_current,
+        "previous_matched_frame": matched_previous,
+        "matched_direction": matched_direction,
+        "joint_matched_frame": joint_matched_current,
+        "joint_previous_matched_frame": joint_matched_previous,
+        "joint_matched_direction": (
+            joint_matched_current - joint_matched_previous
+        ).sign(),
+        "alignment_logits": current_logits,
+        "alignment_probabilities": current_probabilities,
+        "previous_alignment_logits": previous_logits,
+        "previous_alignment_probabilities": previous_probabilities,
+        "joint_alignment_logits": joint_logits,
+        "joint_alignment_probabilities": joint_probabilities,
+        # Column order is backward, stay, forward.
+        "direction_probabilities": direction_probabilities,
+        "memory_positions": positions,
+        "memory_frame_indices": frame_indices,
+    }
+
+
+class JointTransitionAlignmentHead(nn.Module):
+    """Predict the previous/current memory-slot pair as one 53x53 distribution."""
+
+    def __init__(
+        self,
+        hidden_dim: int,
+        transition_dim: int,
+        num_bins: int,
+        transition_score_weight: float,
+    ) -> None:
+        super().__init__()
+        if transition_dim < 1:
+            raise ValueError("transition_dim must be positive")
+        if transition_score_weight < 0.0:
+            raise ValueError("transition_score_weight cannot be negative")
+        self.num_bins = int(num_bins)
+        self.transition_score_weight = float(transition_score_weight)
+        self.gap_embedding = nn.Sequential(
+            nn.Linear(1, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        self.query_norm = nn.LayerNorm(hidden_dim * 4)
+        self.query_projection = nn.Linear(hidden_dim * 4, transition_dim)
+        self.memory_norm = nn.LayerNorm(hidden_dim)
+        self.memory_projection = nn.Linear(hidden_dim, transition_dim)
+        self.relative_slot_embedding = nn.Embedding(
+            2 * self.num_bins - 1,
+            transition_dim,
+        )
+        self.transition_norm = nn.LayerNorm(transition_dim)
+        self.logit_scale = nn.Parameter(torch.tensor(math.log(10.0)))
+        previous = torch.arange(self.num_bins)[:, None]
+        current = torch.arange(self.num_bins)[None, :]
+        self.register_buffer(
+            "relative_slot_indices",
+            current - previous + self.num_bins - 1,
+            persistent=False,
+        )
+
+    def forward(
+        self,
+        previous_tokens: torch.Tensor,
+        current_tokens: torch.Tensor,
+        temporal_memory: torch.Tensor,
+        previous_logits: torch.Tensor,
+        current_logits: torch.Tensor,
+        pair_time_gap: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        batch_size = current_tokens.shape[0]
+        if previous_tokens.shape != current_tokens.shape:
+            raise ValueError("Previous/current Progress token shapes must match")
+        if temporal_memory.shape[:2] != (batch_size, self.num_bins):
+            raise ValueError(
+                f"Temporal memory must be [B,{self.num_bins},D], got "
+                f"{tuple(temporal_memory.shape)}"
+            )
+        if previous_logits.shape != (
+            batch_size,
+            self.num_bins,
+        ) or current_logits.shape != (
+            batch_size,
+            self.num_bins,
+        ):
+            raise ValueError("Unary alignment logits must both be [B,F]")
+        if pair_time_gap.ndim != 1 or pair_time_gap.shape[0] != batch_size:
+            raise ValueError("pair_time_gap must be [B]")
+
+        previous = previous_tokens.mean(dim=1)
+        current = current_tokens.mean(dim=1)
+        gap = self.gap_embedding(pair_time_gap.float().unsqueeze(-1)).to(
+            dtype=current.dtype
+        )
+        query = torch.cat([previous, current, current - previous, gap], dim=-1)
+        query = F.normalize(
+            self.query_projection(self.query_norm(query)).float(),
+            dim=-1,
+        )
+
+        memory = self.memory_projection(self.memory_norm(temporal_memory))
+        # Axis 1 is previous slot j and axis 2 is current slot k.
+        memory_delta = memory[:, None, :, :] - memory[:, :, None, :]
+        relative = self.relative_slot_embedding(self.relative_slot_indices)
+        transition = self.transition_norm(memory_delta + relative.unsqueeze(0))
+        transition = F.normalize(transition.float(), dim=-1)
+        scale = self.logit_scale.float().exp().clamp(max=100.0)
+        transition_logits = torch.einsum("bd,bjkd->bjk", query, transition) * scale
+        joint_logits = (
+            previous_logits.float().unsqueeze(2)
+            + current_logits.float().unsqueeze(1)
+            + self.transition_score_weight * transition_logits
+        )
+        outputs = _joint_alignment_outputs_from_logits(
+            joint_logits,
+            num_bins=self.num_bins,
+        )
+        outputs["transition_logits"] = transition_logits
+        return outputs
+
+
 class SharedFrameLatentEncoder(nn.Module):
     """Encode current and generated RGB-frame latents with shared weights."""
 
@@ -615,7 +845,10 @@ def _select_episode_memory_for_queries(
         )
 
     # query_episode_indices: [B_q]，第 q 个整数指定 query q 应读取第几条 episode memory。
-    if query_episode_indices.ndim != 1 or query_episode_indices.shape[0] != query_batch_size:
+    if (
+        query_episode_indices.ndim != 1
+        or query_episode_indices.shape[0] != query_batch_size
+    ):
         raise ValueError(
             "query_episode_indices must be [B_q], got "
             f"{tuple(query_episode_indices.shape)} for B_q={query_batch_size}"
@@ -682,11 +915,37 @@ class SerialLatentProgressModel(nn.Module):
     def __init__(self, config: ProgressStage2Config):
         super().__init__()
         self.config = config
+        self.query_mode = str(config.query_mode)
+        if self.query_mode not in {
+            "single_frame",
+            "two_frame_fused",
+            "two_frame_joint",
+        }:
+            raise ValueError(
+                "query_mode must be 'single_frame', 'two_frame_fused', or "
+                f"'two_frame_joint', got {self.query_mode!r}"
+            )
+        if (
+            self.query_mode == "two_frame_joint"
+            and config.alignment_head_mode != "pooled_cosine"
+        ):
+            raise ValueError(
+                "two_frame_joint currently requires alignment_head_mode='pooled_cosine'"
+            )
         self.frame_encoder = SharedFrameLatentEncoder(config)
         self.current_type_embedding = nn.Parameter(torch.empty(1, 1, config.hidden_dim))
         self.memory_type_embedding = nn.Parameter(torch.empty(1, 1, config.hidden_dim))
         nn.init.normal_(self.current_type_embedding, std=0.02)
         nn.init.normal_(self.memory_type_embedding, std=0.02)
+        # Keep the single-frame parameter structure byte-for-byte compatible with
+        # archived A2 checkpoints. Pair-only modules are created lazily by mode.
+        if self.query_mode != "single_frame":
+            self.previous_type_embedding = nn.Parameter(
+                torch.empty(1, 1, config.hidden_dim)
+            )
+            nn.init.normal_(self.previous_type_embedding, std=0.02)
+        if self.query_mode == "two_frame_fused":
+            self.pair_fusion = TwoFrameQueryFusion(config.hidden_dim)
         self.blocks = nn.ModuleList(
             [
                 ProgressCrossAttentionBlock(
@@ -699,12 +958,54 @@ class SerialLatentProgressModel(nn.Module):
             ]
         )
         self.alignment_head = _build_alignment_head(config)
+        if self.query_mode == "two_frame_joint":
+            self.joint_alignment_head = JointTransitionAlignmentHead(
+                config.hidden_dim,
+                config.transition_dim,
+                config.num_progress_bins,
+                config.transition_score_weight,
+            )
+
+    def _encode_pair_queries(
+        self,
+        previous_latent: Optional[torch.Tensor],
+        current_latent: torch.Tensor,
+        pair_time_gap: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if previous_latent is None or pair_time_gap is None:
+            raise ValueError(
+                f"query_mode={self.query_mode!r} requires previous_latent and pair_time_gap"
+            )
+        if previous_latent.shape != current_latent.shape:
+            raise ValueError(
+                "Previous/current latent shapes must match, got "
+                f"{tuple(previous_latent.shape)} and {tuple(current_latent.shape)}"
+            )
+        if pair_time_gap.ndim != 1 or pair_time_gap.shape[0] != current_latent.shape[0]:
+            raise ValueError(
+                f"pair_time_gap must be [B], got {tuple(pair_time_gap.shape)}"
+            )
+        if not torch.isfinite(pair_time_gap).all() or bool(
+            ((pair_time_gap < 0.0) | (pair_time_gap > 1.0)).any()
+        ):
+            raise ValueError(
+                "pair_time_gap must contain finite normalized values in [0,1]"
+            )
+        previous_tokens = (
+            self.frame_encoder(previous_latent) + self.previous_type_embedding
+        )
+        current_tokens = (
+            self.frame_encoder(current_latent) + self.current_type_embedding
+        )
+        return previous_tokens, current_tokens, pair_time_gap
 
     def forward(
         self,
         current_latent: torch.Tensor,
         trajectory_frame_latents: torch.Tensor,
         query_episode_indices: Optional[torch.Tensor] = None,
+        previous_latent: Optional[torch.Tensor] = None,
+        pair_time_gap: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         # Serial 数据流：
         # current 单帧 -> SharedFrameLatentEncoder -> [B,K,D]
@@ -714,10 +1015,19 @@ class SerialLatentProgressModel(nn.Module):
         # current_latent: [B_q, C_z, 1, H_z, W_z]
         # trajectory_frame_latents: [E, F=53, C_z, 1, H_z, W_z]
         # query_episode_indices: [B_q]；例如 E=2,Q=3 时为 [0,0,0,1,1,1]。
-        # 同一个共享帧编码器把 B 张真实 current observation 编为 [B,K,D]。
-        progress_tokens = self.frame_encoder(current_latent)
-        # current_type_embedding: [1,1,D]，广播到 [B,K,D]，标记这些 token 属于查询侧。
-        progress_tokens = progress_tokens + self.current_type_embedding
+        if self.query_mode == "single_frame":
+            # This is the archived A2 path. Do not alter its operations or parameters.
+            progress_tokens = self.frame_encoder(current_latent)
+            progress_tokens = progress_tokens + self.current_type_embedding
+            previous_tokens = None
+            current_tokens = None
+        else:
+            previous_tokens, current_tokens, pair_time_gap = self._encode_pair_queries(
+                previous_latent,
+                current_latent,
+                pair_time_gap,
+            )
+            progress_tokens = None
         # 返回 E 条轨迹的 memory_tokens [E,F*K,D] 与 temporal_memory [E,F,D]。
         memory_tokens, temporal_memory = encode_trajectory_frame_memory(
             self.frame_encoder,
@@ -729,21 +1039,49 @@ class SerialLatentProgressModel(nn.Module):
         # 和 [B_q,F,D]。这一步保证 query(e,q) 只读取 memory(e)。
         memory_tokens = _select_episode_memory_for_queries(
             memory_tokens,
-            query_batch_size=progress_tokens.shape[0],
+            query_batch_size=current_latent.shape[0],
             query_episode_indices=query_episode_indices,
             name="Trajectory token memory",
         )
         temporal_memory = _select_episode_memory_for_queries(
             temporal_memory,
-            query_batch_size=progress_tokens.shape[0],
+            query_batch_size=current_latent.shape[0],
             query_episode_indices=query_episode_indices,
             name="Trajectory temporal memory",
         )
 
-        # 6 层 Serial Transformer: [B, K, D] cross-attend [B, F*K, D]。
-        # 每层输入/输出 progress_tokens 都保持 [B,K,D]；memory_tokens 始终只读、不被更新。
-        for block in self.blocks:
-            progress_tokens = block(progress_tokens, memory_tokens)
+        if self.query_mode == "single_frame":
+            assert progress_tokens is not None
+            for block in self.blocks:
+                progress_tokens = block(progress_tokens, memory_tokens)
+        elif self.query_mode == "two_frame_fused":
+            assert previous_tokens is not None and current_tokens is not None
+            assert pair_time_gap is not None
+            progress_tokens = self.pair_fusion(
+                previous_tokens,
+                current_tokens,
+                pair_time_gap,
+            )
+            for block in self.blocks:
+                progress_tokens = block(progress_tokens, memory_tokens)
+        else:
+            assert previous_tokens is not None and current_tokens is not None
+            assert pair_time_gap is not None
+            # Shared blocks localize both observations in the same read-only memory.
+            for block in self.blocks:
+                previous_tokens = block(previous_tokens, memory_tokens)
+                current_tokens = block(current_tokens, memory_tokens)
+
+            previous_outputs = self.alignment_head(previous_tokens, temporal_memory)
+            current_outputs = self.alignment_head(current_tokens, temporal_memory)
+            return self.joint_alignment_head(
+                previous_tokens,
+                current_tokens,
+                temporal_memory,
+                previous_outputs["alignment_logits"],
+                current_outputs["alignment_logits"],
+                pair_time_gap,
+            )
         # Baseline 对每帧 K 个 token 先平均；late-interaction ablation 则恢复
         # [B,F,K,D]，让局部 query token 分别寻找每帧内最匹配的局部 token。
         alignment_memory = _alignment_memory(
@@ -751,6 +1089,7 @@ class SerialLatentProgressModel(nn.Module):
             memory_tokens,
             temporal_memory,
         )
+        assert progress_tokens is not None
         outputs = self.alignment_head(progress_tokens, alignment_memory)
         return outputs
 
@@ -885,6 +1224,10 @@ def build_progress_model(config: ProgressStage2Config) -> nn.Module:
     if config.fusion_mode == "serial_latent":
         return SerialLatentProgressModel(config)
     if config.fusion_mode == "layerwise_wvm":
+        if config.query_mode != "single_frame":
+            raise ValueError(
+                "Two-frame Progress experiments currently use fusion_mode='serial_latent'"
+            )
         return LayerwiseProgressModel(config)
     raise ValueError(f"Unknown Progress fusion_mode={config.fusion_mode!r}")
 
@@ -969,47 +1312,172 @@ def build_progress_target_distribution(
     return distribution
 
 
+def build_joint_progress_target_distribution(
+    previous_target: torch.Tensor,
+    current_target: torch.Tensor,
+    num_bins: int,
+    sigma_bins: float,
+    direction_constrained: bool = True,
+) -> torch.Tensor:
+    """Build a normalized [B,F,F] target centered at (j*, k*)."""
+    if previous_target.shape != current_target.shape or previous_target.ndim != 1:
+        raise ValueError(
+            "Previous/current Progress targets must have the same [B] shape, got "
+            f"{tuple(previous_target.shape)} and {tuple(current_target.shape)}"
+        )
+    previous_distribution = build_progress_target_distribution(
+        previous_target,
+        num_bins=num_bins,
+        sigma_bins=sigma_bins,
+    )
+    current_distribution = build_progress_target_distribution(
+        current_target,
+        num_bins=num_bins,
+        sigma_bins=sigma_bins,
+    )
+    if not direction_constrained:
+        joint = previous_distribution.unsqueeze(2) * current_distribution.unsqueeze(1)
+    else:
+        # Couple equal quantiles of the two Gaussian marginals. This preserves
+        # both 53-bin marginals while producing an ordered transport plan:
+        # forward pairs lie on/above the diagonal, reverse pairs on/below it,
+        # and identical targets collapse exactly onto the diagonal. Unlike a
+        # strict triangular mask, the diagonal mass represents sub-bin motion.
+        previous_high = previous_distribution.cumsum(dim=-1)
+        current_high = current_distribution.cumsum(dim=-1)
+        previous_low = torch.cat(
+            [torch.zeros_like(previous_high[:, :1]), previous_high[:, :-1]],
+            dim=-1,
+        )
+        current_low = torch.cat(
+            [torch.zeros_like(current_high[:, :1]), current_high[:, :-1]],
+            dim=-1,
+        )
+        joint = (
+            torch.minimum(
+                previous_high.unsqueeze(2),
+                current_high.unsqueeze(1),
+            )
+            - torch.maximum(
+                previous_low.unsqueeze(2),
+                current_low.unsqueeze(1),
+            )
+        ).clamp_min(0.0)
+
+        # Remove only floating-point leakage outside the monotone support. The
+        # diagonal remains valid for moving pairs because source-frame motion
+        # can be smaller than one of the 53 discrete Progress slots.
+        slot_indices = torch.arange(num_bins, device=joint.device)
+        slot_delta = slot_indices[None, :] - slot_indices[:, None]
+        target_direction = (current_target - previous_target).sign()
+        direction_mask = torch.where(
+            target_direction[:, None, None] > 0,
+            slot_delta[None, :, :] >= 0,
+            torch.where(
+                target_direction[:, None, None] < 0,
+                slot_delta[None, :, :] <= 0,
+                slot_delta[None, :, :] == 0,
+            ),
+        )
+        joint = joint * direction_mask.to(dtype=joint.dtype)
+    normalizer = joint.sum(dim=(1, 2), keepdim=True)
+    if bool((normalizer <= 0).any()) or not torch.isfinite(normalizer).all():
+        raise ValueError("Joint Progress target has no finite probability mass")
+    return joint / normalizer
+
+
 def compute_progress_loss(
     outputs: Dict[str, torch.Tensor],
     target: torch.Tensor,
     *,
+    previous_target: Optional[torch.Tensor] = None,
     episode_ids: Optional[torch.Tensor] = None,
     target_sigma_bins: float = 2.0,
+    joint_direction_constraint: bool = True,
+    alignment_weight: float = 1.0,
+    joint_weight: float = 0.0,
     regression_weight: float = 1.0,
+    delta_weight: float = 0.0,
     ranking_weight: float = 0.1,
     ranking_minimum_gap: float = 0.05,
     ranking_temperature: float = 0.1,
 ) -> Dict[str, torch.Tensor]:
-    # outputs["alignment_logits"]: [B,F=53]；target: [B]。
-    # target 转 float32 并截断到 [0,1]，形状仍为 [B]。
     target = target.float().clamp(0.0, 1.0)
-    # logits 转 float32 提高 loss 数值稳定性，形状保持 [B,F]。
     logits = outputs["alignment_logits"].float()
-    # 同时检查 rank=2 和 batch 对齐；F 可由配置决定，但正式值必须为 53。
     if logits.ndim != 2 or logits.shape[0] != target.shape[0]:
         raise ValueError(
             f"Expected logits [B,F] aligned with target [B], got {tuple(logits.shape)} and {tuple(target.shape)}"
         )
-    # 根据每个 target 构造 Gaussian soft label: [B] -> [B,F]。
     target_distribution = build_progress_target_distribution(
         target,
         num_bins=logits.shape[1],
         sigma_bins=target_sigma_bins,
     )
-    # 在 F=53 维做 log_softmax，log_probabilities: [B,F]。
     log_probabilities = F.log_softmax(logits, dim=-1)
-    # soft-label cross entropy 先沿 F 求和得到 [B]，再对 B 求均值得到标量。
     alignment_loss = -(target_distribution * log_probabilities).sum(dim=-1).mean()
 
-    # prediction 是 alignment distribution 的期望 Progress，形状 [B]、范围 [0,1]。
     prediction = outputs["progress"].float()
-    # Smooth-L1 直接约束连续 progress prediction 与 target，默认 reduction=mean，输出标量。
-    regression_loss = F.smooth_l1_loss(prediction, target)
+    absolute_loss = F.smooth_l1_loss(prediction, target)
+    joint_logits = outputs.get("joint_alignment_logits")
+    if joint_logits is None:
+        joint_loss = prediction.new_zeros(())
+        delta_loss = prediction.new_zeros(())
+        previous_prediction = None
+        delta_prediction = None
+        previous_target_value = None
+    else:
+        joint_logits = joint_logits.float()
+        if (
+            joint_logits.ndim != 3
+            or joint_logits.shape[0] != target.shape[0]
+            or joint_logits.shape[1] != logits.shape[1]
+            or joint_logits.shape[2] != logits.shape[1]
+        ):
+            raise ValueError(
+                "joint_alignment_logits must be [B,F,F] and align with current logits"
+            )
+        if previous_target is None:
+            raise ValueError("Joint Progress loss requires previous_target")
+        previous_target_value = previous_target.float().clamp(0.0, 1.0)
+        if previous_target_value.shape != target.shape:
+            raise ValueError(
+                "previous_target must match current target shape, got "
+                f"{tuple(previous_target_value.shape)} and {tuple(target.shape)}"
+            )
+        joint_target = build_joint_progress_target_distribution(
+            previous_target_value,
+            target,
+            num_bins=logits.shape[1],
+            sigma_bins=target_sigma_bins,
+            direction_constrained=joint_direction_constraint,
+        )
+        joint_log_probabilities = F.log_softmax(joint_logits.flatten(1), dim=-1)
+        joint_log_probabilities = joint_log_probabilities.reshape_as(joint_logits)
+        joint_loss = -(joint_target * joint_log_probabilities).sum(dim=(1, 2)).mean()
+        previous_prediction = outputs["previous_progress"].float()
+        delta_prediction = outputs["delta_progress"].float()
+        target_delta = target - previous_target_value
+        delta_loss = F.smooth_l1_loss(delta_prediction, target_delta)
+
+    weights = {
+        "alignment_weight": float(alignment_weight),
+        "joint_weight": float(joint_weight),
+        "regression_weight": float(regression_weight),
+        "delta_weight": float(delta_weight),
+        "ranking_weight": float(ranking_weight),
+    }
+    for name, value in weights.items():
+        if value < 0.0:
+            raise ValueError(f"{name} cannot be negative")
+    if not any(value > 0.0 for value in weights.values()):
+        raise ValueError("At least one Progress loss weight must be positive")
+    if joint_logits is None and (
+        weights["joint_weight"] > 0.0 or weights["delta_weight"] > 0.0
+    ):
+        raise ValueError(
+            "joint_weight and delta_weight require two_frame_joint model outputs"
+        )
     ranking_weight = float(ranking_weight)
-    if ranking_weight < 0.0:
-        raise ValueError("ranking_weight cannot be negative")
-    # 当前正式实验关闭 ranking。权重为 0 时直接跳过 O(B^2) pairwise 计算，
-    # 同时保留返回字段，保证训练日志和旧调用接口兼容。
     if ranking_weight == 0.0:
         ranking_loss = prediction.new_zeros(())
     else:
@@ -1020,39 +1488,61 @@ def compute_progress_loss(
             temperature=ranking_temperature,
             episode_ids=episode_ids,
         )
-    # 两项正式监督和一项可选监督的语义：
-    # 1. alignment_loss 让 [B,53] 分布集中在目标帧附近（sigma=2 的软标签）；
-    # 2. regression_loss 约束分布期望得到的连续 Progress；
-    # 3. ranking_loss 是可选项，权重为 0 时不参与当前实验。
-    # total_loss 是标量：53-bin 对齐交叉熵 + 连续 Progress Smooth-L1 + 可选排序损失。
     total_loss = (
-        alignment_loss
-        + float(regression_weight) * regression_loss
+        weights["alignment_weight"] * alignment_loss
+        + weights["joint_weight"] * joint_loss
+        + weights["regression_weight"] * absolute_loss
+        + weights["delta_weight"] * delta_loss
         + ranking_weight * ranking_loss
     )
-    # target_frame: [B]，把归一化 GT 重新换算为 0...52 的连续帧号，仅用于日志指标。
     target_frame = target * float(logits.shape[1] - 1)
-    # expected_frame: [B]；正常由模型直接返回，fallback 与 prediction*52 等价。
     expected_frame = outputs.get(
         "expected_frame", prediction * float(logits.shape[1] - 1)
     ).float()
-    # matched_frame: [B] float；正常是 argmax 离散帧号，fallback 从 logits 现场计算。
     matched_frame = outputs.get("matched_frame", logits.argmax(dim=-1)).float()
-    return {
-        # 以下四项均为可反向/记录的标量 loss。
+    result = {
         "total_loss": total_loss,
         "alignment_loss": alignment_loss,
-        "regression_loss": regression_loss,
+        "joint_loss": joint_loss,
+        "absolute_loss": absolute_loss,
+        # Backward-compatible logging name used by archived training reports.
+        "regression_loss": absolute_loss,
+        "delta_loss": delta_loss,
         "ranking_loss": ranking_loss,
-        # 连续 Progress MAE/RMSE：标量，只用于日志，所以 detach。
         "mae": (prediction - target).abs().mean().detach(),
         "rmse": (prediction - target).pow(2).mean().sqrt().detach(),
-        # 期望帧号和 argmax 帧号相对连续 GT 帧号的 MAE：标量。
         "expected_frame_mae": (expected_frame - target_frame).abs().mean().detach(),
         "matched_frame_mae": (matched_frame - target_frame).abs().mean().detach(),
-        # 每个 query 先判断 argmax 是否落在 GT 帧号 ±1 内，得到 [B] bool，再转 float 求均值。
         "matched_within_one": ((matched_frame - target_frame).abs() <= 1.0)
         .float()
         .mean()
         .detach(),
     }
+    if previous_prediction is not None and previous_target_value is not None:
+        assert delta_prediction is not None
+        target_delta = target - previous_target_value
+        predicted_direction = outputs["direction_probabilities"].argmax(dim=-1) - 1
+        target_direction = target_delta.sign().long()
+        non_stay = target_direction != 0
+        wrong_direction_rate = (
+            (predicted_direction[non_stay] * target_direction[non_stay] < 0)
+            .float()
+            .mean()
+            if bool(non_stay.any())
+            else prediction.new_zeros(())
+        )
+        result.update(
+            {
+                "previous_mae": (previous_prediction - previous_target_value)
+                .abs()
+                .mean()
+                .detach(),
+                "delta_mae": (delta_prediction - target_delta).abs().mean().detach(),
+                "direction_accuracy": (predicted_direction == target_direction)
+                .float()
+                .mean()
+                .detach(),
+                "wrong_direction_rate": wrong_direction_rate.detach(),
+            }
+        )
+    return result
