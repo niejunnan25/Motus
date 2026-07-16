@@ -1,0 +1,63 @@
+common:
+  num_video_frames: 16
+  tail_condition_frames: 1
+  conditioning_mode: "v1_mask_endpoint"
+  mask_channels: 4
+  video_height: 256
+  video_width: 256
+  global_downsample_rate: 1
+
+dataset:
+  type: "video_bridge"
+  dataset_dir:
+    - "/mnt/workspace1/users/niejunnan/datasets/pusht_vgm_v1/train"
+  max_episodes: null
+  require_language_embedding: false
+  data_format: "video"
+  view_layout: "single"
+  video_extensions: [".mp4"]
+  cache_scan: true
+  bridge_sampling_mode: "full_episode_uniform"
+  bridge_sampling_jitter: true
+
+training_mode: "vgm_bridge_stage1"
+
+model:
+  wan:
+    config_path: "/mnt/workspace/users/niejunnan/codebase/Motus/pretrained_models/Wan2.2-TI2V-5B"
+    checkpoint_path: "/mnt/workspace/users/niejunnan/codebase/Motus/pretrained_models/Wan2.2-TI2V-5B"
+    vae_path: "/mnt/workspace/users/niejunnan/codebase/Motus/pretrained_models/Wan2.2-TI2V-5B/Wan2.2_VAE.pth"
+    precision: "bfloat16"
+
+training:
+  batch_size: 2
+  gradient_accumulation_steps: 1
+  max_steps: 5000
+  learning_rate: 1.0e-5
+  weight_decay: 0.01
+  scheduler_type: "diffusers_cosine"
+  warmup_steps: 250
+  lr_schedule_steps: 5000
+  min_lr: 1.0e-6
+  grad_clip_norm: 0.5
+  use_amp: true
+  find_unused_parameters: false
+
+system:
+  checkpoint_dir: "/mnt/workspace1/users/niejunnan/codebase/Motus-pusht/checkpoints"
+  log_level: "INFO"
+  log_interval: 1
+  save_interval: 1000
+  val_interval: 1000000000
+  num_workers: 4
+  pin_memory: true
+
+logging:
+  report_to: "none"
+  wandb_project: "motus-pusht"
+  tensorboard_log_dir: "tensorboard_logs"
+  run_name: "vgm_bridge_pusht_v1_proper_256x256_17f_7gpu_gbs14_5k"
+
+resume:
+  checkpoint_path: null
+  reset_scheduler: false
