@@ -39,6 +39,7 @@ replay a generated path in the simulator, or explicitly score T-block orientatio
 - Repository worktree: `/Users/n/Documents/DreamZero/worktrees/Motus-pusht`
 - Branch: `codex/pusht-vgm-diversity`
 - Experiment base commit: `946e1ad8a04d1c103474f1beaa1efe7ffd4fd984`
+- PushT implementation/evaluation commit: `a534033`
 - Remote code: `/mnt/workspace1/users/niejunnan/codebase/Motus-pusht`
 - Training config: `configs/vgm_bridge_pusht_v1_proper_17f_7gpu_gbs14_5k.yaml`
 - Evaluation config: `configs/vgm_bridge_pusht_v1_proper_17f_eval.yaml`
