@@ -86,6 +86,11 @@ MV10 uses teacher-forced clean high-view trajectory context during training and 
 generated high-view trajectory during inference. This exposure gap is an explicit
 risk of the sequential baseline, not hidden by the implementation.
 
+MV9/MV10 context patches carry the same learned camera IDs as query tokens plus a
+fixed ordered token-position embedding before the zero-initialized cross-attention
+adapter. First/goal and generated-high context therefore remain camera- and
+position-addressable instead of becoming an unordered patch set.
+
 ## Training
 
 Use standard two-process DDP. Shared models use per-rank batch 4. Separate-Wan
@@ -215,11 +220,14 @@ change.
   per-rank batch 4, one synchronized optimizer update, loss `1.1132`, `11.29s`.
 - Real MV3 channel-fusion smoke expanded Wan input/output to `196/96` channels and
   completed a synchronized update with loss `1.1766` in `10.97s`.
-- Real MV10 sequential high-to-wrist smoke completed a synchronized update with
-  loss `1.1132` in `14.06s`.
+- Second-review MV9 endpoint-context smoke, with explicit context camera/position
+  identity, completed a synchronized update with loss `1.0315` in `10.94s`.
+- Second-review MV10 sequential high-to-wrist smoke, with explicit context
+  camera/position identity, completed a synchronized update with loss `1.0315`
+  in `11.48s`.
 - Standard DDP separate MV7: approximately 10.016B trainable parameters, two H200
   GPUs, per-rank batch 1 with accumulation 4, synchronized update passed, loss
   `1.3811`, approximately `11.41s`.
-- Final review: `144 passed`, including strict checkpoint state round trips, the
-  explicit 53-frame contact-sheet regression, and CUDA forward/backward/sampling
-  coverage for all native-view modes.
+- Second review: `154 passed`, including complete multi-view cache write/reuse,
+  strict checkpoint state round trips, the explicit 53-frame contact-sheet
+  regression, and CUDA forward/backward/sampling coverage for all native-view modes.

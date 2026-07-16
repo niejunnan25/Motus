@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 import sys
 from pathlib import Path
-from typing import Any, Iterable, Optional, Sequence
+from typing import Iterable, Optional, Sequence
 
 import torch
 import torch.nn as nn
@@ -467,6 +467,46 @@ class MultiViewWanRunner(nn.Module):
         temporal_indices = [0] if grid_t == 1 else [0, grid_t - 1]
         return tokens[:, :, temporal_indices].reshape(batch_size, -1, hidden_dim)
 
+    def _context_tokens_with_identity(
+        self,
+        tokens: torch.Tensor,
+        grid_sizes: torch.Tensor,
+        *,
+        view_offset: int = 0,
+    ) -> torch.Tensor:
+        """Attach camera identity and a fixed ordered token position to raw context patches."""
+        if tokens.ndim != 4:
+            raise ValueError(
+                f"Context tokens must be [B,V,L,D], got {tuple(tokens.shape)}"
+            )
+        _, num_views, seq_len, hidden_dim = tokens.shape
+        grid_t, grid_h, grid_w = self._uniform_grid(grid_sizes)
+        if seq_len != grid_t * grid_h * grid_w:
+            raise ValueError(
+                f"Context token length {seq_len} does not match grid "
+                f"{(grid_t, grid_h, grid_w)}"
+            )
+        if hidden_dim % 2 != 0:
+            raise ValueError(
+                f"Context positional embedding requires an even hidden size, got {hidden_dim}"
+            )
+        if view_offset < 0 or view_offset + num_views > self.num_views:
+            raise ValueError(
+                f"Context view_offset={view_offset} with {num_views} views exceeds "
+                f"the configured {self.num_views} views"
+            )
+        positions = torch.arange(seq_len, device=tokens.device)
+        position_embedding = sinusoidal_embedding_1d(hidden_dim, positions).to(
+            device=tokens.device,
+            dtype=tokens.dtype,
+        )
+        view_embedding = self.view_embedding[
+            view_offset : view_offset + num_views
+        ].view(1, num_views, 1, hidden_dim)
+        return tokens + view_embedding + position_embedding.view(
+            1, 1, seq_len, hidden_dim
+        )
+
     @staticmethod
     def _head_unpatchify(
         wan_model: nn.Module,
@@ -512,6 +552,7 @@ class MultiViewWanRunner(nn.Module):
         token_residual: Optional[torch.Tensor] = None,
         context_inputs: Optional[torch.Tensor] = None,
         view_offset: int = 0,
+        context_view_offset: int = 0,
         wan_models: Optional[Sequence[nn.Module]] = None,
     ) -> torch.Tensor:
         separate_models = list(wan_models) if wan_models is not None else None
@@ -567,6 +608,11 @@ class MultiViewWanRunner(nn.Module):
         if context_inputs is not None:
             context_tokens, context_grids = self._patchify(wan_model, context_inputs)
             context_grid = self._uniform_grid(context_grids)
+            context_tokens = self._context_tokens_with_identity(
+                context_tokens,
+                context_grids,
+                view_offset=context_view_offset,
+            )
             if self.mode == "endpoint_scene_context":
                 context_tokens = self._select_endpoint_tokens(context_tokens, context_grid)
             else:

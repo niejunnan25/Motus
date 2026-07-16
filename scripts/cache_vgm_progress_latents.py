@@ -335,6 +335,7 @@ def cache_episode(
     episode_index: int,
     cache_dir: Path,
     config: Any,
+    vgm_config: Any,
     overwrite: bool,
 ) -> Dict[str, Any]:
     metadata = dataset.get_episode_metadata(episode_index)
@@ -411,6 +412,19 @@ def cache_episode(
             if isinstance(sample_output, dict)
             else None
         )
+        if model.uses_separate_views and (
+            not isinstance(sample_output, dict)
+            or sample_output.get("rgb_video") is None
+        ):
+            raise RuntimeError(
+                "Native multi-view Stage 1 sampling must return rgb_video so the Progress "
+                "cache does not add a lossy composite VAE decode"
+            )
+        if model.uses_separate_views and trajectory_view_latent is None:
+            raise RuntimeError(
+                "Native multi-view Stage 1 sampling must return view_latent for provenance "
+                "and future native-view Progress replay"
+            )
         if trajectory_view_latent is not None:
             if trajectory_view_latent.ndim != 6:
                 raise RuntimeError(
@@ -766,6 +780,7 @@ def main() -> None:
                 episode_index=episode_index,
                 cache_dir=cache_dir,
                 config=config,
+                vgm_config=vgm_config,
                 overwrite=args.overwrite,
             )
             entries.append(entry)

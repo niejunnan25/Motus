@@ -10,7 +10,11 @@ from torch.utils.data import RandomSampler
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from train import train_vgm_bridge_stage1
-from train.train_vgm_bridge_stage1 import VGMBridgeStage1Trainer, create_train_dataloader
+from train.train_vgm_bridge_stage1 import (
+    VGMBridgeStage1Trainer,
+    _average_accumulated_metrics,
+    create_train_dataloader,
+)
 
 
 class _InnerModel(torch.nn.Module):
@@ -64,6 +68,21 @@ class _CountingScheduler:
 
     def step(self) -> None:
         self.step_count += 1
+
+
+def test_accumulated_metrics_use_per_metric_presence_counts() -> None:
+    metrics = _average_accumulated_metrics(
+        {
+            "total_loss": torch.tensor(6.0),
+            "grad_norm": torch.tensor(3.0),
+        },
+        {
+            "total_loss": 3,
+            "grad_norm": 1,
+        },
+    )
+    assert metrics["total_loss"].item() == 2.0
+    assert metrics["grad_norm"].item() == 3.0
 
 
 def test_trainer_forward_uses_distributed_wrapper(tmp_path: Path) -> None:

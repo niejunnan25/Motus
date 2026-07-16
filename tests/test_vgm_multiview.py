@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 import torch.nn as nn
+from omegaconf import OmegaConf
 from PIL import Image
 
 from data.video_bridge.video_bridge_dataset import VideoBridgeDataset, video_bridge_collate_fn
@@ -18,7 +19,7 @@ from models.vgm_multiview import (
     SEPARATE_VIEW_MODES,
     matched_control_bottleneck_dim,
 )
-from scripts.cache_vgm_progress_latents import sampled_trajectory_frames
+from scripts.cache_vgm_progress_latents import cache_episode, sampled_trajectory_frames
 from train.eval_vgm_bridge_stage1 import (
     cross_view_motion_sync_metrics,
     multiview_pixel_metrics,
@@ -31,6 +32,7 @@ from train.eval_vgm_bridge_stage1 import (
 )
 from utils.config_utils import load_config_with_base
 from wan.utils.fm import FlowMatchScheduler
+from train.train_vgm_bridge_stage1 import validate_multiview_experiment_config
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -67,6 +69,7 @@ def test_multiview_config_matrix_resolves_complete_configs() -> None:
     resolved_modes = set()
     for path in configs:
         config = load_config_with_base(path)
+        validate_multiview_experiment_config(config)
         resolved_modes.add(str(config.common.multiview_mode))
         assert int(config.common.num_video_frames) == 52
         assert int(config.training.max_steps) == 50004
@@ -82,6 +85,33 @@ def test_multiview_config_matrix_resolves_complete_configs() -> None:
         )
         assert str(config.dataset.view_layout) == str(config.common.multiview_output_layout)
     assert resolved_modes == expected_modes
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        (
+            "dataset.image_columns",
+            ["observation.images.image2", "observation.images.image"],
+        ),
+        ("dataset.data_format", "lerobot_v2"),
+        ("dataset.load_state", True),
+        ("dataset.load_role_mask", True),
+        ("common.state_condition_mode", "first"),
+        ("common.interaction_loss_enabled", True),
+        ("common.role_mask_training_mode", "rgb_weight"),
+    ],
+)
+def test_controlled_multiview_config_rejects_confounded_supervision(
+    key: str,
+    value: object,
+) -> None:
+    config = load_config_with_base(
+        ROOT / "configs" / "vgm_bridge_mv7_cross_view_attention_53f.yaml"
+    )
+    OmegaConf.update(config, key, value, merge=False)
+    with pytest.raises(ValueError):
+        validate_multiview_experiment_config(config)
 
 
 def test_dataset_collate_preserves_camera_dimension() -> None:
@@ -328,6 +358,31 @@ def test_endpoint_context_uses_only_independently_encoded_boundaries() -> None:
     assert torch.equal(context[:, :, :, 0:1], condition[:, :, :, 0:1])
     assert torch.equal(context[:, :, :, -1:], endpoint)
     assert torch.count_nonzero(context[:, :, :, 1:-1]) == 0
+
+
+def test_context_tokens_preserve_camera_and_order_identity() -> None:
+    runner = MultiViewWanRunner(
+        mode="endpoint_scene_context",
+        num_views=2,
+        hidden_dim=32,
+        adapter_dim=16,
+        adapter_heads=4,
+        layer_indices=[0],
+        num_scene_tokens=2,
+        capacity_mode="shared",
+    )
+    with torch.no_grad():
+        runner.view_embedding.zero_()
+        runner.view_embedding[1, 0] = 3.0
+    tokens = torch.zeros(1, 2, 8, 32)
+    grids = torch.tensor([[[2, 2, 2], [2, 2, 2]]])
+    identified = runner._context_tokens_with_identity(tokens, grids)
+
+    assert not torch.equal(identified[:, :, 0], identified[:, :, -1])
+    assert torch.allclose(
+        identified[:, 1, :, 0] - identified[:, 0, :, 0],
+        torch.full((1, 8), 3.0),
+    )
 
 
 def test_consistency_loss_rewards_same_stage_pairing() -> None:
@@ -829,3 +884,128 @@ def test_progress_cache_prefers_direct_multiview_decode() -> None:
         expected_frames=5,
     )
     assert torch.equal(frames, direct[0])
+
+
+def test_progress_cache_episode_writes_and_revalidates_multiview_metadata(
+    tmp_path: Path,
+) -> None:
+    class FakeVideoModel:
+        @staticmethod
+        def encode_video(pixels: torch.Tensor) -> torch.Tensor:
+            pooled = torch.nn.functional.adaptive_avg_pool3d(
+                pixels.mean(dim=1, keepdim=True),
+                (1, 2, 1),
+            )
+            return pooled.repeat(1, 4, 1, 1, 1)
+
+    class FakeModel:
+        uses_separate_views = True
+        predict_role_mask = False
+        role_mask_fusion_mode = "none"
+        device = torch.device("cpu")
+        dtype = torch.float32
+        video_model = FakeVideoModel()
+
+        def __init__(self) -> None:
+            self.sample_calls = 0
+
+        def sample_bridge(self, **_: object) -> dict[str, torch.Tensor]:
+            self.sample_calls += 1
+            return {
+                "rgb_latent": torch.zeros(1, 4, 2, 2, 1),
+                "view_latent": torch.zeros(1, 2, 4, 2, 1, 1),
+                "rgb_video": torch.linspace(0.0, 1.0, 5).view(1, 5, 1, 1, 1).expand(
+                    1, 5, 3, 4, 2
+                ),
+            }
+
+    class FakeDataset:
+        @staticmethod
+        def get_episode_metadata(_episode_index: int) -> dict[str, object]:
+            return {
+                "episode_name": "task_0/episode_0",
+                "episode_index": 0,
+                "task_index": 0,
+                "root": "/fake/dataset",
+            }
+
+        @staticmethod
+        def get_episode_frame_count(_episode_index: int) -> int:
+            return 5
+
+        @staticmethod
+        def load_episode_language_embedding(_episode_index: int) -> None:
+            return None
+
+        @staticmethod
+        def load_episode_frames(
+            _episode_index: int,
+            indices: list[int],
+        ) -> torch.Tensor:
+            values = torch.tensor(indices, dtype=torch.float32).view(-1, 1, 1, 1) / 4.0
+            return values.expand(-1, 3, 4, 2).clone()
+
+        @staticmethod
+        def load_episode_view_frames(
+            _episode_index: int,
+            indices: list[int],
+        ) -> torch.Tensor:
+            values = torch.tensor(indices, dtype=torch.float32).view(-1, 1, 1, 1, 1) / 4.0
+            return values.expand(-1, 2, 3, 2, 2).clone()
+
+    config = OmegaConf.create(
+        {
+            "source": {
+                "vgm_config": "configs/vgm_bridge_mv7_cross_view_attention_53f.yaml",
+                "vgm_checkpoint": "/fake/checkpoint",
+            },
+            "cache": {
+                "current_frame_stride": 1,
+                "seed": 7,
+                "dtype": "float16",
+                "trajectory_frame_encode_batch_size": 2,
+                "current_encode_batch_size": 2,
+                "num_inference_steps": 2,
+                "validation_fraction": 0.1,
+            },
+            "progress_model": {"num_progress_bins": 5},
+        }
+    )
+    vgm_config = OmegaConf.create(
+        {
+            "common": {
+                "multiview_mode": "cross_view_attention",
+                "multiview_layout": "vertical",
+                "multiview_output_layout": "vertical",
+            }
+        }
+    )
+    model = FakeModel()
+    dataset = FakeDataset()
+
+    entry = cache_episode(
+        model=model,
+        dataset=dataset,
+        episode_index=0,
+        cache_dir=tmp_path,
+        config=config,
+        vgm_config=vgm_config,
+        overwrite=False,
+    )
+    payload = torch.load(tmp_path / entry["cache_file"], map_location="cpu", weights_only=False)
+    assert payload["multiview_mode"] == "cross_view_attention"
+    assert payload["trajectory_view_latent_included"] is True
+    assert payload["trajectory_frame_latents"].shape == (5, 4, 1, 2, 1)
+    assert model.sample_calls == 1
+
+    repeated_entry = cache_episode(
+        model=model,
+        dataset=dataset,
+        episode_index=0,
+        cache_dir=tmp_path,
+        config=config,
+        vgm_config=vgm_config,
+        overwrite=False,
+    )
+    assert repeated_entry == entry
+    assert model.sample_calls == 1

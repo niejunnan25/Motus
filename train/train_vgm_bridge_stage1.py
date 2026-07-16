@@ -99,11 +99,17 @@ def validate_multiview_experiment_config(config: OmegaConf) -> None:
         )
     if not bool(config.dataset.get("require_language_embedding", False)):
         raise ValueError("Controlled multi-view experiments require task language embeddings")
+    if str(config.dataset.get("data_format", "")) != "lerobot_v3_video":
+        raise ValueError(
+            "Controlled multi-view experiments require data_format='lerobot_v3_video'"
+        )
     image_columns = list(config.dataset.get("image_columns", []))
     view_names = list(config.dataset.get("view_names", []))
-    if len(image_columns) != num_views:
+    expected_columns = ["observation.images.image", "observation.images.image2"]
+    if image_columns != expected_columns:
         raise ValueError(
-            f"Controlled multi-view configs require {num_views} image columns, got {image_columns}"
+            "Controlled LIBERO image order must be high then wrist: "
+            f"expected {expected_columns}, got {image_columns}"
         )
     if len(view_names) != num_views:
         raise ValueError(
@@ -112,6 +118,27 @@ def validate_multiview_experiment_config(config: OmegaConf) -> None:
     if [str(name) for name in view_names] != ["high", "wrist"]:
         raise ValueError(
             f"Controlled LIBERO view order must be ['high', 'wrist'], got {view_names}"
+        )
+    if str(config.common.get("state_condition_mode", "none")) != "none" or bool(
+        config.dataset.get("load_state", False)
+    ):
+        raise ValueError(
+            "Controlled multi-view architecture ablations must not use robot state"
+        )
+    if bool(config.common.get("interaction_loss_enabled", False)):
+        raise ValueError(
+            "Controlled multi-view architecture ablations must not use interaction-weighted loss"
+        )
+    role_settings = (
+        str(config.common.get("role_mask_fusion_mode", "none")),
+        str(config.common.get("role_mask_training_mode", "legacy")),
+        str(config.common.get("role_mask_condition_mode", "legacy")),
+        bool(config.dataset.get("load_role_mask", False)),
+    )
+    if role_settings != ("none", "legacy", "legacy", False):
+        raise ValueError(
+            "Controlled multi-view architecture ablations require RoleMask to be fully disabled; "
+            f"got fusion/training/condition/load={role_settings}"
         )
     return_separate = bool(config.dataset.get("return_separate_views", False))
     if return_separate != (mode in SEPARATE_VIEW_MODES):
@@ -147,6 +174,25 @@ def validate_multiview_experiment_config(config: OmegaConf) -> None:
             f"Composite video size must be {(expected_h, expected_w)} for {num_views} "
             f"{view_size} views in {layout} layout, got {actual_size}"
         )
+
+
+def _average_accumulated_metrics(
+    metric_sums: Dict[str, torch.Tensor],
+    metric_counts: Dict[str, int],
+) -> Dict[str, torch.Tensor]:
+    """Average metrics by their own presence count across accumulation micro-steps."""
+    if set(metric_sums) != set(metric_counts):
+        raise ValueError(
+            "Metric sums/counts have different keys: "
+            f"sums={sorted(metric_sums)}, counts={sorted(metric_counts)}"
+        )
+    invalid = {key: count for key, count in metric_counts.items() if count < 1}
+    if invalid:
+        raise ValueError(f"Metric counts must be positive, got {invalid}")
+    return {
+        key: value / float(metric_counts[key])
+        for key, value in metric_sums.items()
+    }
 
 
 def collect_git_provenance(repo_root: Path) -> Dict[str, Any]:
@@ -593,7 +639,7 @@ class VGMBridgeStage1Trainer:
         optimizer_step_start = start_time
         data_iter = iter(self.train_dataloader)
         accumulated_metrics: Dict[str, torch.Tensor] = {}
-        accumulated_micro_steps = 0
+        accumulated_metric_counts: Dict[str, int] = {}
 
         while self.global_step < max_steps:
             try:
@@ -613,22 +659,22 @@ class VGMBridgeStage1Trainer:
                 accumulated_metrics[key] = (
                     accumulated_metrics.get(key, torch.zeros_like(value)) + value
                 )
-            accumulated_micro_steps += 1
+                accumulated_metric_counts[key] = accumulated_metric_counts.get(key, 0) + 1
 
             if self.accelerator is not None and not self.accelerator.sync_gradients:
                 continue
 
-            metrics = {
-                key: value / float(accumulated_micro_steps)
-                for key, value in accumulated_metrics.items()
-            }
+            metrics = _average_accumulated_metrics(
+                accumulated_metrics,
+                accumulated_metric_counts,
+            )
             if self.accelerator is not None and self.world_size > 1:
                 metrics = {
                     key: self.accelerator.reduce(value, reduction="mean")
                     for key, value in metrics.items()
                 }
             accumulated_metrics = {}
-            accumulated_micro_steps = 0
+            accumulated_metric_counts = {}
 
             step_time = time.time() - optimizer_step_start
             optimizer_step_start = time.time()

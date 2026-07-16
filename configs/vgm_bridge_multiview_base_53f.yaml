@@ -22,6 +22,14 @@ common:
   multiview_consistency_temperature: 0.07
   multiview_consistency_projection_dim: 128
 
+  # Keep the matrix structural: no state, RoleMask, or interaction-loss supervision.
+  state_condition_mode: "none"
+  interaction_loss_enabled: false
+  role_mask_fusion_mode: "none"
+  # Legacy + no fusion is the established RGB-only path in VGMBridgeStage1.
+  role_mask_training_mode: "legacy"
+  role_mask_condition_mode: "legacy"
+
 dataset:
   type: "video_bridge"
   dataset_dir:
@@ -34,6 +42,8 @@ dataset:
   view_names: ["high", "wrist"]
   view_layout: "vertical"
   return_separate_views: false
+  load_state: false
+  load_role_mask: false
   view_video_size: [224, 224]
   video_extensions: [".mp4"]
   cache_scan: false

@@ -8,12 +8,11 @@ import contextlib
 import json
 import logging
 import math
-import os
 import re
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence
 
 import torch
 from omegaconf import OmegaConf
@@ -28,6 +27,9 @@ from models.progress_stage2 import (
     compute_progress_loss,
 )
 from utils.config_utils import load_config_with_base
+
+if TYPE_CHECKING:
+    from accelerate import Accelerator
 
 logger = logging.getLogger(__name__)
 

@@ -5,10 +5,8 @@ import torch
 import torch.nn as nn
 from typing import List, Optional, Dict, Any
 import logging
-import sys
 import os
 import json
-from pathlib import Path
 
 from wan.modules.model import WanModel, sinusoidal_embedding_1d
 from wan.modules.vae2_2 import Wan2_2_VAE
@@ -289,7 +287,7 @@ class WanVideoModel(nn.Module):
                 if incompatible_keys.unexpected_keys:
                     logger.warning(f"Unexpected keys: {incompatible_keys.unexpected_keys}")
                 
-                logger.info(f"Successfully loaded WAN weights from .pt file")
+                logger.info("Successfully loaded WAN weights from .pt file")
             elif checkpoint_path.endswith('.bin') or checkpoint_path.endswith('.safetensors'):
                 # Single-file HF-style weight
                 logger.info(f"Loading weights from weight file: {checkpoint_path}")
@@ -318,8 +316,8 @@ class WanVideoModel(nn.Module):
             else:
                 # Directory-based loading (original diffusers format)
                 loaded_model = WanModel.from_pretrained(checkpoint_path)
-                model.wan_model.load_state_dict(loaded_model.state_dict(), strict=False)
-                logger.info(f"Successfully loaded WAN weights from directory")
+                model.wan_model.load_state_dict(loaded_model.state_dict(), strict=True)
+                logger.info("Successfully loaded WAN weights from directory")
                 
         except Exception as e:
             raise RuntimeError(
