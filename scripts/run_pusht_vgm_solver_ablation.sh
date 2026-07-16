@@ -10,8 +10,8 @@ checkpoint=$1
 output_root=${2:-eval_outputs/pusht_vgm_multimodal}
 python_bin=/mnt/workspace/users/niejunnan/envs/motus/bin/python
 config=configs/vgm_bridge_pusht_v1_proper_17f_eval.yaml
-steps=(55 50 20 10 4 1)
-gpus=(0 1 2 3 4 5)
+steps=(50 20 10 4 1)
+gpus=(0 1 2 3 4)
 pids=()
 
 mkdir -p "${output_root}/logs"

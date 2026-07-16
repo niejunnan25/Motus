@@ -6,39 +6,24 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-import math
-from collections import Counter
-from itertools import combinations
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Sequence
+from typing import Any, Dict, List, Sequence
 
 import matplotlib.pyplot as plt
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
+from pusht_trajectory_metrics import (
+    generated_approach_mode,
+    label_entropy,
+    pairwise_path_rms,
+)
 
 # The primary metric requires both rendered entities in at least 16/17 frames.
 # This post-hoc secondary diagnostic asks a narrower task question: did the T
 # block reach its goal while the pusher remained observable for most of the path?
 TASK_PUSHER_MIN_DETECTION_RATE = 12.0 / 17.0
 TASK_BLOCK_MIN_DETECTION_RATE = 16.0 / 17.0
-
-
-def pairwise_rms(paths: Sequence[np.ndarray]) -> float:
-    distances = []
-    for left, right in combinations(paths, 2):
-        finite = np.isfinite(left).all(axis=-1) & np.isfinite(right).all(axis=-1)
-        if finite.any():
-            distances.append(float(np.sqrt(np.mean((left[finite] - right[finite]) ** 2))))
-    return float(np.mean(distances)) if distances else float("nan")
-
-
-def entropy(labels: Iterable[str]) -> float:
-    counts = np.asarray(list(Counter(labels).values()), dtype=np.float64)
-    if not len(counts):
-        return 0.0
-    probability = counts / counts.sum()
-    return float(-(probability * np.log(probability)).sum())
 
 
 def read_json(path: Path) -> Any:
@@ -131,8 +116,17 @@ def summarize_condition(step_dir: Path, rows: List[Dict[str, Any]]) -> Dict[str,
 
     strict_samples = [sample for sample in samples if bool(sample[0]["valid"])]
     task_samples = [sample for sample in samples if bool(sample[2]["valid"])]
-    strict_sectors = [str(row["approach_sector"]) for row, _, _ in strict_samples]
-    task_sectors = [str(row["approach_sector"]) for row, _, _ in task_samples]
+    def mode(tracks: Any) -> str:
+        result = generated_approach_mode(
+            tracks["pred_pusher_xy"],
+            tracks["pred_block_xy"],
+            tracks["pred_surface_distance"],
+            contact_distance_max=float(thresholds["moving_contact_distance_max"]),
+        )
+        return str(result["sector"])
+
+    strict_sectors = [mode(tracks) for _, tracks, _ in strict_samples]
+    task_sectors = [mode(tracks) for _, tracks, _ in task_samples]
     return {
         "condition_number": int(rows[0]["condition_number"]),
         "episode_name": rows[0]["episode_name"],
@@ -142,11 +136,11 @@ def summarize_condition(step_dir: Path, rows: List[Dict[str, Any]]) -> Dict[str,
         "valid_samples": len(strict_samples),
         "valid_rate": float(len(strict_samples) / len(rows)),
         "valid_mode_count": len(set(strict_sectors)),
-        "valid_mode_entropy": entropy(strict_sectors),
-        "pusher_pairwise_rms": pairwise_rms(
+        "valid_mode_entropy": label_entropy(strict_sectors),
+        "pusher_pairwise_rms": pairwise_path_rms(
             [tracks["pred_pusher_xy"] for _, tracks, _ in strict_samples]
         ),
-        "block_pairwise_rms": pairwise_rms(
+        "block_pairwise_rms": pairwise_path_rms(
             [tracks["pred_block_xy"] for _, tracks, _ in strict_samples]
         ),
         "strict_valid_samples": len(strict_samples),
@@ -154,11 +148,11 @@ def summarize_condition(step_dir: Path, rows: List[Dict[str, Any]]) -> Dict[str,
         "task_valid_samples": len(task_samples),
         "task_valid_rate": float(len(task_samples) / len(rows)),
         "task_valid_mode_count": len(set(task_sectors)),
-        "task_valid_mode_entropy": entropy(task_sectors),
-        "task_pusher_pairwise_rms": pairwise_rms(
+        "task_valid_mode_entropy": label_entropy(task_sectors),
+        "task_pusher_pairwise_rms": pairwise_path_rms(
             [tracks["pred_pusher_xy"] for _, tracks, _ in task_samples]
         ),
-        "task_block_pairwise_rms": pairwise_rms(
+        "task_block_pairwise_rms": pairwise_path_rms(
             [tracks["pred_block_xy"] for _, tracks, _ in task_samples]
         ),
         "mean_block_goal_error": float(
@@ -290,8 +284,6 @@ def plot_pareto(rows: Sequence[Dict[str, Any]], output_path: Path) -> None:
         y_offset = 6
         if row["num_inference_steps"] == 50:
             y_offset = -18
-        elif row["num_inference_steps"] == 55:
-            y_offset = 10
         axis.annotate(
             f"{row['num_inference_steps']} steps",
             (row["task_pusher_pairwise_rms"], row["task_valid_rate"]),
@@ -396,14 +388,28 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input_root", required=True, help="directory containing steps_* evaluator outputs")
     parser.add_argument("--output_dir", required=True)
+    parser.add_argument(
+        "--steps",
+        default="1,4,10,20,50",
+        help="comma-separated solver steps to include; formal protocol is capped at 50",
+    )
     args = parser.parse_args()
 
     input_root = Path(args.input_root)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    step_dirs = sorted(path for path in input_root.glob("steps_*") if (path / "sample_metrics.json").exists())
+    selected_steps = {int(value.strip()) for value in args.steps.split(",") if value.strip()}
+    if not selected_steps or max(selected_steps) > 50:
+        raise ValueError(f"formal solver steps must be non-empty and <= 50, got {sorted(selected_steps)}")
+    all_step_dirs = sorted(
+        path for path in input_root.glob("steps_*") if (path / "sample_metrics.json").exists()
+    )
+    step_dirs = [path for path in all_step_dirs if int(path.name.split("_")[-1]) in selected_steps]
     if not step_dirs:
         raise FileNotFoundError(f"No complete steps_* runs under {input_root}")
+    excluded_steps = sorted(
+        int(path.name.split("_")[-1]) for path in all_step_dirs if path not in step_dirs
+    )
 
     condition_rows = []
     for step_dir in step_dirs:
@@ -417,6 +423,16 @@ def main() -> None:
         json.dump(step_rows, file, indent=2)
     write_csv(output_dir / "condition_summary.csv", condition_rows)
     write_csv(output_dir / "step_summary.csv", step_rows)
+    with (output_dir / "summary_manifest.json").open("w") as file:
+        json.dump(
+            {
+                "included_steps": sorted(selected_steps),
+                "excluded_available_steps": excluded_steps,
+                "maximum_formal_step": max(selected_steps),
+            },
+            file,
+            indent=2,
+        )
     plot_step_metrics(step_rows, output_dir / "solver_step_metrics.png")
     plot_pareto(step_rows, output_dir / "validity_diversity_pareto.png")
 

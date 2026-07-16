@@ -31,6 +31,7 @@ from scipy.ndimage import distance_transform_edt
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 from train.eval_vgm_bridge_stage1 import build_dataset, build_model, tensor_to_uint8
+from scripts.pusht_trajectory_metrics import generated_approach_mode
 
 
 LOGGER = logging.getLogger(__name__)
@@ -145,17 +146,14 @@ def trajectory_features(tracks: Dict[str, np.ndarray]) -> Dict[str, float | str]
         moving_surface = np.asarray([], dtype=np.float32)
     distance = np.linalg.norm(pusher_xy - block_xy, axis=-1)
     finite_distance = np.flatnonzero(np.isfinite(distance))
-    if len(finite_distance):
-        closest_idx = int(finite_distance[np.argmin(distance[finite_distance])])
-        offset = pusher_xy[closest_idx] - block_xy[closest_idx]
-        angle = float(math.atan2(float(offset[1]), float(offset[0])))
-        sector_index = int(np.floor(((angle + math.pi) % (2 * math.pi)) / (math.pi / 2)))
-        sector = ("left-up", "right-up", "right-down", "left-down")[sector_index]
-        closest_distance = float(distance[closest_idx])
-    else:
-        closest_idx = -1
-        sector = "missing"
-        closest_distance = float("nan")
+    closest_distance = (
+        float(distance[finite_distance].min()) if len(finite_distance) else float("nan")
+    )
+    mode = generated_approach_mode(
+        pusher_xy,
+        block_xy,
+        tracks["surface_distance"],
+    )
 
     return {
         "pusher_detection_rate": float(np.isfinite(pusher_xy).all(axis=-1).mean()),
@@ -170,8 +168,10 @@ def trajectory_features(tracks: Dict[str, np.ndarray]) -> Dict[str, float | str]
             float(np.quantile(moving_surface, 0.90)) if len(moving_surface) else float("nan")
         ),
         "closest_pusher_block_distance": closest_distance,
-        "closest_frame": closest_idx,
-        "approach_sector": sector,
+        "closest_frame": int(mode["index"]),
+        "approach_sector": str(mode["sector"]),
+        "approach_sector_index": int(mode["sector_index"]),
+        "approach_from_contact": bool(mode["from_contact"]),
     }
 
 

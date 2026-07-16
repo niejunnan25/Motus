@@ -11,8 +11,12 @@ import matplotlib.pyplot as plt
 import numpy as np
 from scipy.spatial.distance import cdist
 
-
-SECTOR_NAMES = ("right", "down", "left", "up")
+from pusht_trajectory_metrics import (
+    SECTOR_NAMES,
+    endpoint_descriptor,
+    resample_path,
+    state_approach_mode,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -25,28 +29,6 @@ def parse_args() -> argparse.Namespace:
 
 def load_manifest(path: Path) -> list[dict]:
     return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
-
-
-def first_contact_index(n_contacts: np.ndarray, state: np.ndarray) -> int:
-    hits = np.flatnonzero(n_contacts.reshape(-1) > 0.5)
-    if hits.size:
-        return int(hits[0])
-    distances = np.linalg.norm(state[:, :2] - state[:, 2:4], axis=1)
-    return int(np.argmin(distances))
-
-
-def approach_sector(state: np.ndarray, n_contacts: np.ndarray) -> tuple[int, float]:
-    index = first_contact_index(n_contacts, state)
-    delta = state[index, :2] - state[index, 2:4]
-    angle = float(np.arctan2(delta[1], delta[0]))
-    sector = int(np.floor((angle + np.pi / 4.0) / (np.pi / 2.0))) % 4
-    return sector, angle
-
-
-def resample_path(path: np.ndarray, count: int = 64) -> np.ndarray:
-    source = np.linspace(0.0, 1.0, len(path))
-    target = np.linspace(0.0, 1.0, count)
-    return np.column_stack([np.interp(target, source, path[:, dim]) for dim in range(path.shape[1])])
 
 
 def normalized_nearest(descriptors: np.ndarray, neighbor_count: int) -> np.ndarray:
@@ -72,10 +54,6 @@ def normalized_cross_nearest(
     return np.argpartition(distances, neighbor_count - 1, axis=1)[:, :neighbor_count]
 
 
-def pose_descriptor(state: np.ndarray) -> np.ndarray:
-    return np.concatenate([state[:4], [np.sin(state[4]), np.cos(state[4])]])
-
-
 def main() -> None:
     args = parse_args()
     dataset_dir = args.dataset_dir.expanduser().resolve()
@@ -96,13 +74,16 @@ def main() -> None:
         payload = np.load(dataset_dir / row["metadata_path"])
         state = payload["state"].astype(np.float64)
         n_contacts = payload["n_contacts"].astype(np.float64)
-        sector, angle = approach_sector(state, n_contacts)
+        mode = state_approach_mode(state, n_contacts)
         relative_path = state[:, :2] - state[0, 2:4]
         descriptors.append(payload["start_descriptor"].astype(np.float64))
-        endpoint_descriptors.append(np.concatenate([pose_descriptor(state[0]), pose_descriptor(state[-1])]))
-        sectors.append(sector)
-        angles.append(angle)
-        canonical_paths.append(resample_path(relative_path))
+        endpoint_descriptors.append(endpoint_descriptor(state))
+        sectors.append(int(mode["sector_index"]))
+        angles.append(float(mode["angle"]))
+        canonical_path = resample_path(relative_path, count=64)
+        if canonical_path is None:
+            raise RuntimeError(f"episode {row['episode_name']} has fewer than two finite states")
+        canonical_paths.append(canonical_path)
         splits.append(row["split"])
         lengths.append(len(state))
 
