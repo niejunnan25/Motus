@@ -16,13 +16,21 @@ import cv2
 import numpy as np
 import torch
 
-
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png"}
 MODEL_COLORS = {
     "A0": (230, 96, 45),
     "A1": (45, 45, 230),
     "A2": (48, 166, 47),
     "A3": (210, 48, 148),
+    "A4": (38, 150, 190),
+    "Layerwise": (140, 90, 25),
+    "WVM": (140, 90, 25),
+    "B0": (48, 166, 47),
+    "B1": (220, 120, 35),
+    "B2": (165, 85, 210),
+    "B3": (200, 80, 135),
+    "B4": (45, 155, 175),
+    "B5": (75, 105, 215),
 }
 
 
@@ -34,13 +42,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--images_root", type=Path, required=True)
     parser.add_argument("--vae_path", type=Path, required=True)
     parser.add_argument("--output_dir", type=Path, required=True)
+    parser.add_argument(
+        "--manifest_name",
+        default="manifest.csv",
+        help="Per-process manifest filename; use unique names for parallel shards.",
+    )
     parser.add_argument("--models", nargs="+", default=["A2"])
     parser.add_argument("--episode_indices", nargs="*", type=int, default=[])
     parser.add_argument("--case_selection_csv", type=Path, default=None)
     parser.add_argument("--max_cases", type=int, default=None)
     parser.add_argument("--fps", type=float, default=15.0)
-    parser.add_argument("--width", type=int, default=1600)
-    parser.add_argument("--height", type=int, default=900)
+    parser.add_argument("--width", type=int, default=1920)
+    parser.add_argument("--height", type=int, default=1080)
     parser.add_argument("--crf", type=int, default=23)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--skip_existing", action="store_true")
@@ -65,7 +78,9 @@ def load_benchmark(path: Path) -> tuple[List[str], List[str]]:
     return [str(value) for value in episode_paths], [str(value) for value in task_texts]
 
 
-def load_progress_outputs(root: Path, models: Sequence[str]) -> Dict[str, Dict[str, Any]]:
+def load_progress_outputs(
+    root: Path, models: Sequence[str]
+) -> Dict[str, Dict[str, Any]]:
     outputs: Dict[str, Dict[str, Any]] = {}
     for model in models:
         path = root / model / "episode_outputs.pt"
@@ -201,6 +216,24 @@ def paste_letterboxed(
     cv2.rectangle(canvas, (x, y), (x + width, y + height), (185, 190, 198), 1)
 
 
+def paste_placeholder(
+    canvas: np.ndarray,
+    rect: tuple[int, int, int, int],
+    text: str,
+) -> None:
+    x, y, width, height = rect
+    canvas[y : y + height, x : x + width] = (232, 234, 238)
+    cv2.rectangle(canvas, (x, y), (x + width, y + height), (185, 190, 198), 1)
+    text_size = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.48, 1)[0]
+    put_text(
+        canvas,
+        text,
+        (x + max(8, (width - text_size[0]) // 2), y + height // 2),
+        scale=0.48,
+        color=(105, 108, 115),
+    )
+
+
 def chart_points(
     values: np.ndarray,
     rect: tuple[int, int, int, int],
@@ -232,7 +265,9 @@ def draw_progress_chart(
     for fraction in np.linspace(0.0, 1.0, 6):
         line_y = int(round(y + height - fraction * height))
         cv2.line(canvas, (x, line_y), (x + width, line_y), (224, 226, 230), 1)
-        put_text(canvas, f"{fraction:.1f}", (x + 4, max(y + 14, line_y - 3)), scale=0.38)
+        put_text(
+            canvas, f"{fraction:.1f}", (x + 4, max(y + 14, line_y - 3)), scale=0.38
+        )
     target_points = chart_points(target, rect)
     prediction_points = chart_points(prediction, rect)
     cv2.polylines(canvas, [target_points], False, (38, 38, 38), 2, cv2.LINE_AA)
@@ -241,9 +276,25 @@ def draw_progress_chart(
     cv2.line(canvas, (current_x, y), (current_x, y + height), (80, 80, 80), 1)
     cv2.circle(canvas, tuple(target_points[current]), 5, (38, 38, 38), -1)
     cv2.circle(canvas, tuple(prediction_points[current]), 5, model_color, -1)
-    put_text(canvas, "GT", (x + width - 105, y + 18), scale=0.42, color=(38, 38, 38), thickness=2)
-    put_text(canvas, "Pred", (x + width - 65, y + 18), scale=0.42, color=model_color, thickness=2)
-    put_text(canvas, "Progress over source episode", (x + 8, y - 8), scale=0.52, thickness=2)
+    put_text(
+        canvas,
+        "GT",
+        (x + width - 105, y + 18),
+        scale=0.42,
+        color=(38, 38, 38),
+        thickness=2,
+    )
+    put_text(
+        canvas,
+        "Pred",
+        (x + width - 65, y + 18),
+        scale=0.42,
+        color=model_color,
+        thickness=2,
+    )
+    put_text(
+        canvas, "Progress over source episode", (x + 8, y - 8), scale=0.52, thickness=2
+    )
 
 
 def alignment_heatmap(alignment: np.ndarray) -> np.ndarray:
@@ -274,7 +325,10 @@ def draw_alignment_chart(
         return px, py
 
     gt_points = np.asarray(
-        [point(index, float(target[index] * (num_slots - 1))) for index in range(num_queries)],
+        [
+            point(index, float(target[index] * (num_slots - 1)))
+            for index in range(num_queries)
+        ],
         dtype=np.int32,
     )
     match_points = np.asarray(
@@ -285,7 +339,9 @@ def draw_alignment_chart(
     cv2.polylines(canvas, [match_points], False, (255, 220, 30), 1, cv2.LINE_AA)
     current_y = point(current, 0.0)[1]
     cv2.line(canvas, (x, current_y), (x + width, current_y), (20, 20, 230), 2)
-    cv2.circle(canvas, point(current, float(argmax_slots[current])), 6, (20, 20, 230), -1)
+    cv2.circle(
+        canvas, point(current, float(argmax_slots[current])), 6, (20, 20, 230), -1
+    )
     cv2.rectangle(canvas, (x, y), (x + width, y + height), (170, 175, 182), 1)
     put_text(
         canvas,
@@ -294,7 +350,9 @@ def draw_alignment_chart(
         scale=0.48,
         thickness=2,
     )
-    put_text(canvas, "slot 0", (x + 4, y + height - 6), scale=0.38, color=(255, 255, 255))
+    put_text(
+        canvas, "slot 0", (x + 4, y + height - 6), scale=0.38, color=(255, 255, 255)
+    )
     put_text(
         canvas,
         f"slot {num_slots - 1}",
@@ -341,8 +399,69 @@ def draw_distribution(
     )
 
 
+def draw_joint_distribution(
+    canvas: np.ndarray,
+    rect: tuple[int, int, int, int],
+    probabilities: np.ndarray,
+    previous_gt_slot: float,
+    current_gt_slot: float,
+) -> None:
+    x, y, width, height = rect
+    maximum = max(float(probabilities.max()), 1e-12)
+    normalized = np.clip(probabilities / maximum, 0.0, 1.0)
+    heatmap = cv2.applyColorMap(
+        np.round(normalized * 255.0).astype(np.uint8),
+        cv2.COLORMAP_VIRIDIS,
+    )
+    resized = cv2.resize(heatmap, (width, height), interpolation=cv2.INTER_NEAREST)
+    canvas[y : y + height, x : x + width] = resized
+    num_previous, num_current = probabilities.shape
+
+    def point(previous_slot: float, current_slot: float) -> tuple[int, int]:
+        px = x + int(round(current_slot / max(1, num_current - 1) * (width - 1)))
+        py = y + int(round(previous_slot / max(1, num_previous - 1) * (height - 1)))
+        return px, py
+
+    flat_index = int(probabilities.argmax())
+    matched_previous, matched_current = np.unravel_index(
+        flat_index, probabilities.shape
+    )
+    cv2.circle(
+        canvas,
+        point(previous_gt_slot, current_gt_slot),
+        7,
+        (255, 255, 255),
+        2,
+    )
+    cv2.circle(
+        canvas,
+        point(float(matched_previous), float(matched_current)),
+        6,
+        (20, 20, 230),
+        -1,
+    )
+    cv2.rectangle(canvas, (x, y), (x + width, y + height), (170, 175, 182), 1)
+    put_text(
+        canvas,
+        "Joint P(previous,current): white=GT, red=MAP",
+        (x + 6, y - 8),
+        scale=0.45,
+        thickness=2,
+    )
+    put_text(
+        canvas,
+        "current slot ->",
+        (x + 6, y + height - 7),
+        scale=0.38,
+        color=(255, 255, 255),
+    )
+    put_text(canvas, "prev", (x + 5, y + 16), scale=0.38, color=(255, 255, 255))
+
+
 def wrap_header(text: str, width: int = 125) -> List[str]:
-    return textwrap.wrap(" ".join(text.split()), width=width, break_long_words=False)[:2]
+    return textwrap.wrap(" ".join(text.split()), width=width, break_long_words=False)[
+        :2
+    ]
 
 
 def render_frame(
@@ -354,6 +473,9 @@ def render_frame(
     episode_name: str,
     query_index: int,
     frame_index: int,
+    previous_frame_index: int | None,
+    previous_high_frame: np.ndarray | None,
+    previous_wrist_frame: np.ndarray | None,
     high_frame: np.ndarray,
     wrist_frame: np.ndarray,
     generated_frames: np.ndarray,
@@ -362,44 +484,61 @@ def render_frame(
     alignment: np.ndarray,
     heatmap: np.ndarray,
     argmax_slots: np.ndarray,
+    previous_target: np.ndarray | None = None,
+    previous_prediction: np.ndarray | None = None,
+    predicted_delta: np.ndarray | None = None,
+    direction_probabilities: np.ndarray | None = None,
+    pair_time_gaps: np.ndarray | None = None,
+    joint_probabilities: np.ndarray | None = None,
 ) -> np.ndarray:
-    if width < 1280 or height < 720:
-        raise ValueError("Video canvas must be at least 1280x720")
+    if width < 1600 or height < 900:
+        raise ValueError("Pair-aware video canvas must be at least 1600x900")
     canvas = np.full((height, width, 3), 245, dtype=np.uint8)
-    header_height = 74
+    header_height = 78
     canvas[:header_height] = (36, 42, 51)
-    header_lines = wrap_header(f"{episode_name} | {task_text}")
+    header_lines = wrap_header(
+        f"{model} | {episode_name} | {task_text}",
+        width=145,
+    )
     for line_index, line in enumerate(header_lines):
         put_text(
             canvas,
             line,
-            (18, 27 + line_index * 25),
-            scale=0.58,
+            (18, 29 + line_index * 27),
+            scale=0.62,
             color=(245, 245, 245),
-            thickness=1,
+            thickness=2 if line_index == 0 else 1,
         )
 
     margin = 18
-    top_y = header_height + 24
-    top_height = int(height * 0.43)
-    square_width = int(width * 0.155)
-    memory_width = int(width * 0.12)
-    gap = 14
+    top_y = header_height + 25
+    top_height = int(height * 0.30)
+    gap = 12
+    info_gap = 24
+    info_width = max(405, int(width * 0.225))
+    image_area_width = width - 2 * margin - info_gap - info_width
+    image_width = (image_area_width - 5 * gap) // 6
     image_rects = [
-        (margin, top_y, square_width, top_height),
-        (margin + square_width + gap, top_y, square_width, top_height),
-        (margin + 2 * (square_width + gap), top_y, memory_width, top_height),
-        (margin + 2 * (square_width + gap) + memory_width + gap, top_y, memory_width, top_height),
+        (margin + index * (image_width + gap), top_y, image_width, top_height)
+        for index in range(6)
     ]
 
     gt_slot_float = float(target[query_index] * (alignment.shape[1] - 1))
     gt_slot = int(np.clip(round(gt_slot_float), 0, generated_frames.shape[0] - 1))
     matched_slot = int(argmax_slots[query_index])
-    paste_letterboxed(canvas, high_frame, image_rects[0])
-    paste_letterboxed(canvas, wrist_frame, image_rects[1])
-    paste_letterboxed(canvas, generated_frames[gt_slot], image_rects[2])
-    paste_letterboxed(canvas, generated_frames[matched_slot], image_rects[3])
+    if previous_high_frame is None or previous_wrist_frame is None:
+        paste_placeholder(canvas, image_rects[0], "not used")
+        paste_placeholder(canvas, image_rects[1], "not used")
+    else:
+        paste_letterboxed(canvas, previous_high_frame, image_rects[0])
+        paste_letterboxed(canvas, previous_wrist_frame, image_rects[1])
+    paste_letterboxed(canvas, high_frame, image_rects[2])
+    paste_letterboxed(canvas, wrist_frame, image_rects[3])
+    paste_letterboxed(canvas, generated_frames[gt_slot], image_rects[4])
+    paste_letterboxed(canvas, generated_frames[matched_slot], image_rects[5])
     labels = [
+        "Previous high view",
+        "Previous wrist view",
         "Current high view",
         "Current wrist view",
         f"Time-label slot {gt_slot}",
@@ -408,7 +547,7 @@ def render_frame(
     for rect, label in zip(image_rects, labels):
         put_text(canvas, label, (rect[0], rect[1] - 7), scale=0.43, thickness=2)
 
-    info_x = image_rects[-1][0] + image_rects[-1][2] + 26
+    info_x = image_rects[-1][0] + image_rects[-1][2] + info_gap
     info_width = width - info_x - margin
     model_color = MODEL_COLORS.get(model, (70, 70, 210))
     error = abs(float(prediction[query_index] - target[query_index]))
@@ -418,7 +557,9 @@ def render_frame(
         else 0.0
     )
     probabilities = alignment[query_index]
-    entropy = -float(np.sum(probabilities * np.log(np.clip(probabilities, 1e-12, None))))
+    entropy = -float(
+        np.sum(probabilities * np.log(np.clip(probabilities, 1e-12, None)))
+    )
     top_slots = np.argsort(probabilities)[-5:][::-1]
     top_text = "  ".join(f"{slot}:{probabilities[slot]:.3f}" for slot in top_slots)
     lines = [
@@ -433,13 +574,34 @@ def render_frame(
         f"Alignment entropy: {entropy:.3f}",
         f"Top slots: {top_text}",
     ]
-    line_spacing = 23
+    if previous_frame_index is not None:
+        previous_text = f"Previous source frame: {previous_frame_index}"
+        if previous_target is not None:
+            previous_text += f"   GT={previous_target[query_index]:.4f}"
+        if previous_prediction is not None:
+            previous_text += f"   Pred={previous_prediction[query_index]:.4f}"
+        lines.insert(2, previous_text)
+    if pair_time_gaps is not None:
+        lines.insert(3, f"Normalized observable gap: {pair_time_gaps[query_index]:.3f}")
+    if predicted_delta is not None and previous_target is not None:
+        target_delta = float(target[query_index] - previous_target[query_index])
+        lines.insert(
+            8,
+            f"Pair delta: GT={target_delta:+.4f}   Pred={predicted_delta[query_index]:+.4f}",
+        )
+    if direction_probabilities is not None:
+        direction = direction_probabilities[query_index]
+        lines.insert(
+            9,
+            f"Direction p(B/S/F): {direction[0]:.3f}/{direction[1]:.3f}/{direction[2]:.3f}",
+        )
+    line_spacing = 21
     for index, line in enumerate(lines):
         put_text(
             canvas,
             line,
             (info_x, top_y + 20 + index * line_spacing),
-            scale=0.48 if index else 0.65,
+            scale=0.43 if index else 0.61,
             color=model_color if index == 0 else (35, 35, 35),
             thickness=2 if index == 0 else 1,
         )
@@ -468,23 +630,16 @@ def render_frame(
             thickness=2,
         )
 
-    distribution_rect = (info_x, top_y + top_height - 105, info_width, 100)
-    draw_distribution(
-        canvas,
-        distribution_rect,
-        probabilities,
-        gt_slot_float,
-        matched_slot,
-        model_color,
-    )
-
     chart_y = top_y + top_height + 38
     chart_height = height - chart_y - 28
-    chart_gap = 42
-    chart_width = (width - 2 * margin - chart_gap) // 2
+    chart_gap = 32
+    usable_width = width - 2 * margin - 2 * chart_gap
+    progress_width = int(usable_width * 0.31)
+    alignment_width = int(usable_width * 0.39)
+    diagnostic_width = usable_width - progress_width - alignment_width
     draw_progress_chart(
         canvas,
-        (margin, chart_y, chart_width, chart_height),
+        (margin, chart_y, progress_width, chart_height),
         target,
         prediction,
         query_index,
@@ -492,17 +647,47 @@ def render_frame(
     )
     draw_alignment_chart(
         canvas,
-        (margin + chart_width + chart_gap, chart_y, chart_width, chart_height),
+        (
+            margin + progress_width + chart_gap,
+            chart_y,
+            alignment_width,
+            chart_height,
+        ),
         heatmap,
         target,
         argmax_slots,
         query_index,
     )
+    diagnostic_rect = (
+        margin + progress_width + alignment_width + 2 * chart_gap,
+        chart_y,
+        diagnostic_width,
+        chart_height,
+    )
+    if joint_probabilities is not None and previous_target is not None:
+        draw_joint_distribution(
+            canvas,
+            diagnostic_rect,
+            joint_probabilities[query_index],
+            float(previous_target[query_index] * (alignment.shape[1] - 1)),
+            gt_slot_float,
+        )
+    else:
+        draw_distribution(
+            canvas,
+            diagnostic_rect,
+            probabilities,
+            gt_slot_float,
+            matched_slot,
+            model_color,
+        )
     return canvas
 
 
 class FfmpegWriter:
-    def __init__(self, path: Path, width: int, height: int, fps: float, crf: int) -> None:
+    def __init__(
+        self, path: Path, width: int, height: int, fps: float, crf: int
+    ) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         command = [
             "ffmpeg",
@@ -555,6 +740,11 @@ def event_summary(
     target: np.ndarray,
     prediction: np.ndarray,
     alignment: np.ndarray,
+    *,
+    previous_target: np.ndarray | None = None,
+    previous_prediction: np.ndarray | None = None,
+    predicted_delta: np.ndarray | None = None,
+    direction_probabilities: np.ndarray | None = None,
 ) -> Dict[str, Any]:
     errors = np.abs(prediction - target)
     deltas = np.diff(prediction, prepend=prediction[0])
@@ -575,7 +765,8 @@ def event_summary(
             "argmax_probability": float(alignment[index, argmax_slots[index]]),
         }
 
-    return {
+    slot_deltas = np.diff(argmax_slots, prepend=argmax_slots[0])
+    summary = {
         "episode_name": episode_name,
         "task_text": task_text,
         "model": model,
@@ -584,9 +775,45 @@ def event_summary(
         "rmse": float(np.sqrt(np.mean(np.square(prediction - target)))),
         "max_absolute_error": float(errors.max()),
         "max_absolute_jump": float(np.abs(deltas).max()),
+        "max_absolute_slot_jump": int(np.abs(slot_deltas).max()),
+        "backward_step_rate": (
+            float((deltas[1:] < -1e-4).mean()) if target.size > 1 else 0.0
+        ),
+        "end_error": float(errors[-1]),
+        "catastrophic": bool(
+            errors.max() >= 0.25
+            or np.abs(deltas).max() >= 0.20
+            or np.abs(slot_deltas).max() >= 20
+        ),
         "top_error_frames": [row(int(index)) for index in top_error_indices],
         "top_jump_frames": [row(int(index)) for index in top_jump_indices],
     }
+    if previous_target is not None:
+        target_delta = target - previous_target
+        summary["pair_target_delta_mean"] = float(target_delta.mean())
+        if previous_prediction is not None:
+            summary["previous_mae"] = float(
+                np.abs(previous_prediction - previous_target).mean()
+            )
+        if predicted_delta is not None:
+            summary["pair_delta_mae"] = float(
+                np.abs(predicted_delta - target_delta).mean()
+            )
+        if direction_probabilities is not None:
+            predicted_direction = direction_probabilities.argmax(axis=1) - 1
+            target_direction = np.sign(target_delta).astype(np.int64)
+            summary["pair_direction_accuracy"] = float(
+                (predicted_direction == target_direction).mean()
+            )
+            moving = target_direction != 0
+            summary["pair_wrong_direction_rate"] = (
+                float(
+                    (predicted_direction[moving] * target_direction[moving] < 0).mean()
+                )
+                if moving.any()
+                else 0.0
+            )
+    return summary
 
 
 def render_model_video(
@@ -599,6 +826,7 @@ def render_model_video(
     high_paths: Sequence[Path],
     wrist_paths: Sequence[Path],
     generated_frames: np.ndarray,
+    rgb_cache: Dict[Path, np.ndarray] | None = None,
 ) -> Dict[str, Any]:
     safe_episode = episode_name.rsplit("/", 1)[-1]
     video_path = args.output_dir / "videos" / model / f"{safe_episode}.mp4"
@@ -609,27 +837,86 @@ def render_model_video(
     target = torch.as_tensor(output["target"]).float().numpy()
     prediction = torch.as_tensor(output["prediction"]).float().numpy()
     alignment = torch.as_tensor(output["alignment_probabilities"]).float().numpy()
+
+    def optional_array(name: str, *, integer: bool = False) -> np.ndarray | None:
+        value = output.get(name)
+        if value is None:
+            return None
+        tensor = torch.as_tensor(value)
+        return tensor.long().numpy() if integer else tensor.float().numpy()
+
+    previous_frame_indices = optional_array("previous_frame_indices", integer=True)
+    previous_target = optional_array("previous_target")
+    previous_prediction = optional_array("previous_prediction")
+    predicted_delta = optional_array("predicted_delta")
+    direction_probabilities = optional_array("direction_probabilities")
+    pair_time_gaps = optional_array("pair_time_gaps")
+    joint_probabilities = optional_array("joint_alignment_probabilities")
     if frame_indices.ndim != 1 or target.ndim != 1 or prediction.ndim != 1:
-        raise ValueError(f"Progress outputs must be one-dimensional for {model}/{episode_name}")
+        raise ValueError(
+            f"Progress outputs must be one-dimensional for {model}/{episode_name}"
+        )
     if alignment.ndim != 2:
         raise ValueError(
             f"alignment_probabilities must be [queries,slots] for {model}/{episode_name}"
         )
-    if not (
-        frame_indices.size == target.size == prediction.size == alignment.shape[0]
-    ):
+    if not (frame_indices.size == target.size == prediction.size == alignment.shape[0]):
         raise ValueError(f"Progress tensor lengths differ for {model}/{episode_name}")
     if target.size == 0:
         raise ValueError(f"Progress outputs are empty for {model}/{episode_name}")
+    for name, value in (
+        ("previous_frame_indices", previous_frame_indices),
+        ("previous_target", previous_target),
+        ("previous_prediction", previous_prediction),
+        ("predicted_delta", predicted_delta),
+        ("pair_time_gaps", pair_time_gaps),
+    ):
+        if value is not None and (value.ndim != 1 or value.size != target.size):
+            raise ValueError(
+                f"{name} must be [queries] for {model}/{episode_name}, got {value.shape}"
+            )
+    if direction_probabilities is not None and direction_probabilities.shape != (
+        target.size,
+        3,
+    ):
+        raise ValueError(
+            f"direction_probabilities must be [queries,3] for {model}/{episode_name}"
+        )
+    if joint_probabilities is not None and joint_probabilities.shape != (
+        target.size,
+        alignment.shape[1],
+        alignment.shape[1],
+    ):
+        raise ValueError(
+            f"joint_alignment_probabilities must be [queries,slots,slots] for "
+            f"{model}/{episode_name}, got {joint_probabilities.shape}"
+        )
     if alignment.shape[1] != generated_frames.shape[0]:
         raise ValueError(
             f"Alignment has {alignment.shape[1]} slots but generated trajectory has "
             f"{generated_frames.shape[0]} frames for {model}/{episode_name}"
         )
-    if not all(np.isfinite(value).all() for value in (target, prediction, alignment)):
-        raise ValueError(f"Progress outputs contain NaN or inf for {model}/{episode_name}")
+    finite_values = [target, prediction, alignment]
+    finite_values.extend(
+        value
+        for value in (
+            previous_target,
+            previous_prediction,
+            predicted_delta,
+            direction_probabilities,
+            pair_time_gaps,
+            joint_probabilities,
+        )
+        if value is not None
+    )
+    if not all(np.isfinite(value).all() for value in finite_values):
+        raise ValueError(
+            f"Progress outputs contain NaN or inf for {model}/{episode_name}"
+        )
     if (target < 0.0).any() or (target > 1.0).any():
-        raise ValueError(f"Progress targets must be in [0,1] for {model}/{episode_name}")
+        raise ValueError(
+            f"Progress targets must be in [0,1] for {model}/{episode_name}"
+        )
     if (alignment < -1e-6).any() or not np.allclose(
         alignment.sum(axis=1), 1.0, atol=5e-3
     ):
@@ -643,6 +930,18 @@ def render_model_video(
         or len(high_paths) != len(wrist_paths)
     ):
         raise ValueError(f"RGB frame count differs for {episode_name}")
+    if previous_frame_indices is not None and (
+        previous_frame_indices.min() < 0
+        or previous_frame_indices.max() >= len(high_paths)
+    ):
+        raise ValueError(f"Previous RGB frame index differs for {model}/{episode_name}")
+    if joint_probabilities is not None and (
+        (joint_probabilities < -1e-5).any()
+        or not np.allclose(joint_probabilities.sum(axis=(1, 2)), 1.0, atol=5e-3)
+    ):
+        raise ValueError(
+            f"Joint alignment rows must be normalized probabilities for {model}/{episode_name}"
+        )
 
     summary = event_summary(
         episode_name,
@@ -652,6 +951,10 @@ def render_model_video(
         target,
         prediction,
         alignment,
+        previous_target=previous_target,
+        previous_prediction=previous_prediction,
+        predicted_delta=predicted_delta,
+        direction_probabilities=direction_probabilities,
     )
     summary["video_path"] = str(video_path)
     summary["poster_path"] = str(poster_path)
@@ -666,8 +969,21 @@ def render_model_video(
     worst_index = int(np.abs(prediction - target).argmax())
     writer = FfmpegWriter(video_path, args.width, args.height, args.fps, args.crf)
     worst_frame: np.ndarray | None = None
+
+    def cached_read(path: Path) -> np.ndarray:
+        if rgb_cache is None:
+            return read_rgb(path)
+        if path not in rgb_cache:
+            rgb_cache[path] = read_rgb(path)
+        return rgb_cache[path]
+
     try:
         for query_index, frame_index in enumerate(frame_indices.tolist()):
+            previous_frame_index = (
+                int(previous_frame_indices[query_index])
+                if previous_frame_indices is not None
+                else None
+            )
             frame = render_frame(
                 width=args.width,
                 height=args.height,
@@ -676,14 +992,31 @@ def render_model_video(
                 episode_name=episode_name,
                 query_index=query_index,
                 frame_index=frame_index,
-                high_frame=read_rgb(high_paths[frame_index]),
-                wrist_frame=read_rgb(wrist_paths[frame_index]),
+                previous_frame_index=previous_frame_index,
+                previous_high_frame=(
+                    cached_read(high_paths[previous_frame_index])
+                    if previous_frame_index is not None
+                    else None
+                ),
+                previous_wrist_frame=(
+                    cached_read(wrist_paths[previous_frame_index])
+                    if previous_frame_index is not None
+                    else None
+                ),
+                high_frame=cached_read(high_paths[frame_index]),
+                wrist_frame=cached_read(wrist_paths[frame_index]),
                 generated_frames=generated_frames,
                 target=target,
                 prediction=prediction,
                 alignment=alignment,
                 heatmap=heatmap,
                 argmax_slots=argmax_slots,
+                previous_target=previous_target,
+                previous_prediction=previous_prediction,
+                predicted_delta=predicted_delta,
+                direction_probabilities=direction_probabilities,
+                pair_time_gaps=pair_time_gaps,
+                joint_probabilities=joint_probabilities,
             )
             writer.write(frame)
             if query_index == worst_index:
@@ -713,6 +1046,14 @@ def write_manifest(path: Path, rows: Iterable[Mapping[str, Any]]) -> None:
         "rmse",
         "max_absolute_error",
         "max_absolute_jump",
+        "max_absolute_slot_jump",
+        "backward_step_rate",
+        "end_error",
+        "catastrophic",
+        "previous_mae",
+        "pair_delta_mae",
+        "pair_direction_accuracy",
+        "pair_wrong_direction_rate",
         "video_path",
         "poster_path",
     ]
@@ -765,6 +1106,7 @@ def main() -> None:
         episode_root = args.images_root / relative_path
         high_paths = list_frames(episode_root / "cam_high")
         wrist_paths = list_frames(episode_root / "cam_left_wrist")
+        rgb_cache: Dict[Path, np.ndarray] = {}
         for model in args.models:
             output = outputs[model].get(episode_name)
             if output is None:
@@ -779,9 +1121,16 @@ def main() -> None:
                     high_paths=high_paths,
                     wrist_paths=wrist_paths,
                     generated_frames=generated_frames,
+                    rgb_cache=rgb_cache,
                 )
             )
-    write_manifest(args.output_dir / "manifest.csv", rows)
+    manifest_name = Path(args.manifest_name)
+    if (
+        manifest_name.name != args.manifest_name
+        or manifest_name.suffix.lower() != ".csv"
+    ):
+        raise ValueError("--manifest_name must be a plain CSV filename")
+    write_manifest(args.output_dir / manifest_name, rows)
     print(f"complete: {len(rows)} videos under {args.output_dir}", flush=True)
 
 

@@ -20,7 +20,6 @@ import torch
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-
 LOWER_IS_BETTER = {
     "mae": True,
     "rmse": True,
@@ -39,7 +38,20 @@ PLOT_METRICS = [
     ("end_error", "End error", True),
 ]
 
-COLORS = ["#2563eb", "#dc2626", "#16a34a", "#9333ea", "#ea580c", "#0891b2"]
+COLORS = [
+    "#2563eb",
+    "#dc2626",
+    "#16a34a",
+    "#9333ea",
+    "#ea580c",
+    "#0891b2",
+    "#4f46e5",
+    "#be123c",
+    "#15803d",
+    "#7e22ce",
+    "#c2410c",
+    "#0e7490",
+]
 
 
 @dataclass
@@ -199,7 +211,10 @@ def validate_runs(runs: Sequence[RunData], baseline: str) -> Dict[str, Any]:
                     f"Unexpected output shape for {run.name}/{episode_name}: "
                     f"prediction={tuple(prediction.shape)} alignment={tuple(alignment.shape)}"
                 )
-            if not torch.isfinite(prediction).all() or not torch.isfinite(alignment).all():
+            if (
+                not torch.isfinite(prediction).all()
+                or not torch.isfinite(alignment).all()
+            ):
                 raise ValueError(f"Non-finite output for {run.name}/{episode_name}")
             probability_error = float((alignment.sum(dim=-1) - 1.0).abs().max())
             max_probability_sum_error = max(
@@ -269,9 +284,7 @@ def per_episode_rows(runs: Sequence[RunData]) -> List[Dict[str, Any]]:
         }
         for run in runs:
             for metric in LOWER_IS_BETTER:
-                row[f"{run.name}_{metric}"] = run.episode_metrics[episode_name][
-                    metric
-                ]
+                row[f"{run.name}_{metric}"] = run.episode_metrics[episode_name][metric]
         rows.append(row)
     return rows
 
@@ -315,7 +328,9 @@ def bootstrap_mean_ci(
     return float(values.mean()), float(lower), float(upper)
 
 
-def metric_vector(run: RunData, episode_names: Sequence[str], metric: str) -> np.ndarray:
+def metric_vector(
+    run: RunData, episode_names: Sequence[str], metric: str
+) -> np.ndarray:
     return np.asarray(
         [float(run.episode_metrics[name][metric]) for name in episode_names],
         dtype=np.float64,
@@ -359,9 +374,7 @@ def paired_statistics(
                     baseline_values = metric_vector(baseline, episode_names, metric)
                     run_values = metric_vector(run, episode_names, metric)
                 else:
-                    baseline_values = task_metric_vector(
-                        baseline, task_indices, metric
-                    )
+                    baseline_values = task_metric_vector(baseline, task_indices, metric)
                     run_values = task_metric_vector(run, task_indices, metric)
                 delta = run_values - baseline_values
                 mean_delta, ci_low, ci_high = bootstrap_mean_ci(
@@ -397,7 +410,9 @@ def plot_overall_metrics(runs: Sequence[RunData], output_path: Path) -> None:
         values = [float(run.metrics["task_macro"][metric]) for run in runs]
         bars = axis.bar(x, values, color=COLORS[: len(runs)], width=0.68)
         axis.set_xticks(x, [run.name for run in runs], fontsize=11)
-        axis.set_title(f"{title} ({'lower' if lower_is_better else 'higher'} is better)")
+        axis.set_title(
+            f"{title} ({'lower' if lower_is_better else 'higher'} is better)"
+        )
         axis.grid(axis="y", alpha=0.2)
         for bar, value in zip(bars, values):
             axis.text(
@@ -645,8 +660,7 @@ def select_cases(
             continue
         delta = {
             name: float(
-                run.episode_metrics[name]["mae"]
-                - baseline.episode_metrics[name]["mae"]
+                run.episode_metrics[name]["mae"] - baseline.episode_metrics[name]["mae"]
             )
             for name in episode_names
         }
@@ -659,8 +673,7 @@ def select_cases(
     }
     monotonic = {
         name: max(
-            float(run.episode_metrics[name]["monotonic_violation_rate"])
-            for run in runs
+            float(run.episode_metrics[name]["monotonic_violation_rate"]) for run in runs
         )
         for name in episode_names
     }
@@ -723,7 +736,10 @@ def case_title(
 
 def alignment_vmax(runs: Sequence[RunData], episode_name: str) -> float:
     values = np.concatenate(
-        [run.episodes[episode_name]["alignment_probabilities"].numpy().ravel() for run in runs]
+        [
+            run.episodes[episode_name]["alignment_probabilities"].numpy().ravel()
+            for run in runs
+        ]
     )
     return max(float(np.quantile(values, 0.995)), 0.05)
 
@@ -735,9 +751,7 @@ def draw_curve(axis: Any, run: RunData, episode_name: str, color: str) -> None:
     prediction = episode["prediction"].numpy()
     axis.plot(frames, target, color="#111827", linewidth=2.4, label="GT")
     axis.plot(frames, prediction, color=color, linewidth=2.2, label=run.name)
-    axis.fill_between(
-        frames, target, prediction, color=color, alpha=0.12, linewidth=0
-    )
+    axis.fill_between(frames, target, prediction, color=color, alpha=0.12, linewidth=0)
     axis.set_ylim(-0.04, 1.04)
     axis.set_xlabel("Original episode frame")
     axis.set_ylabel("Progress")
@@ -750,9 +764,7 @@ def draw_curve(axis: Any, run: RunData, episode_name: str, color: str) -> None:
     )
 
 
-def draw_alignment(
-    axis: Any, run: RunData, episode_name: str, vmax: float
-) -> Any:
+def draw_alignment(axis: Any, run: RunData, episode_name: str, vmax: float) -> Any:
     episode = run.episodes[episode_name]
     frames = episode["frame_indices"].numpy()
     target = episode["target"].numpy()
@@ -971,9 +983,7 @@ def main() -> None:
     )
     write_csv(args.output_dir / "per_episode_metrics.csv", per_episode_rows(runs))
     write_csv(args.output_dir / "per_task_metrics.csv", per_task_rows(runs))
-    write_csv(
-        args.output_dir / "error_by_progress_bin.csv", progress_bin_rows(runs)
-    )
+    write_csv(args.output_dir / "error_by_progress_bin.csv", progress_bin_rows(runs))
     backward_jumps = backward_jump_rows(runs)
     write_csv(args.output_dir / "backward_jump_rates.csv", backward_jumps)
     paired = paired_statistics(
@@ -1005,9 +1015,7 @@ def main() -> None:
     plot_paired_episode_delta(
         runs, args.baseline, args.output_dir / "paired_episode_mae_delta.png"
     )
-    plot_error_by_progress_bin(
-        runs, args.output_dir / "error_by_progress_bin.png"
-    )
+    plot_error_by_progress_bin(runs, args.output_dir / "error_by_progress_bin.png")
     plot_backward_jump_rates(
         runs, backward_jumps, args.output_dir / "backward_jump_rates.png"
     )

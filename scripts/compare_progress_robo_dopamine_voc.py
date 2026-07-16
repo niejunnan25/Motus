@@ -16,8 +16,20 @@ import numpy as np
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-
-OUR_COLORS = ["#2563eb", "#dc2626", "#16a34a", "#9333ea"]
+OUR_COLORS = [
+    "#2563eb",
+    "#dc2626",
+    "#16a34a",
+    "#9333ea",
+    "#ea580c",
+    "#0891b2",
+    "#4f46e5",
+    "#be123c",
+    "#15803d",
+    "#7e22ce",
+    "#c2410c",
+    "#0e7490",
+]
 OFFICIAL_COLOR = "#374151"
 
 
@@ -154,9 +166,7 @@ def summarize_runs(
     rows: List[Dict[str, object]] = []
     for run in runs:
         values = np.asarray([run.values[name] for name in episodes], dtype=np.float64)
-        ci_low, ci_high = bootstrap_mean_ci(
-            values, samples=bootstrap_samples, rng=rng
-        )
+        ci_low, ci_high = bootstrap_mean_ci(values, samples=bootstrap_samples, rng=rng)
         rows.append(
             {
                 "interval": interval,
@@ -314,7 +324,9 @@ def plot_delta_heatmap(
     limit = max(float(np.abs(values).max()), 1e-3)
     figure, axis = plt.subplots(figsize=(12, 6), constrained_layout=True)
     image = axis.imshow(values, cmap="RdBu", vmin=-limit, vmax=limit, aspect="auto")
-    axis.set_xticks(np.arange(len(official_names)), official_names, rotation=25, ha="right")
+    axis.set_xticks(
+        np.arange(len(official_names)), official_names, rotation=25, ha="right"
+    )
     axis.set_yticks(np.arange(len(progress_names)), progress_names)
     axis.set_xlabel("Official Robo-Dopamine model")
     axis.set_ylabel("Progress model")
@@ -386,7 +398,7 @@ def report_text(
             "",
             "This is a direct comparison of the released forward VOC+ statistic. Model inputs "
             "remain different: Robo-Dopamine predicts relative hops from before/after multi-view "
-            "pairs, whereas Progress predicts absolute position from one current composite frame "
+            "pairs, whereas Progress predicts absolute position from one or two current observations "
             "and generated trajectory memory. The Progress model has no native reverse-hop output, "
             "so official VOC- is not synthesized.",
         ]
@@ -398,7 +410,9 @@ def main() -> None:
     args = parse_args()
     if args.interval < 1:
         raise ValueError("interval must be positive")
-    progress_runs = load_progress_runs(args.progress_episode_csv.resolve(), args.interval)
+    progress_runs = load_progress_runs(
+        args.progress_episode_csv.resolve(), args.interval
+    )
     official_runs = [
         load_official_run(name, path, args.interval)
         for name, path in (parse_named_path(value) for value in args.official)

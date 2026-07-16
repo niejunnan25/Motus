@@ -16,8 +16,20 @@ import torch
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-
-COLORS = ["#2563eb", "#dc2626", "#16a34a", "#9333ea", "#ea580c"]
+COLORS = [
+    "#2563eb",
+    "#dc2626",
+    "#16a34a",
+    "#9333ea",
+    "#ea580c",
+    "#0891b2",
+    "#4f46e5",
+    "#be123c",
+    "#15803d",
+    "#7e22ce",
+    "#c2410c",
+    "#0e7490",
+]
 
 
 def parse_args() -> argparse.Namespace:
@@ -98,11 +110,17 @@ def validate_runs(runs: Sequence[Mapping[str, Any]]) -> None:
             if actual["task_index"] != expected["task_index"]:
                 raise ValueError(f"Task differs for {run['name']}/{episode_name}")
             if actual["total_frames"] != expected["total_frames"]:
-                raise ValueError(f"Frame count differs for {run['name']}/{episode_name}")
+                raise ValueError(
+                    f"Frame count differs for {run['name']}/{episode_name}"
+                )
             if not torch.equal(actual["frame_indices"], expected["frame_indices"]):
-                raise ValueError(f"Frame indices differ for {run['name']}/{episode_name}")
+                raise ValueError(
+                    f"Frame indices differ for {run['name']}/{episode_name}"
+                )
             if not torch.allclose(actual["target"], expected["target"], atol=1e-7):
-                raise ValueError(f"Progress targets differ for {run['name']}/{episode_name}")
+                raise ValueError(
+                    f"Progress targets differ for {run['name']}/{episode_name}"
+                )
 
 
 def rankdata(values: np.ndarray) -> np.ndarray:
@@ -145,7 +163,9 @@ def make_sample_indices(num_frames: int, count: int) -> List[int]:
     return [round(index * (num_frames - 1) / (count - 1)) for index in range(count)]
 
 
-def sampled_episode_metrics(episode: Mapping[str, Any], interval: int) -> Dict[str, Any]:
+def sampled_episode_metrics(
+    episode: Mapping[str, Any], interval: int
+) -> Dict[str, Any]:
     total_frames = int(episode["total_frames"])
     sample_count = total_frames // int(interval)
     # Official GRM predicts a hop for each transition, so its VOC vector omits
@@ -160,7 +180,9 @@ def sampled_episode_metrics(episode: Mapping[str, Any], interval: int) -> Dict[s
         raise ValueError(
             f"Cache is missing official interval={interval} query frames: {missing[:5]}"
         )
-    offsets = torch.tensor([position[frame] for frame in sampled_indices], dtype=torch.long)
+    offsets = torch.tensor(
+        [position[frame] for frame in sampled_indices], dtype=torch.long
+    )
     prediction = episode["prediction"].index_select(0, offsets).numpy()
     target = episode["target"].index_select(0, offsets).numpy()
     error = prediction - target
@@ -212,7 +234,9 @@ def aggregate_interval(
         )
         task_values = []
         for task_id in task_ids:
-            values = [float(row[metric]) for row in rows if int(row["task_index"]) == task_id]
+            values = [
+                float(row[metric]) for row in rows if int(row["task_index"]) == task_id
+            ]
             task_values.append(float(np.mean(values)))
         summary[f"task_macro_{metric}"] = float(np.mean(task_values))
     return summary, rows
@@ -272,10 +296,17 @@ def plot_interval_metrics(
     figure, axes = plt.subplots(1, 2, figsize=(16, 6), constrained_layout=True)
     x = np.arange(len(intervals), dtype=np.float64)
     width = 0.8 / len(runs)
-    for run_index, (run, color) in enumerate(zip(runs, COLORS)):
+    for run_index, run in enumerate(runs):
+        color = COLORS[run_index % len(COLORS)]
         offsets = x + (run_index - (len(runs) - 1) / 2) * width
-        voc = [lookup[(run["name"], interval)]["episode_mean_spearman"] for interval in intervals]
-        mae = [lookup[(run["name"], interval)]["episode_mean_mae"] for interval in intervals]
+        voc = [
+            lookup[(run["name"], interval)]["episode_mean_spearman"]
+            for interval in intervals
+        ]
+        mae = [
+            lookup[(run["name"], interval)]["episode_mean_mae"]
+            for interval in intervals
+        ]
         axes[0].bar(offsets, voc, width=width, label=run["name"], color=color)
         axes[1].bar(offsets, mae, width=width, label=run["name"], color=color)
     for axis in axes:
@@ -302,7 +333,7 @@ def report(
     lines = [
         "# Robo-Dopamine-Bench LIBERO Progress Evaluation",
         "",
-        "A0-A3 consume one current frame and a cached 53-slot generated trajectory, then output absolute Progress. Official GRM consumes before/after multi-view pairs and outputs a relative hop. The tables are therefore kept separate; only forward chronological ordering is a shared diagnostic.",
+        "Progress models consume one or two current observations and a cached 53-slot generated trajectory, then output absolute Progress. Official GRM consumes before/after multi-view pairs and outputs a relative hop. The tables are therefore kept separate; only forward chronological ordering is a shared diagnostic.",
         "",
         "## Absolute Progress Results",
         "",
@@ -344,7 +375,7 @@ def report(
             "",
             "## Interpretation Boundary",
             "",
-            "Official `voc-` reverses pair direction and asks GRM for regress hops. An absolute single-frame Progress model has no equivalent native reverse-hop output, so no synthetic A0-A3 `voc-` is reported. Dense MAE, ordering, monotonicity, and per-case alignment maps remain the primary A0-A3 diagnostics.",
+            "Official `voc-` reverses pair direction and asks GRM for regress hops. An absolute Progress model has no equivalent native reverse-hop output, so no synthetic Progress `voc-` is reported. Dense MAE, ordering, monotonicity, and per-case alignment maps remain the primary diagnostics.",
         ]
     )
     return "\n".join(lines) + "\n"

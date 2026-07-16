@@ -335,8 +335,10 @@ def _run_progress_queries(
         "progress",
         "alignment_probabilities",
         "previous_progress",
+        "previous_alignment_probabilities",
         "delta_progress",
         "direction_probabilities",
+        "joint_alignment_probabilities",
     )
     for start in range(0, current_latents.shape[0], query_batch_size):
         end = min(start + query_batch_size, current_latents.shape[0])
@@ -505,6 +507,7 @@ def evaluate_episode(
     target = episode["progress"].float().to(device)
     previous_latents = None
     previous_target = None
+    previous_indices = None
     pair_time_gaps = None
     if model_config.query_mode != "single_frame":
         pair_config = config.get("pair_sampling", {})
@@ -551,11 +554,20 @@ def evaluate_episode(
     }
     if previous_target is not None:
         result["previous_target"] = previous_target.float().cpu()
+        result["previous_frame_indices"] = (
+            episode["frame_indices"].index_select(0, previous_indices.cpu()).long()
+        )
         result["pair_time_gaps"] = pair_time_gaps.float().cpu()
     if "previous_progress" in outputs:
         result["previous_prediction"] = outputs["previous_progress"]
         result["predicted_delta"] = outputs["delta_progress"]
         result["direction_probabilities"] = outputs["direction_probabilities"]
+    for name in (
+        "previous_alignment_probabilities",
+        "joint_alignment_probabilities",
+    ):
+        if name in outputs:
+            result[name] = outputs[name]
 
     if model_config.query_mode != "single_frame" and run_pair_diagnostics:
         pair_config = config.get("pair_sampling", {})
@@ -734,6 +746,19 @@ def main() -> None:
         ):
             if name in evaluated:
                 output_payload[name] = evaluated[name].float().contiguous()
+        if "previous_frame_indices" in evaluated:
+            output_payload["previous_frame_indices"] = (
+                evaluated["previous_frame_indices"].long().contiguous()
+            )
+        for name in (
+            "previous_alignment_probabilities",
+            "joint_alignment_probabilities",
+        ):
+            if name in evaluated:
+                # Full 53x53 joint maps are retained for visual diagnosis. FP16
+                # keeps a 100-episode benchmark practical without changing any
+                # metric, which is computed above in float32.
+                output_payload[name] = evaluated[name].half().contiguous()
         episode_outputs.append(output_payload)
         all_predictions.append(prediction)
         all_targets.append(target)
