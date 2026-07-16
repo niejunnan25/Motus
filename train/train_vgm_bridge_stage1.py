@@ -269,7 +269,8 @@ class VGMBridgeStage1Trainer:
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=grad_clip_norm)
 
             self.optimizer.step()
-            if self.scheduler is not None:
+            should_step_scheduler = self.accelerator is None or self.accelerator.sync_gradients
+            if self.scheduler is not None and should_step_scheduler:
                 self.scheduler.step()
             self.optimizer.zero_grad(set_to_none=True)
 
@@ -578,6 +579,9 @@ def main() -> None:
         log_with=report_to if report_to else None,
         project_dir=config.system.checkpoint_dir,
         project_config=accelerator_project_config,
+        # The trainer advances the scheduler once per synchronized optimizer
+        # update. Accelerate's default would advance it once per process.
+        step_scheduler_with_optimizer=False,
     )
 
     rank = accelerator.process_index

@@ -49,6 +49,22 @@ class _FakeAccelerator:
     def clip_grad_norm_(parameters: object, max_norm: float) -> None:
         torch.nn.utils.clip_grad_norm_(parameters, max_norm)
 
+    @staticmethod
+    def unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
+        return model
+
+    @staticmethod
+    def gather(value: torch.Tensor) -> torch.Tensor:
+        return torch.cat([value, value], dim=0)
+
+
+class _CountingScheduler:
+    def __init__(self) -> None:
+        self.step_count = 0
+
+    def step(self) -> None:
+        self.step_count += 1
+
 
 def test_trainer_forward_uses_distributed_wrapper(tmp_path: Path) -> None:
     model = _ForwardWrapper(_InnerModel())
@@ -73,6 +89,37 @@ def test_trainer_forward_uses_distributed_wrapper(tmp_path: Path) -> None:
     trainer.train_step(batch)
 
     assert model.forward_calls == 1
+
+
+def test_scheduler_steps_only_on_synchronized_optimizer_updates(tmp_path: Path) -> None:
+    model = _ForwardWrapper(_InnerModel())
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    scheduler = _CountingScheduler()
+    accelerator = _FakeAccelerator()
+    trainer = VGMBridgeStage1Trainer(
+        model=model,
+        train_dataloader=[],
+        optimizer=optimizer,
+        scheduler=scheduler,
+        device=torch.device("cpu"),
+        world_size=2,
+        checkpoint_dir=str(tmp_path),
+        accelerator=accelerator,
+        config=SimpleNamespace(training=SimpleNamespace(grad_clip_norm=1.0)),
+    )
+    batch = {
+        "first_frame": torch.ones(1, 1, 1, 1),
+        "video_frames": torch.ones(1, 1, 1, 1, 1),
+        "language_embedding": None,
+    }
+
+    accelerator.sync_gradients = False
+    trainer.train_step(batch)
+    assert scheduler.step_count == 0
+
+    accelerator.sync_gradients = True
+    trainer.train_step(batch)
+    assert scheduler.step_count == 1
 
 
 class _Dataset(torch.utils.data.Dataset):
