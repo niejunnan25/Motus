@@ -37,12 +37,14 @@ if __package__:
         forward_progress,
         load_frozen_vgm,
         model_config_from_yaml,
+        source_requires_trajectory_role_latent,
     )
 else:
     from train_progress_stage2 import (
         forward_progress,
         load_frozen_vgm,
         model_config_from_yaml,
+        source_requires_trajectory_role_latent,
     )
 
 
@@ -500,6 +502,9 @@ def evaluate_episode(
     run_pair_diagnostics: bool = True,
 ) -> Dict[str, Any]:
     trajectory_latent = episode["trajectory_latent"].unsqueeze(0).to(device)
+    trajectory_role_latent = episode.get("trajectory_role_latent")
+    if trajectory_role_latent is not None:
+        trajectory_role_latent = trajectory_role_latent.unsqueeze(0).to(device)
     trajectory_frame_latents = (
         episode["trajectory_frame_latents"].unsqueeze(0).to(device)
     )
@@ -527,6 +532,7 @@ def evaluate_episode(
     if frozen_vgm is not None:
         video_features = frozen_vgm.extract_bridge_hidden_states(
             trajectory_latent=trajectory_latent,
+            trajectory_role_latent=trajectory_role_latent,
             first_frame=episode["first_frame"]
             .float()
             .div(255.0)
@@ -685,6 +691,7 @@ def main() -> None:
         split=args.split,
         load_language_embedding=model_config.fusion_mode == "layerwise_wvm",
         expected_num_progress_bins=model_config.num_progress_bins,
+        require_trajectory_role_latent=source_requires_trajectory_role_latent(config),
         max_episodes=args.max_episodes,
     )
 

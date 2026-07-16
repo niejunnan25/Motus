@@ -121,6 +121,12 @@ def build_model(config: Any, checkpoint_path: Path) -> VGMBridgeStage1:
         state_clip=config.common.get("state_clip", 10.0),
         role_mask_fusion_mode=config.common.get("role_mask_fusion_mode", "none"),
         role_mask_loss_weight=config.common.get("role_mask_loss_weight", 1.0),
+        role_mask_training_mode=config.common.get("role_mask_training_mode", "legacy"),
+        role_mask_condition_mode=config.common.get("role_mask_condition_mode", "legacy"),
+        role_mask_prompt_dropout=config.common.get("role_mask_prompt_dropout", 0.5),
+        role_mask_loss_warmup_steps=config.common.get("role_mask_loss_warmup_steps", 0),
+        role_rgb_max_weight=config.common.get("role_rgb_max_weight", 8.0),
+        role_rgb_weight_warmup_steps=config.common.get("role_rgb_weight_warmup_steps", 1000),
         load_pretrained_backbones=False,
     )
     model = VGMBridgeStage1(model_config)
@@ -376,12 +382,181 @@ def pixel_metrics(
     return metrics
 
 
+def rendered_role_ids(
+    value: torch.Tensor,
+    render_mode: str,
+    role_mask_palette: Optional[Dict[Any, Any]] = None,
+) -> torch.Tensor:
+    """Convert rendered RoleMask RGB frames into stable integer role IDs."""
+    if render_mode == "binary":
+        return (value.mean(dim=2) >= 0.5).long()
+
+    configured_palette = role_mask_palette or {
+        0: [0, 0, 0],
+        1: [255, 0, 0],
+        2: [0, 255, 0],
+        4: [0, 0, 255],
+    }
+    palette_by_id = {int(role_id): color for role_id, color in configured_palette.items()}
+    role_ids = sorted(role_id for role_id in palette_by_id if role_id in {0, 1, 2, 4})
+    if role_ids != [0, 1, 2, 4]:
+        raise ValueError(f"Color role-mask evaluation requires palette entries 0,1,2,4; got {role_ids}")
+    palette = value.new_tensor([palette_by_id[role_id] for role_id in role_ids]) / 255.0
+    role_id_tensor = value.new_tensor(role_ids, dtype=torch.long)
+    channels_last = value.permute(0, 1, 3, 4, 2)
+    distance = (channels_last.unsqueeze(-2) - palette).pow(2).sum(dim=-1)
+    return role_id_tensor[distance.argmin(dim=-1)]
+
+
+def role_region_pixel_metrics(
+    gt_rgb: torch.Tensor,
+    pred_rgb: torch.Tensor,
+    gt_role: torch.Tensor,
+    render_mode: str,
+    role_mask_palette: Optional[Dict[Any, Any]] = None,
+    tail_condition_frames: int = 0,
+) -> Dict[str, float]:
+    """Measure RGB fidelity only where task-role labels say manipulation occurs."""
+    frame_count = min(gt_rgb.shape[1], pred_rgb.shape[1], gt_role.shape[1])
+    generated_end = frame_count - max(0, min(int(tail_condition_frames), frame_count - 1))
+    if generated_end <= 1:
+        return {}
+    error = (pred_rgb[:, 1:generated_end] - gt_rgb[:, 1:generated_end]).pow(2).mean(dim=2)
+    role_ids = rendered_role_ids(
+        gt_role[:, :frame_count],
+        render_mode,
+        role_mask_palette=role_mask_palette,
+    )[:, 1:generated_end]
+
+    metrics: Dict[str, float] = {}
+    regions = {"foreground": role_ids != 0}
+    if render_mode != "binary":
+        regions.update(
+            {
+                "active": role_ids == 1,
+                "target": role_ids == 2,
+                "robot": role_ids == 4,
+            }
+        )
+    for name, region in regions.items():
+        count = region.sum()
+        if int(count) == 0:
+            continue
+        mse = (error * region.float()).sum() / count.float()
+        value = float(mse.cpu())
+        metrics[f"rgb_role_{name}_mse"] = value
+        metrics[f"rgb_role_{name}_psnr"] = psnr_from_mse(value)
+    return metrics
+
+
+def role_trajectory_metrics(
+    gt_role: torch.Tensor,
+    pred_role: torch.Tensor,
+    role_names: Dict[int, str],
+    view_layout: str = "single",
+    view_names: Optional[List[str]] = None,
+) -> Dict[str, float]:
+    """Compare per-view centroids and motion without mixing independent cameras."""
+    if gt_role.shape != pred_role.shape:
+        raise ValueError(
+            f"GT/pred RoleMask ID tensors must match, got {gt_role.shape} and {pred_role.shape}"
+        )
+    names = list(view_names or ["view_0"])
+    if view_layout == "single":
+        if len(names) != 1:
+            raise ValueError("view_layout='single' requires exactly one view name")
+        views = [("", gt_role, pred_role)]
+    else:
+        if view_layout not in {"vertical", "horizontal"}:
+            raise ValueError(f"Unsupported view_layout={view_layout!r}")
+        if len(names) < 2:
+            raise ValueError(f"view_layout={view_layout!r} requires at least two views")
+        split_dim = -2 if view_layout == "vertical" else -1
+        split_size = gt_role.shape[split_dim]
+        if split_size % len(names) != 0:
+            raise ValueError(
+                f"RoleMask {view_layout} dimension {split_size} is not divisible by {len(names)} views"
+            )
+        gt_views = torch.chunk(gt_role, len(names), dim=split_dim)
+        pred_views = torch.chunk(pred_role, len(names), dim=split_dim)
+        views = []
+        for index, (name, gt_view, pred_view) in enumerate(zip(names, gt_views, pred_views)):
+            clean_name = re.sub(r"[^A-Za-z0-9]+", "_", str(name).split(".")[-1]).strip("_")
+            clean_name = clean_name or f"view_{index}"
+            views.append((clean_name, gt_view, pred_view))
+
+    def centroid(mask: torch.Tensor, height: int, width: int) -> Optional[torch.Tensor]:
+        points = mask.nonzero(as_tuple=False)
+        if points.numel() == 0:
+            return None
+        y = points[:, 0].float().mean() / max(height - 1, 1)
+        x = points[:, 1].float().mean() / max(width - 1, 1)
+        return torch.stack([x, y])
+
+    metrics: Dict[str, float] = {}
+    macro_values: Dict[tuple[str, str], List[float]] = {}
+    for view_name, gt_view, pred_view in views:
+        height, width = gt_view.shape[-2:]
+        for role_id, role_name in role_names.items():
+            position_errors = []
+            motion_errors = []
+            for batch_idx in range(gt_view.shape[0]):
+                gt_centroids = []
+                pred_centroids = []
+                for frame_idx in range(gt_view.shape[1]):
+                    gt_centroid = centroid(
+                        gt_view[batch_idx, frame_idx] == role_id, height, width
+                    )
+                    pred_centroid = centroid(
+                        pred_view[batch_idx, frame_idx] == role_id, height, width
+                    )
+                    gt_centroids.append(gt_centroid)
+                    pred_centroids.append(pred_centroid)
+                    if gt_centroid is not None:
+                        position_errors.append(
+                            torch.linalg.vector_norm(pred_centroid - gt_centroid)
+                            if pred_centroid is not None
+                            else gt_view.new_tensor(math.sqrt(2.0), dtype=torch.float32)
+                        )
+                for frame_idx in range(1, len(gt_centroids)):
+                    gt_prev, gt_now = gt_centroids[frame_idx - 1], gt_centroids[frame_idx]
+                    pred_prev, pred_now = pred_centroids[frame_idx - 1], pred_centroids[frame_idx]
+                    if gt_prev is None or gt_now is None:
+                        continue
+                    if pred_prev is None or pred_now is None:
+                        motion_errors.append(
+                            gt_view.new_tensor(math.sqrt(2.0), dtype=torch.float32)
+                        )
+                    else:
+                        motion_errors.append(
+                            torch.linalg.vector_norm(
+                                (pred_now - pred_prev) - (gt_now - gt_prev)
+                            )
+                        )
+            suffix = f"{view_name}_" if view_name else ""
+            if position_errors:
+                value = float(torch.stack(position_errors).mean().cpu())
+                metrics[f"role_mask_{role_name}_{suffix}centroid_l2"] = value
+                macro_values.setdefault((role_name, "centroid_l2"), []).append(value)
+            if motion_errors:
+                value = float(torch.stack(motion_errors).mean().cpu())
+                metrics[f"role_mask_{role_name}_{suffix}motion_l2"] = value
+                macro_values.setdefault((role_name, "motion_l2"), []).append(value)
+
+    if len(views) > 1:
+        for (role_name, metric_name), values in macro_values.items():
+            metrics[f"role_mask_{role_name}_macro_{metric_name}"] = float(np.mean(values))
+    return metrics
+
+
 def role_mask_metrics(
     gt: torch.Tensor,
     pred: torch.Tensor,
     render_mode: str,
     role_mask_palette: Optional[Dict[Any, Any]] = None,
     tail_condition_frames: int = 0,
+    view_layout: str = "single",
+    view_names: Optional[List[str]] = None,
 ) -> Dict[str, float]:
     """Measure generated role masks without letting conditioned endpoints inflate the result."""
     frame_count = min(gt.shape[1], pred.shape[1])
@@ -417,8 +592,8 @@ def role_mask_metrics(
         return metrics
 
     if render_mode == "binary":
-        gt_foreground_full = gt.mean(dim=2) >= 0.5
-        pred_foreground_full = pred.mean(dim=2) >= 0.5
+        gt_foreground_full = rendered_role_ids(gt, render_mode) != 0
+        pred_foreground_full = rendered_role_ids(pred, render_mode) != 0
         full_metrics = foreground_metrics(gt_foreground_full, pred_foreground_full)
         gt_foreground = gt_foreground_full[:, 1:generated_end]
         pred_foreground = pred_foreground_full[:, 1:generated_end]
@@ -431,28 +606,19 @@ def role_mask_metrics(
                 "role_mask_recall": metrics["role_mask_foreground_recall"],
             }
         )
+        metrics.update(
+            role_trajectory_metrics(
+                gt_foreground.long(),
+                pred_foreground.long(),
+                {1: "foreground"},
+                view_layout=view_layout,
+                view_names=view_names,
+            )
+        )
         return add_full_metrics(metrics, full_metrics)
 
-    configured_palette = role_mask_palette or {
-        0: [0, 0, 0],
-        1: [255, 0, 0],
-        2: [0, 255, 0],
-        4: [0, 0, 255],
-    }
-    palette_by_id = {int(role_id): color for role_id, color in configured_palette.items()}
-    role_ids = sorted(role_id for role_id in palette_by_id if role_id in {0, 1, 2, 4})
-    if role_ids != [0, 1, 2, 4]:
-        raise ValueError(f"Color role-mask evaluation requires palette entries 0,1,2,4; got {role_ids}")
-    palette = pred.new_tensor([palette_by_id[role_id] for role_id in role_ids]) / 255.0
-    role_id_tensor = pred.new_tensor(role_ids, dtype=torch.long)
-
-    def nearest_role(value: torch.Tensor) -> torch.Tensor:
-        channels_last = value.permute(0, 1, 3, 4, 2)
-        distance = (channels_last.unsqueeze(-2) - palette).pow(2).sum(dim=-1)
-        return role_id_tensor[distance.argmin(dim=-1)]
-
-    gt_role_full = nearest_role(gt)
-    pred_role_full = nearest_role(pred)
+    gt_role_full = rendered_role_ids(gt, render_mode, role_mask_palette=role_mask_palette)
+    pred_role_full = rendered_role_ids(pred, render_mode, role_mask_palette=role_mask_palette)
     full_metrics = foreground_metrics(gt_role_full != 0, pred_role_full != 0)
     gt_role = gt_role_full[:, 1:generated_end]
     pred_role = pred_role_full[:, 1:generated_end]
@@ -469,6 +635,15 @@ def role_mask_metrics(
             ious.append(iou)
             metrics[f"role_mask_{role_name}_iou"] = float(iou.cpu())
     metrics["role_mask_macro_iou"] = float(torch.stack(ious).mean().cpu()) if ious else 0.0
+    metrics.update(
+        role_trajectory_metrics(
+            gt_role,
+            pred_role,
+            role_names,
+            view_layout=view_layout,
+            view_names=view_names,
+        )
+    )
     return add_full_metrics(metrics, full_metrics)
 
 
@@ -541,6 +716,8 @@ def evaluate_samples(
     fps: int,
     role_mask_render_mode: str = "binary",
     role_mask_palette: Optional[Dict[Any, Any]] = None,
+    view_layout: str = "single",
+    view_names: Optional[List[str]] = None,
 ) -> Dict[str, float]:
     sample_dir = output_dir / "samples"
     sample_dir.mkdir(parents=True, exist_ok=True)
@@ -560,8 +737,18 @@ def evaluate_samples(
             first_role_mask = first_role_mask.to(model.device, dtype=model.dtype)
         if role_mask_frames is not None:
             role_mask_frames = role_mask_frames.to(model.device, dtype=model.dtype)
-        last_role_mask = role_mask_frames[:, -1] if role_mask_frames is not None and tail_n > 0 else None
-        tail_role_masks = role_mask_frames[:, -tail_n:] if role_mask_frames is not None and tail_n > 0 else None
+        use_external_role_prompt = model.requires_role_mask_prompt
+        sample_first_role_mask = first_role_mask if use_external_role_prompt else None
+        last_role_mask = (
+            role_mask_frames[:, -1]
+            if use_external_role_prompt and role_mask_frames is not None and tail_n > 0
+            else None
+        )
+        tail_role_masks = (
+            role_mask_frames[:, -tail_n:]
+            if use_external_role_prompt and role_mask_frames is not None and tail_n > 0
+            else None
+        )
         language_embeddings = batch["language_embedding"]
         if language_embeddings is not None:
             language_embeddings = language_embeddings.to(model.device, dtype=model.dtype)
@@ -573,11 +760,11 @@ def evaluate_samples(
             last_state = last_state.to(model.device, dtype=model.dtype)
 
         generator = torch.Generator(device=model.device).manual_seed(seed + batch_idx)
-        pred_full = model.sample_bridge(
+        sample_output = model.sample_bridge(
             first_frame=first_frame,
             last_frame=last_frame,
             tail_frames=tail_frames,
-            first_role_mask=first_role_mask,
+            first_role_mask=sample_first_role_mask,
             last_role_mask=last_role_mask,
             tail_role_masks=tail_role_masks,
             language_embeddings=language_embeddings,
@@ -585,12 +772,20 @@ def evaluate_samples(
             last_state=last_state,
             num_inference_steps=num_inference_steps,
             generator=generator,
+            return_components=model.predict_role_mask,
         )
+        if model.predict_role_mask:
+            pred_rgb = sample_output["rgb_video"]
+            pred_role = sample_output["role_video"]
+            pred_full = torch.cat([pred_rgb, pred_role], dim=-1)
+        else:
+            pred_rgb = sample_output
+            pred_role = None
+            pred_full = pred_rgb
         gt_rgb = torch.cat([first_frame.unsqueeze(1).float(), video_frames.float()], dim=1).clamp(0, 1)
         if role_mask_frames is not None:
             gt_role = torch.cat([first_role_mask.unsqueeze(1).float(), role_mask_frames.float()], dim=1).clamp(0, 1)
-            gt_full = torch.cat([gt_rgb, gt_role], dim=-1)
-            pred_rgb, pred_role = pred_full.chunk(2, dim=-1)
+            gt_full = torch.cat([gt_rgb, gt_role], dim=-1) if pred_role is not None else gt_rgb
         else:
             gt_full = gt_rgb
 
@@ -606,14 +801,30 @@ def evaluate_samples(
                     ).items()
                 }
                 sample_metrics.update(
-                    role_mask_metrics(
+                    role_region_pixel_metrics(
+                        gt_rgb[local_idx : local_idx + 1].float(),
+                        pred_rgb[local_idx : local_idx + 1].float(),
                         gt_role[local_idx : local_idx + 1].float(),
-                        pred_role[local_idx : local_idx + 1].float(),
                         role_mask_render_mode,
                         role_mask_palette=role_mask_palette,
                         tail_condition_frames=model.config.tail_condition_frames,
                     )
                 )
+                if pred_role is not None:
+                    role_tail_condition_frames = (
+                        model.config.tail_condition_frames
+                        if model.role_mask_condition_mode == "legacy_endpoints"
+                        else 0
+                    )
+                    sample_metrics.update(role_mask_metrics(
+                        gt_role[local_idx : local_idx + 1].float(),
+                        pred_role[local_idx : local_idx + 1].float(),
+                        role_mask_render_mode,
+                        role_mask_palette=role_mask_palette,
+                        tail_condition_frames=role_tail_condition_frames,
+                        view_layout=view_layout,
+                        view_names=view_names,
+                    ))
             else:
                 sample_metrics = pixel_metrics(
                     gt_full[local_idx : local_idx + 1].float(),
@@ -622,17 +833,53 @@ def evaluate_samples(
                 )
             metric_rows.append(sample_metrics)
             sample_metric_rows[name] = sample_metrics
+            # Keep the historical filenames as RGB-only outputs so human review does not
+            # shrink each camera frame by horizontally appending the auxiliary RoleMask.
             save_contact_sheet(
-                gt_full[local_idx],
-                pred_full[local_idx],
+                gt_rgb[local_idx],
+                pred_rgb[local_idx],
                 sample_dir / f"{name}_sheet.png",
             )
             save_comparison_video(
-                gt_full[local_idx],
-                pred_full[local_idx],
+                gt_rgb[local_idx],
+                pred_rgb[local_idx],
                 sample_dir / f"{name}_gt_pred.mp4",
                 fps=fps,
             )
+            save_contact_sheet(
+                gt_rgb[local_idx],
+                pred_rgb[local_idx],
+                sample_dir / f"{name}_rgb_sheet.png",
+            )
+            save_comparison_video(
+                gt_rgb[local_idx],
+                pred_rgb[local_idx],
+                sample_dir / f"{name}_rgb_gt_pred.mp4",
+                fps=fps,
+            )
+            if pred_role is not None:
+                save_contact_sheet(
+                    gt_role[local_idx],
+                    pred_role[local_idx],
+                    sample_dir / f"{name}_role_sheet.png",
+                )
+                save_contact_sheet(
+                    gt_full[local_idx],
+                    pred_full[local_idx],
+                    sample_dir / f"{name}_combined_sheet.png",
+                )
+                save_comparison_video(
+                    gt_role[local_idx],
+                    pred_role[local_idx],
+                    sample_dir / f"{name}_role_gt_pred.mp4",
+                    fps=fps,
+                )
+                save_comparison_video(
+                    gt_full[local_idx],
+                    pred_full[local_idx],
+                    sample_dir / f"{name}_combined_gt_pred.mp4",
+                    fps=fps,
+                )
             sample_index += 1
 
     with (output_dir / "sample_metrics.json").open("w") as file:
@@ -728,6 +975,13 @@ def main() -> None:
             fps=args.fps,
             role_mask_render_mode=config.dataset.get("role_mask_render_mode", "binary"),
             role_mask_palette=config.dataset.get("role_mask_palette", None),
+            view_layout=str(config.dataset.get("view_layout", "single")),
+            view_names=[
+                str(name)
+                for name in config.dataset.get(
+                    "image_columns", [config.dataset.get("image_column", "image")]
+                )
+            ],
         )
 
     with (output_dir / "metrics.json").open("w") as file:

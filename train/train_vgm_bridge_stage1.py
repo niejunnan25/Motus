@@ -269,7 +269,8 @@ class VGMBridgeStage1Trainer:
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=grad_clip_norm)
 
             self.optimizer.step()
-            if self.scheduler is not None:
+            should_step_scheduler = self.accelerator is None or self.accelerator.sync_gradients
+            if self.scheduler is not None and should_step_scheduler:
                 self.scheduler.step()
             self.optimizer.zero_grad(set_to_none=True)
 
@@ -375,6 +376,12 @@ def create_model_and_optimizer(config: OmegaConf) -> tuple[VGMBridgeStage1, torc
         state_clip=config.common.get("state_clip", 10.0),
         role_mask_fusion_mode=config.common.get("role_mask_fusion_mode", "none"),
         role_mask_loss_weight=config.common.get("role_mask_loss_weight", 1.0),
+        role_mask_training_mode=config.common.get("role_mask_training_mode", "legacy"),
+        role_mask_condition_mode=config.common.get("role_mask_condition_mode", "legacy"),
+        role_mask_prompt_dropout=config.common.get("role_mask_prompt_dropout", 0.5),
+        role_mask_loss_warmup_steps=config.common.get("role_mask_loss_warmup_steps", 0),
+        role_rgb_max_weight=config.common.get("role_rgb_max_weight", 8.0),
+        role_rgb_weight_warmup_steps=config.common.get("role_rgb_weight_warmup_steps", 1000),
         load_pretrained_backbones=getattr(config.model, "load_pretrained_backbones", None),
     )
     model = VGMBridgeStage1(model_config)
@@ -572,6 +579,9 @@ def main() -> None:
         log_with=report_to if report_to else None,
         project_dir=config.system.checkpoint_dir,
         project_config=accelerator_project_config,
+        # The trainer advances the scheduler once per synchronized optimizer
+        # update. Accelerate's default would advance it once per process.
+        step_scheduler_with_optimizer=False,
     )
 
     rank = accelerator.process_index
