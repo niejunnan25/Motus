@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 import torch.utils.data as data
 from PIL import Image
 from tqdm import tqdm
@@ -147,6 +148,12 @@ def video_bridge_collate_fn(batch: List[Optional[Dict[str, Any]]]) -> Optional[D
     return {
         "first_frame": torch.stack([sample["first_frame"] for sample in batch]),
         "video_frames": torch.stack([sample["video_frames"] for sample in batch]),
+        "first_view_frames": _process_optional_tensors_batch(
+            [sample.get("first_view_frames") for sample in batch], "first_view_frames"
+        ),
+        "view_video_frames": _process_optional_tensors_batch(
+            [sample.get("view_video_frames") for sample in batch], "view_video_frames"
+        ),
         "first_role_mask": _process_optional_tensors_batch(
             [sample.get("first_role_mask") for sample in batch], "first_role_mask"
         ),
@@ -202,6 +209,8 @@ class VideoBridgeDataset(data.Dataset):
         image_column: str = "image",
         image_columns: Optional[List[str]] = None,
         view_layout: str = "single",
+        return_separate_views: bool = False,
+        view_video_size: Optional[Tuple[int, int]] = None,
         task_language_embedding_dir: Optional[str] = None,
         task_language_embedding_pattern: str = "task_{task_index:06d}.pt",
         task_language_caption_version: Optional[str] = None,
@@ -209,6 +218,8 @@ class VideoBridgeDataset(data.Dataset):
         state_column: str = "observation.state",
         bridge_sampling_mode: str = "sliding_window",
         bridge_sampling_jitter: bool = False,
+        index_seeded_sampling: bool = False,
+        sampling_seed: int = 0,
         load_role_mask: bool = False,
         role_mask_columns: Optional[List[str]] = None,
         role_mask_render_mode: str = "binary",
@@ -241,6 +252,8 @@ class VideoBridgeDataset(data.Dataset):
         self.image_column = image_column
         self.image_columns = list(image_columns) if image_columns else [image_column]
         self.view_layout = view_layout
+        self.return_separate_views = bool(return_separate_views)
+        self.view_video_size = tuple(view_video_size) if view_video_size is not None else None
         self.task_language_embedding_dir = task_language_embedding_dir
         self.task_language_embedding_pattern = task_language_embedding_pattern
         self.task_language_caption_version = task_language_caption_version
@@ -248,6 +261,8 @@ class VideoBridgeDataset(data.Dataset):
         self.state_column = str(state_column)
         self.bridge_sampling_mode = bridge_sampling_mode
         self.bridge_sampling_jitter = bool(bridge_sampling_jitter)
+        self.index_seeded_sampling = bool(index_seeded_sampling)
+        self.sampling_seed = int(sampling_seed)
         self.load_role_mask = bool(load_role_mask)
         self.role_mask_columns = list(role_mask_columns or [])
         self.role_mask_render_mode = str(role_mask_render_mode)
@@ -291,15 +306,18 @@ class VideoBridgeDataset(data.Dataset):
         logger.info(
             "VideoBridgeDataset initialized with %s episodes from %s roots; "
             "data_format=%s, image_columns=%s, view_layout=%s, require_language_embedding=%s, "
-            "bridge_sampling_mode=%s, bridge_sampling_jitter=%s",
+            "return_separate_views=%s, bridge_sampling_mode=%s, bridge_sampling_jitter=%s, "
+            "index_seeded_sampling=%s",
             len(self.episodes),
             len(self.dataset_dir),
             self.data_format,
             self.image_columns,
             self.view_layout,
             self.require_language_embedding,
+            self.return_separate_views,
             self.bridge_sampling_mode,
             self.bridge_sampling_jitter,
+            self.index_seeded_sampling,
         )
 
     def _scan_all_episodes(self) -> List[Dict[str, Any]]:
@@ -690,6 +708,20 @@ class VideoBridgeDataset(data.Dataset):
             )
         return self._load_episode_frames(episode, indices)
 
+    def load_episode_view_frames(self, episode_index: int, frame_indices: List[int]) -> torch.Tensor:
+        """Load exact source frames while preserving the camera dimension [F,V,C,H,W]."""
+        if not self.episodes:
+            raise IndexError("VideoBridgeDataset has no episodes")
+        episode = self.episodes[episode_index % len(self.episodes)]
+        total_frames = self._episode_frame_count(episode)
+        indices = [int(index) for index in frame_indices]
+        if any(index < 0 or index >= total_frames for index in indices):
+            raise IndexError(
+                f"Frame indices out of bounds for {episode.get('episode_name')}: "
+                f"indices={indices}, total_frames={total_frames}"
+            )
+        return self._load_episode_view_frames(episode, indices)
+
     def load_episode_language_embedding(self, episode_index: int) -> Optional[torch.Tensor]:
         """Load the language embedding associated with one deterministic episode."""
         if not self.episodes:
@@ -703,7 +735,13 @@ class VideoBridgeDataset(data.Dataset):
             raise IndexError("VideoBridgeDataset has no episodes")
         return dict(self.episodes[episode_index % len(self.episodes)])
 
-    def _uniform_frame_indices(self, total_frames: int, *, jitter: bool) -> List[int]:
+    def _uniform_frame_indices(
+        self,
+        total_frames: int,
+        *,
+        jitter: bool,
+        rng: Optional[random.Random] = None,
+    ) -> List[int]:
         frame_count = self.num_video_frames + 1
         if total_frames < frame_count:
             raise ValueError(f"Video is too short: total_frames={total_frames}, needs at least {frame_count}")
@@ -723,7 +761,7 @@ class VideoBridgeDataset(data.Dataset):
             lo = max(start_idx + 1, int(np.floor(left)) + 1)
             hi = min(end_idx - 1, int(np.floor(right)))
             if lo <= hi:
-                indices.append(random.randint(lo, hi))
+                indices.append((rng or random).randint(lo, hi))
             else:
                 indices.append(int(round(targets[frame_pos])))
         indices.append(end_idx)
@@ -735,9 +773,18 @@ class VideoBridgeDataset(data.Dataset):
             )
         return indices
 
-    def _select_indices(self, total_frames: int) -> Tuple[int, List[int]]:
+    def _select_indices(
+        self,
+        total_frames: int,
+        *,
+        rng: Optional[random.Random] = None,
+    ) -> Tuple[int, List[int]]:
         if self.bridge_sampling_mode == "full_episode_uniform":
-            frame_indices = self._uniform_frame_indices(total_frames, jitter=self.bridge_sampling_jitter)
+            frame_indices = self._uniform_frame_indices(
+                total_frames,
+                jitter=self.bridge_sampling_jitter,
+                rng=rng,
+            )
             return frame_indices[0], frame_indices[1:]
 
         step = self.global_downsample_rate
@@ -748,9 +795,25 @@ class VideoBridgeDataset(data.Dataset):
                 f"needs at least {1 + self.num_video_frames * step}"
             )
 
-        condition_idx = random.randint(0, max_cond)
+        condition_idx = (rng or random).randint(0, max_cond)
         video_indices = [condition_idx + (i + 1) * step for i in range(self.num_video_frames)]
         return condition_idx, video_indices
+
+    def _episode_and_rng_for_index(
+        self,
+        index: int,
+        attempt: int,
+    ) -> Tuple[Dict[str, Any], Optional[random.Random]]:
+        """Map sampler indices to reproducible, rank-independent episode draws."""
+        if not self.index_seeded_sampling:
+            return random.choice(self.episodes), None
+        episode_index = (int(index) + int(attempt)) % len(self.episodes)
+        draw_seed = (
+            self.sampling_seed * 1_000_003
+            + int(index) * 97_409
+            + int(attempt) * 65_537
+        ) & ((1 << 63) - 1)
+        return self.episodes[episode_index], random.Random(draw_seed)
 
     def _episode_frame_count(self, episode: Dict[str, Any]) -> int:
         if episode.get("format", "video") == "lerobot_parquet":
@@ -765,6 +828,61 @@ class VideoBridgeDataset(data.Dataset):
         if episode.get("format") == "lerobot_v3_video":
             return self._load_lerobot_v3_video_frames(episode, frame_indices)
         return load_video_frames(episode["video_path"], frame_indices, self.video_size)
+
+    def _load_episode_view_frames(self, episode: Dict[str, Any], frame_indices: List[int]) -> torch.Tensor:
+        if episode.get("format", "video") == "lerobot_parquet":
+            return self._load_lerobot_parquet_view_frames(episode["parquet_path"], frame_indices)
+        if episode.get("format") == "lerobot_v3_video":
+            return self._load_lerobot_v3_video_view_frames(episode, frame_indices)
+        size = self.view_video_size or self.video_size
+        return load_video_frames(episode["video_path"], frame_indices, size).unsqueeze(1)
+
+    @staticmethod
+    def _resize_tensor_with_padding(frames: torch.Tensor, target_size: Tuple[int, int]) -> torch.Tensor:
+        """Resize [N,C,H,W] tensors with the same aspect-preserving black padding as RGB loading."""
+        target_h, target_w = (int(target_size[0]), int(target_size[1]))
+        source_h, source_w = frames.shape[-2:]
+        if (source_h, source_w) == (target_h, target_w):
+            return frames
+        scale = min(target_h / source_h, target_w / source_w)
+        resized_h = max(1, int(round(source_h * scale)))
+        resized_w = max(1, int(round(source_w * scale)))
+        frames = F.interpolate(frames, size=(resized_h, resized_w), mode="bilinear", align_corners=False)
+        pad_h = target_h - resized_h
+        pad_w = target_w - resized_w
+        return F.pad(
+            frames,
+            (pad_w // 2, pad_w - pad_w // 2, pad_h // 2, pad_h - pad_h // 2),
+            value=0.0,
+        )
+
+    def _compose_view_tensor(self, view_frames: torch.Tensor) -> torch.Tensor:
+        """Compose [F,V,C,H,W] camera frames using the configured legacy RGB layout."""
+        if view_frames.ndim != 5:
+            raise ValueError(f"view_frames must be [F,V,C,H,W], got {tuple(view_frames.shape)}")
+        if view_frames.shape[1] == 1 or self.view_layout == "single":
+            composed = view_frames[:, 0]
+        elif self.view_layout == "vertical":
+            composed = torch.cat([view_frames[:, index] for index in range(view_frames.shape[1])], dim=-2)
+        elif self.view_layout == "horizontal":
+            composed = torch.cat([view_frames[:, index] for index in range(view_frames.shape[1])], dim=-1)
+        else:
+            raise ValueError(
+                f"Unsupported view_layout={self.view_layout!r}; expected single/vertical/horizontal"
+            )
+        if self.video_size is not None:
+            composed = self._resize_tensor_with_padding(composed, self.video_size)
+        return composed
+
+    def _load_frames_with_optional_views(
+        self,
+        episode: Dict[str, Any],
+        frame_indices: List[int],
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        if not self.return_separate_views:
+            return self._load_episode_frames(episode, frame_indices), None
+        view_frames = self._load_episode_view_frames(episode, frame_indices)
+        return self._compose_view_tensor(view_frames), view_frames
 
     def _load_episode_states(self, episode: Dict[str, Any], frame_indices: List[int]) -> Optional[torch.Tensor]:
         if not self.load_state:
@@ -1062,7 +1180,7 @@ class VideoBridgeDataset(data.Dataset):
                 for i in range(self.num_video_frames)
             ]
             frame_indices = [condition_idx] + video_indices
-        frames = self._load_episode_frames(episode, frame_indices)
+        frames, view_frames = self._load_frames_with_optional_views(episode, frame_indices)
         role_masks = self._load_episode_role_masks(episode, frame_indices)
         states = self._load_episode_states(episode, frame_indices)
         language_embedding = self._load_language_embedding(episode.get("lang_path"))
@@ -1070,6 +1188,8 @@ class VideoBridgeDataset(data.Dataset):
         sample = {
             "first_frame": frames[0],
             "video_frames": frames[1:],
+            "first_view_frames": view_frames[0] if view_frames is not None else None,
+            "view_video_frames": view_frames[1:] if view_frames is not None else None,
             "first_role_mask": role_masks[0] if role_masks is not None else None,
             "role_mask_frames": role_masks[1:] if role_masks is not None else None,
             "language_embedding": language_embedding,
@@ -1163,6 +1283,22 @@ class VideoBridgeDataset(data.Dataset):
         frames_np = np.stack(frames, axis=0)
         return torch.from_numpy(frames_np).permute(0, 3, 1, 2).float() / 255.0
 
+    def _load_lerobot_parquet_view_frames(self, parquet_path: str, frame_indices: List[int]) -> torch.Tensor:
+        import pandas as pd
+
+        df = pd.read_parquet(parquet_path, columns=self.image_columns)
+        frames = []
+        for idx in frame_indices:
+            views = []
+            for column in self.image_columns:
+                frame = self._decode_lerobot_image_cell(df[column].iloc[idx], parquet_path)
+                if self.view_video_size is not None and frame.shape[:2] != self.view_video_size:
+                    frame = resize_with_padding(frame, self.view_video_size)
+                views.append(frame)
+            frames.append(np.stack(views, axis=0))
+        frames_np = np.stack(frames, axis=0)
+        return torch.from_numpy(frames_np).permute(0, 1, 4, 2, 3).float() / 255.0
+
     def _load_video_frames_pyav(self, video_path: str, frame_indices: List[int]) -> List[np.ndarray]:
         import av
 
@@ -1201,18 +1337,42 @@ class VideoBridgeDataset(data.Dataset):
         frames_np = np.stack(frames, axis=0)
         return torch.from_numpy(frames_np).permute(0, 3, 1, 2).float() / 255.0
 
+    def _load_lerobot_v3_video_view_frames(
+        self,
+        episode: Dict[str, Any],
+        frame_indices: List[int],
+    ) -> torch.Tensor:
+        view_batches = [
+            self._load_video_frames_pyav(video_path, frame_indices)
+            for video_path in episode["video_paths"]
+        ]
+        frames = []
+        for frame_pos in range(len(frame_indices)):
+            views = []
+            for view_batch in view_batches:
+                frame = view_batch[frame_pos]
+                if self.view_video_size is not None and frame.shape[:2] != self.view_video_size:
+                    frame = resize_with_padding(frame, self.view_video_size)
+                views.append(frame)
+            frames.append(np.stack(views, axis=0))
+        frames_np = np.stack(frames, axis=0)
+        return torch.from_numpy(frames_np).permute(0, 1, 4, 2, 3).float() / 255.0
+
     def __getitem__(self, idx: int) -> Optional[Dict[str, Any]]:
         if not self.episodes:
             return None
 
-        for _ in range(20):
-            episode = random.choice(self.episodes)
+        for attempt in range(20):
+            episode, sampling_rng = self._episode_and_rng_for_index(idx, attempt)
             try:
                 total_frames = self._episode_frame_count(episode)
-                condition_idx, video_indices = self._select_indices(total_frames)
+                condition_idx, video_indices = self._select_indices(
+                    total_frames,
+                    rng=sampling_rng,
+                )
                 frame_indices = [condition_idx] + video_indices
 
-                frames = self._load_episode_frames(episode, frame_indices)
+                frames, view_frames = self._load_frames_with_optional_views(episode, frame_indices)
                 try:
                     role_masks = self._load_episode_role_masks(episode, frame_indices)
                 except Exception as exc:
@@ -1227,6 +1387,8 @@ class VideoBridgeDataset(data.Dataset):
                 sample = {
                     "first_frame": frames[0],
                     "video_frames": frames[1:],
+                    "first_view_frames": view_frames[0] if view_frames is not None else None,
+                    "view_video_frames": view_frames[1:] if view_frames is not None else None,
                     "first_role_mask": role_masks[0] if role_masks is not None else None,
                     "role_mask_frames": role_masks[1:] if role_masks is not None else None,
                     "language_embedding": language_embedding,

@@ -1,0 +1,7 @@
+_base_: vgm_bridge_multiview_base_53f.yaml
+common:
+  multiview_mode: "latent_spatial"
+dataset:
+  return_separate_views: true
+logging:
+  run_name: "vgm_bridge_mv2_independent_vae_spatial_53f_2gpu_gbs8_50k"

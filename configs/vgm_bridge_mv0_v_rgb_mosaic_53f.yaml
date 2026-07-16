@@ -1,0 +1,8 @@
+_base_: vgm_bridge_multiview_base_53f.yaml
+common:
+  multiview_mode: "legacy"
+  multiview_layout: "vertical"
+dataset:
+  view_layout: "vertical"
+logging:
+  run_name: "vgm_bridge_mv0_v_rgb_mosaic_53f_2gpu_gbs8_50k"

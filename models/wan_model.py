@@ -245,9 +245,12 @@ class WanVideoModel(nn.Module):
             config_path = checkpoint_path
         
         config_json_path = os.path.join(config_path, 'config.json')
-        if os.path.exists(config_json_path):
-            with open(config_json_path, 'r') as f:
-                model_config = json.load(f)
+        if not os.path.isfile(config_json_path):
+            raise FileNotFoundError(
+                f"WAN config.json does not exist under pretrained path: {config_json_path}"
+            )
+        with open(config_json_path, 'r') as f:
+            model_config = json.load(f)
         
         # Create model
         model = cls(
@@ -319,7 +322,9 @@ class WanVideoModel(nn.Module):
                 logger.info(f"Successfully loaded WAN weights from directory")
                 
         except Exception as e:
-            logger.warning(f"Failed to load WAN checkpoint from {checkpoint_path}: {e}")
-            logger.warning("Using random initialization instead")
+            raise RuntimeError(
+                f"Failed to load requested WAN pretrained checkpoint from {checkpoint_path}. "
+                "Refusing to continue with random weights."
+            ) from e
         
         return model

@@ -27,6 +27,7 @@ from models.progress_stage2 import (
     build_progress_model,
     compute_progress_loss,
 )
+from utils.config_utils import load_config_with_base
 
 logger = logging.getLogger(__name__)
 
@@ -127,7 +128,7 @@ def load_frozen_vgm(config: Any, device: torch.device):
         from eval_vgm_bridge_stage1 import build_model as build_vgm_model
 
     # Layerwise/WVM-style 需要重新运行冻结的 V1-proper WAN，并读取其 30 层 hidden state。
-    vgm_config = OmegaConf.load(config.source.vgm_config)
+    vgm_config = load_config_with_base(config.source.vgm_config)
     vgm = build_vgm_model(vgm_config, Path(config.source.vgm_checkpoint))
     vgm.to(device)
     vgm.eval()
@@ -170,7 +171,7 @@ def source_requires_trajectory_role_latent(config: Any) -> bool:
     """Return whether Layerwise replay needs the joint RoleMask trajectory cache field."""
     if str(config.progress_model.fusion_mode) != "layerwise_wvm":
         return False
-    vgm_config = OmegaConf.load(config.source.vgm_config)
+    vgm_config = load_config_with_base(config.source.vgm_config)
     return (
         str(vgm_config.common.get("role_mask_fusion_mode", "none")) == "latent_channel"
         and str(vgm_config.common.get("role_mask_training_mode", "legacy"))
@@ -354,6 +355,15 @@ def prepare_episode_micro_batch(
         )
     else:
         trajectory_role_latent = torch.stack(role_latents, dim=0)
+    view_latents = [episode.get("trajectory_view_latent") for episode in episodes]
+    if all(value is None for value in view_latents):
+        trajectory_view_latent = None
+    elif any(value is None for value in view_latents):
+        raise ValueError(
+            "An episode micro-batch cannot mix caches with and without trajectory_view_latent"
+        )
+    else:
+        trajectory_view_latent = torch.stack(view_latents, dim=0)
     # trajectory_frame_latents: E * [F=53,C_z,1,H_z,W_z]
     # -> [E,F=53,C_z,1,H_z,W_z]。
     trajectory_frame_latents = torch.stack(
@@ -412,6 +422,7 @@ def prepare_episode_micro_batch(
     prepared = {
         "trajectory_latent": trajectory_latent,
         "trajectory_role_latent": trajectory_role_latent,
+        "trajectory_view_latent": trajectory_view_latent,
         "trajectory_frame_latents": trajectory_frame_latents,
         # [sum_e Q_e,C_z,1,H_z,W_z]；正式 mixed batch 中 Q_e 都等于配置 Q。
         "current_latents": torch.cat(current_latents, dim=0),

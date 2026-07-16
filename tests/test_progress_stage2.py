@@ -1001,6 +1001,7 @@ def test_progress_cache_dataset_preserves_whole_episode(tmp_path):
     assert sample["num_progress_bins"] == 53
     assert sample["current_latents"].shape[0] == 7
     assert sample["trajectory_role_latent"] is None
+    assert sample["trajectory_view_latent"] is None
     assert sample["progress"].tolist() == torch.linspace(0.0, 1.0, 7).tolist()
     collated = progress_episode_collate_fn([sample, sample])
     # collate 只保留长度 E=2 的 episode list，不会尝试 stack 不同长度的 N 维。
@@ -1016,6 +1017,29 @@ def test_progress_cache_dataset_preserves_whole_episode(tmp_path):
             expected_num_progress_bins=53,
             require_trajectory_role_latent=True,
         )[0]
+
+    with pytest.raises(ValueError, match="requires trajectory_view_latent"):
+        ProgressEpisodeCacheDataset(
+            tmp_path,
+            split="train",
+            load_language_embedding=True,
+            expected_num_progress_bins=53,
+            require_trajectory_view_latent=True,
+        )[0]
+
+    payload["trajectory_view_latent"] = torch.randn(2, 4, 3, 4, 4)
+    payload["first_view_frames"] = torch.zeros(2, 3, 8, 8, dtype=torch.uint8)
+    payload["last_view_frames"] = torch.zeros(2, 3, 8, 8, dtype=torch.uint8)
+    torch.save(payload, episode_dir / "episode.pt")
+    multiview_sample = ProgressEpisodeCacheDataset(
+        tmp_path,
+        split="train",
+        load_language_embedding=True,
+        expected_num_progress_bins=53,
+        require_trajectory_view_latent=True,
+    )[0]
+    assert multiview_sample["trajectory_view_latent"].shape == (2, 4, 3, 4, 4)
+    assert multiview_sample["first_view_frames"].shape == (2, 3, 8, 8)
 
     payload["trajectory_role_latent"] = torch.randn_like(payload["trajectory_latent"])
     torch.save(payload, episode_dir / "episode.pt")

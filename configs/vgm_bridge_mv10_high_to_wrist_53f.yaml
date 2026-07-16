@@ -1,0 +1,8 @@
+_base_: vgm_bridge_multiview_base_53f.yaml
+common:
+  multiview_mode: "autoregressive_high_to_wrist"
+  view_capacity_mode: "shared"
+dataset:
+  return_separate_views: true
+logging:
+  run_name: "vgm_bridge_mv10_high_to_wrist_53f_2gpu_gbs8_50k"

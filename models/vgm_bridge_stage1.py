@@ -1,5 +1,6 @@
 import logging
 import math
+import copy
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,6 +18,17 @@ from wan.modules.model import sinusoidal_embedding_1d
 from wan.utils.fm import FlowMatchScheduler
 
 from .wan_model import WanVideoModel
+from .vgm_multiview import (
+    ARCHITECTURE_MODES,
+    MULTIVIEW_MODES,
+    BottleneckResidual,
+    CrossViewConsistencyHead,
+    MosaicViewEmbedding,
+    MultiViewWanRunner,
+    SEPARATE_VIEW_MODES,
+    add_token_residuals,
+    matched_control_bottleneck_dim,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -138,6 +150,19 @@ class VGMBridgeStage1Config:
     role_mask_loss_warmup_steps: int = 0
     role_rgb_max_weight: float = 8.0
     role_rgb_weight_warmup_steps: int = 1000
+    # Multi-view experiments preserve the legacy path unless explicitly enabled.
+    multiview_mode: str = "legacy"
+    num_views: int = 2
+    multiview_layout: str = "vertical"
+    view_capacity_mode: str = "shared"
+    multiview_layer_indices: Optional[List[int]] = None
+    multiview_adapter_dim: int = 256
+    multiview_adapter_heads: int = 8
+    multiview_scene_tokens: int = 4
+    multiview_consistency_weight: float = 0.1
+    multiview_consistency_temperature: float = 0.07
+    multiview_consistency_projection_dim: int = 128
+    multiview_output_layout: str = "vertical"
     load_pretrained_backbones: Optional[bool] = None
 
 
@@ -200,6 +225,41 @@ class VGMBridgeStage1(nn.Module):
                 f"Unknown role_mask_condition_mode={config.role_mask_condition_mode!r}; "
                 f"expected one of {sorted(self.VALID_ROLE_MASK_CONDITION_MODES)}"
             )
+        if config.multiview_mode not in MULTIVIEW_MODES:
+            raise ValueError(
+                f"Unknown multiview_mode={config.multiview_mode!r}; "
+                f"expected one of {sorted(MULTIVIEW_MODES)}"
+            )
+        if int(config.num_views) < 2 and config.multiview_mode != "legacy":
+            raise ValueError("Explicit multi-view modes require num_views >= 2")
+        if config.multiview_layout not in {"vertical", "horizontal"}:
+            raise ValueError("multiview_layout must be vertical or horizontal")
+        if config.multiview_output_layout not in {"vertical", "horizontal"}:
+            raise ValueError("multiview_output_layout must be vertical or horizontal")
+        if config.view_capacity_mode not in {"shared", "view_adapter", "separate"}:
+            raise ValueError("view_capacity_mode must be shared, view_adapter, or separate")
+        if config.view_capacity_mode == "separate" and config.multiview_mode not in {
+            "independent",
+            "independent_consistency",
+            "cross_view_attention",
+        }:
+            raise ValueError(
+                "Separate WAN capacity is supported for MV4/MV5 and factorized MV7"
+            )
+        if config.view_capacity_mode == "view_adapter" and config.multiview_mode not in ARCHITECTURE_MODES:
+            raise ValueError("view_adapter capacity requires a token-level MV6-MV10 architecture")
+        if (
+            config.view_capacity_mode == "view_adapter"
+            and config.multiview_mode == "autoregressive_high_to_wrist"
+        ):
+            raise ValueError("MV10 sequential passes currently require shared capacity")
+        if float(config.multiview_consistency_weight) < 0:
+            raise ValueError("multiview_consistency_weight must be >= 0")
+        if config.multiview_mode in {
+            "independent_consistency",
+            "autoregressive_high_to_wrist",
+        } and int(config.num_views) != 2:
+            raise ValueError(f"{config.multiview_mode} currently requires exactly two views")
         if not 0.0 <= float(config.role_mask_prompt_dropout) <= 1.0:
             raise ValueError("role_mask_prompt_dropout must be in [0, 1]")
         if int(config.role_mask_loss_warmup_steps) < 0:
@@ -210,6 +270,16 @@ class VGMBridgeStage1(nn.Module):
             raise ValueError("role_rgb_weight_warmup_steps must be >= 0")
         if config.role_mask_fusion_mode != "none" and config.interaction_loss_enabled:
             raise ValueError("Role-mask experiments currently require interaction_loss_enabled=false")
+        if config.multiview_mode != "legacy" and (
+            config.role_mask_fusion_mode != "none"
+            or config.role_mask_training_mode != "legacy"
+            or config.interaction_loss_enabled
+            or config.state_condition_mode != "none"
+        ):
+            raise ValueError(
+                "Multi-view architecture ablations intentionally exclude RoleMask, interaction loss, "
+                "and state conditioning so the structural comparison remains identifiable"
+            )
         if config.role_mask_training_mode != "legacy" and config.role_mask_condition_mode == "legacy":
             raise ValueError(
                 "Non-legacy RoleMask experiments must set role_mask_condition_mode explicitly"
@@ -281,6 +351,9 @@ class VGMBridgeStage1(nn.Module):
 
         self.device = next(self.video_model.wan_model.parameters()).device
         self.latent_channels = self.video_model.wan_model.in_dim
+        self.multiview_mode = config.multiview_mode
+        self.num_views = int(config.num_views)
+        self.uses_separate_views = self.multiview_mode in SEPARATE_VIEW_MODES
         self.role_mask_fusion_mode = config.role_mask_fusion_mode
         self.role_mask_training_mode = config.role_mask_training_mode
         if self.role_mask_training_mode == "legacy":
@@ -299,7 +372,10 @@ class VGMBridgeStage1(nn.Module):
         self.requires_role_mask_prompt = (
             self.predict_role_mask and self.role_mask_condition_mode == "legacy_endpoints"
         )
-        self.model_latent_channels = self.latent_channels * (2 if self.role_mask_fusion_mode == "latent_channel" else 1)
+        channel_multiplier = self.num_views if self.multiview_mode == "latent_channel" else 1
+        if self.role_mask_fusion_mode == "latent_channel":
+            channel_multiplier *= 2
+        self.model_latent_channels = self.latent_channels * channel_multiplier
         self.use_mask_condition = config.conditioning_mode in {"v1_mask", "v1_mask_endpoint"}
         self.use_endpoint_adapter = config.conditioning_mode in {"v0_5_endpoint", "v1_mask_endpoint"}
         self.use_state_condition = config.state_condition_mode != "none"
@@ -307,7 +383,7 @@ class VGMBridgeStage1(nn.Module):
 
         if self.use_mask_condition:
             self._expand_patch_embedding(self.model_latent_channels * 2 + config.mask_channels)
-        if self.role_mask_fusion_mode == "latent_channel":
+        if self.role_mask_fusion_mode == "latent_channel" or self.multiview_mode == "latent_channel":
             self._expand_output_head(self.model_latent_channels)
         if self.use_endpoint_adapter:
             self.endpoint_adapter = EndpointTokenAdapter(
@@ -327,6 +403,71 @@ class VGMBridgeStage1(nn.Module):
         else:
             self.state_adapter = None
 
+        layer_indices = config.multiview_layer_indices
+        if layer_indices is None:
+            layer_indices = list(range(3, len(self.video_model.wan_model.blocks), 4))
+        layer_indices = sorted({int(index) for index in layer_indices})
+        invalid_layers = [
+            index for index in layer_indices
+            if index < 0 or index >= len(self.video_model.wan_model.blocks)
+        ]
+        if invalid_layers:
+            raise ValueError(f"Invalid multiview_layer_indices: {invalid_layers}")
+
+        self.mosaic_view_embedding = None
+        if self.multiview_mode in {
+            "rgb_mosaic_view_embedding",
+            "rgb_mosaic_adapter_control",
+        }:
+            self.mosaic_view_embedding = MosaicViewEmbedding(
+                num_views=self.num_views,
+                hidden_dim=self.video_model.wan_model.dim,
+            ).to(device=self.device, dtype=self.dtype)
+
+        self.mosaic_control_adapters = nn.ModuleDict()
+        if self.multiview_mode == "rgb_mosaic_adapter_control":
+            control_dim = matched_control_bottleneck_dim(
+                self.video_model.wan_model.dim,
+                int(config.multiview_adapter_dim),
+            )
+            self.mosaic_control_adapters = nn.ModuleDict(
+                {
+                    str(layer_index): BottleneckResidual(
+                        self.video_model.wan_model.dim,
+                        control_dim,
+                    )
+                    for layer_index in layer_indices
+                }
+            ).to(device=self.device, dtype=self.dtype)
+
+        self.multiview_runner = None
+        if self.multiview_mode in ARCHITECTURE_MODES:
+            self.multiview_runner = MultiViewWanRunner(
+                mode=self.multiview_mode,
+                num_views=self.num_views,
+                hidden_dim=self.video_model.wan_model.dim,
+                adapter_dim=int(config.multiview_adapter_dim),
+                adapter_heads=int(config.multiview_adapter_heads),
+                layer_indices=layer_indices,
+                num_scene_tokens=int(config.multiview_scene_tokens),
+                capacity_mode=config.view_capacity_mode,
+            ).to(device=self.device, dtype=self.dtype)
+
+        self.cross_view_consistency_head = None
+        if self.multiview_mode == "independent_consistency":
+            self.cross_view_consistency_head = CrossViewConsistencyHead(
+                latent_channels=self.latent_channels,
+                num_views=self.num_views,
+                projection_dim=int(config.multiview_consistency_projection_dim),
+                temperature=float(config.multiview_consistency_temperature),
+            ).to(device=self.device, dtype=self.dtype)
+
+        self.additional_view_models = nn.ModuleList()
+        if config.view_capacity_mode == "separate":
+            self.additional_view_models.extend(
+                copy.deepcopy(self.video_model.wan_model) for _ in range(self.num_views - 1)
+            )
+
         self.fm_train_scheduler = FlowMatchScheduler(
             shift=5.0,
             sigma_min=0.0,
@@ -340,7 +481,8 @@ class VGMBridgeStage1(nn.Module):
             "tail_condition_frames=%s, condition_on_last_frame=%s, state_condition_mode=%s, "
             "role_mask_fusion_mode=%s, role_mask_training_mode=%s, "
             "role_mask_condition_mode=%s, interaction_loss=%s, "
-            "interaction_weight_mode=%s, video_size=%sx%s",
+            "interaction_weight_mode=%s, multiview_mode=%s, view_capacity_mode=%s, "
+            "video_size=%sx%s",
             config.conditioning_mode,
             config.num_video_frames,
             config.tail_condition_frames,
@@ -351,6 +493,8 @@ class VGMBridgeStage1(nn.Module):
             self.role_mask_condition_mode,
             self.use_interaction_loss,
             config.interaction_weight_mode,
+            self.multiview_mode,
+            config.view_capacity_mode,
             config.video_height,
             config.video_width,
         )
@@ -383,7 +527,15 @@ class VGMBridgeStage1(nn.Module):
         ).to(device=patch_embedding.weight.device, dtype=patch_embedding.weight.dtype)
         with torch.no_grad():
             expanded.weight.zero_()
-            expanded.weight[:, : self.latent_channels].copy_(patch_embedding.weight)
+            if self.multiview_mode == "latent_channel":
+                for view_index in range(self.num_views):
+                    start = view_index * self.latent_channels
+                    stop = start + self.latent_channels
+                    expanded.weight[:, start:stop].copy_(
+                        patch_embedding.weight / float(self.num_views)
+                    )
+            else:
+                expanded.weight[:, : self.latent_channels].copy_(patch_embedding.weight)
             if patch_embedding.bias is not None:
                 expanded.bias.copy_(patch_embedding.bias)
 
@@ -418,12 +570,17 @@ class VGMBridgeStage1(nn.Module):
             expanded.weight.zero_()
             expanded_weight = expanded.weight.view(patch_volume, int(new_out_channels), old_linear.in_features)
             old_weight = old_linear.weight.view(patch_volume, self.latent_channels, old_linear.in_features)
-            expanded_weight[:, : self.latent_channels].copy_(old_weight)
+            output_copies = self.num_views if self.multiview_mode == "latent_channel" else 1
+            for output_index in range(output_copies):
+                start = output_index * self.latent_channels
+                expanded_weight[:, start : start + self.latent_channels].copy_(old_weight)
             if old_linear.bias is not None:
                 expanded.bias.zero_()
                 expanded_bias = expanded.bias.view(patch_volume, int(new_out_channels))
                 old_bias = old_linear.bias.view(patch_volume, self.latent_channels)
-                expanded_bias[:, : self.latent_channels].copy_(old_bias)
+                for output_index in range(output_copies):
+                    start = output_index * self.latent_channels
+                    expanded_bias[:, start : start + self.latent_channels].copy_(old_bias)
 
         output_head.head = expanded
         output_head.out_dim = int(new_out_channels)
@@ -541,10 +698,11 @@ class VGMBridgeStage1(nn.Module):
         seq_len: int,
         token_residual: Optional[torch.Tensor] = None,
         return_hidden_states: bool = False,
+        wan_model_override: Optional[nn.Module] = None,
     ) -> Any:
         """Run WAN with an optional token residual injected after patch embedding."""
         # wan_model 是 Video DiT 主干；正式 TI2V-5B 的 D_video=3072，共有 30 个 block。
-        wan_model = self.video_model.wan_model
+        wan_model = wan_model_override or self.video_model.wan_model
         # patch embedding 参数所在设备就是本次 WAN 前向应使用的 CUDA device。
         device = wan_model.patch_embedding.weight.device
         # Rotary 位置频率不是 Parameter，首次调用时可能仍在 CPU；这里只搬设备，不改形状。
@@ -619,8 +777,16 @@ class VGMBridgeStage1(nn.Module):
         # 正式 Wan2.2-TI2V-5B 有 30 层，因此最终列表长度为 30。
         hidden_states = []
         # 第 j 次循环：输入 x_j [B,seq_len,D_video]，输出 x_{j+1} 形状不变。
-        for block in wan_model.blocks:
+        for layer_index, block in enumerate(wan_model.blocks):
             x = block(x, **kwargs)
+
+            mosaic_control_adapters = getattr(self, "mosaic_control_adapters", None)
+            if (
+                wan_model_override is None
+                and mosaic_control_adapters is not None
+                and str(layer_index) in mosaic_control_adapters
+            ):
+                x = mosaic_control_adapters[str(layer_index)](x)
 
             # Layerwise Progress 需要逐层读取，所以保存每层更新后的 x；普通生成不保存。
             if return_hidden_states:
@@ -1147,10 +1313,486 @@ class VGMBridgeStage1(nn.Module):
         active_mean = (latent_weight * active_mask).sum(dim=(1, 2, 3, 4), keepdim=True) / active_sum
         return latent_weight / active_mean.clamp_min(1e-6)
 
+    def _validate_multiview_pixels(
+        self,
+        first_view_frames: Optional[torch.Tensor],
+        view_video_frames: Optional[torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if first_view_frames is None or view_video_frames is None:
+            raise ValueError(
+                f"multiview_mode={self.multiview_mode!r} requires first_view_frames and view_video_frames"
+            )
+        if first_view_frames.ndim != 5:
+            raise ValueError(
+                f"first_view_frames must be [B,V,C,H,W], got {tuple(first_view_frames.shape)}"
+            )
+        if view_video_frames.ndim != 6:
+            raise ValueError(
+                f"view_video_frames must be [B,F,V,C,H,W], got {tuple(view_video_frames.shape)}"
+            )
+        if first_view_frames.shape[0] != view_video_frames.shape[0]:
+            raise ValueError("first/view video batch sizes do not match")
+        if first_view_frames.shape[1] != self.num_views or view_video_frames.shape[2] != self.num_views:
+            raise ValueError(
+                f"Expected {self.num_views} views, got first={first_view_frames.shape[1]} "
+                f"and video={view_video_frames.shape[2]}"
+            )
+        if view_video_frames.shape[1] != self.config.num_video_frames:
+            raise ValueError(
+                f"Expected {self.config.num_video_frames} future frames, got {view_video_frames.shape[1]}"
+            )
+        first_shape = tuple(first_view_frames.shape[2:])
+        future_shape = tuple(view_video_frames.shape[3:])
+        if first_shape != future_shape:
+            raise ValueError(
+                "First/future view image shapes must match, got "
+                f"first={first_shape}, future={future_shape}"
+            )
+        if first_shape[0] != 3:
+            raise ValueError(f"Multi-view RGB inputs require 3 channels, got {first_shape[0]}")
+        if self.config.multiview_layout == "vertical":
+            if self.config.video_height % self.num_views != 0:
+                raise ValueError(
+                    f"video_height={self.config.video_height} is not divisible by {self.num_views} views"
+                )
+            expected_shape = (
+                3,
+                self.config.video_height // self.num_views,
+                self.config.video_width,
+            )
+        else:
+            if self.config.video_width % self.num_views != 0:
+                raise ValueError(
+                    f"video_width={self.config.video_width} is not divisible by {self.num_views} views"
+                )
+            expected_shape = (
+                3,
+                self.config.video_height,
+                self.config.video_width // self.num_views,
+            )
+        if first_shape != expected_shape:
+            raise ValueError(
+                "Native view shape does not match the canonical composite contract: "
+                f"expected={expected_shape}, got={first_shape}"
+            )
+        return first_view_frames, view_video_frames
+
+    def _encode_view_video(self, video: torch.Tensor) -> torch.Tensor:
+        """Encode [B,V,C,F,H,W] without allowing the VAE to mix cameras."""
+        batch_size, num_views = video.shape[:2]
+        flat = video.reshape(batch_size * num_views, *video.shape[2:])
+        latent = self.video_model.encode_video(flat.to(self.dtype))
+        return latent.view(batch_size, num_views, *latent.shape[1:])
+
+    def _encode_view_condition(
+        self,
+        first_view_norm: torch.Tensor,
+        condition_view_video: torch.Tensor,
+        latent_template: torch.Tensor,
+    ) -> torch.Tensor:
+        batch_size, num_views = condition_view_video.shape[:2]
+        flat_first = first_view_norm.reshape(
+            batch_size * num_views, *first_view_norm.shape[2:]
+        )
+        flat_condition = condition_view_video.reshape(
+            batch_size * num_views, *condition_view_video.shape[2:]
+        )
+        flat_template = latent_template.reshape(
+            batch_size * num_views, *latent_template.shape[2:]
+        )
+        encoded = self._encode_condition_latent(
+            first_frame_norm=flat_first,
+            condition_video=flat_condition,
+            latent_template=flat_template,
+        )
+        return encoded.view(batch_size, num_views, *encoded.shape[1:])
+
+    def _pack_view_latents(self, latent: torch.Tensor) -> torch.Tensor:
+        if latent.ndim != 6:
+            raise ValueError(f"View latent must be [B,V,C,T,H,W], got {tuple(latent.shape)}")
+        if self.multiview_mode == "latent_spatial":
+            concat_dim = -2 if self.config.multiview_layout == "vertical" else -1
+            return torch.cat([latent[:, view_index] for view_index in range(self.num_views)], dim=concat_dim)
+        if self.multiview_mode == "latent_channel":
+            return torch.cat([latent[:, view_index] for view_index in range(self.num_views)], dim=1)
+        return latent
+
+    def _unpack_view_latents(self, latent: torch.Tensor) -> torch.Tensor:
+        if latent.ndim == 6:
+            return latent
+        if self.multiview_mode == "latent_spatial":
+            split_dim = -2 if self.config.multiview_layout == "vertical" else -1
+            size = latent.shape[split_dim]
+            if size % self.num_views != 0:
+                raise ValueError(
+                    f"Packed spatial latent size {size} is not divisible by {self.num_views} views"
+                )
+            return torch.stack(torch.chunk(latent, self.num_views, dim=split_dim), dim=1)
+        if self.multiview_mode == "latent_channel":
+            if latent.shape[1] != self.num_views * self.latent_channels:
+                raise ValueError(
+                    f"Packed channel latent has {latent.shape[1]} channels; expected "
+                    f"{self.num_views * self.latent_channels}"
+                )
+            return torch.stack(torch.chunk(latent, self.num_views, dim=1), dim=1)
+        raise ValueError(f"Cannot unpack latent for multiview_mode={self.multiview_mode!r}")
+
+    def _view_known_mask(self, view_latent: torch.Tensor) -> torch.Tensor:
+        flat = view_latent.reshape(-1, *view_latent.shape[2:])
+        if self.config.conditioning_mode == "v0":
+            mask = self._known_condition_mask(flat)
+        else:
+            mask = self._first_condition_mask(flat)
+        return mask.view(view_latent.shape[0], view_latent.shape[1], *mask.shape[1:])
+
+    def _build_view_model_input(
+        self,
+        noisy_view_latent: torch.Tensor,
+        condition_view_latent: torch.Tensor,
+        frame_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        batch_size, num_views = noisy_view_latent.shape[:2]
+        flat_noisy = noisy_view_latent.reshape(
+            batch_size * num_views, *noisy_view_latent.shape[2:]
+        )
+        flat_condition = condition_view_latent.reshape(
+            batch_size * num_views, *condition_view_latent.shape[2:]
+        )
+        flat_frame_mask = frame_mask.repeat_interleave(num_views, dim=0)
+        model_input = self._build_model_input(flat_noisy, flat_condition, flat_frame_mask)
+        return model_input.view(batch_size, num_views, *model_input.shape[1:])
+
+    @staticmethod
+    def _endpoint_context_view_latent(
+        condition_views: torch.Tensor,
+        endpoint_views: torch.Tensor,
+    ) -> torch.Tensor:
+        """Build endpoint context from independently encoded first/goal latent slices."""
+        context = torch.zeros_like(condition_views)
+        context[:, :, :, 0:1] = condition_views[:, :, :, 0:1]
+        context[:, :, :, -1:] = endpoint_views
+        return context
+
+    def _view_endpoint_residual(
+        self,
+        endpoint_view_latent: torch.Tensor,
+        target_latent: torch.Tensor,
+        seq_len: int,
+    ) -> torch.Tensor:
+        if self.endpoint_adapter is None:
+            return target_latent.new_zeros(
+                target_latent.shape[0], target_latent.shape[1], seq_len, self.video_model.wan_model.dim
+            )
+        batch_size, num_views = endpoint_view_latent.shape[:2]
+        flat_endpoint = endpoint_view_latent.reshape(
+            batch_size * num_views, *endpoint_view_latent.shape[2:]
+        )
+        flat_target = target_latent.reshape(batch_size * num_views, *target_latent.shape[2:])
+        residual = self.endpoint_adapter(flat_endpoint, flat_target, seq_len)
+        return residual.view(batch_size, num_views, seq_len, residual.shape[-1])
+
+    @staticmethod
+    def _repeat_context_by_view(
+        context: List[torch.Tensor],
+        num_views: int,
+    ) -> List[torch.Tensor]:
+        return [item for item in context for _ in range(num_views)]
+
+    def _forward_multiview_prediction(
+        self,
+        *,
+        model_input: torch.Tensor,
+        timestep_tokens: torch.Tensor,
+        context: List[torch.Tensor],
+        token_residual: torch.Tensor,
+        endpoint_context_input: Optional[torch.Tensor] = None,
+        autoregressive_context_input: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        wan_model = self.video_model.wan_model
+        if wan_model.freqs.device != wan_model.patch_embedding.weight.device:
+            wan_model.freqs = wan_model.freqs.to(wan_model.patch_embedding.weight.device)
+
+        if self.multiview_mode in {"latent_spatial", "latent_channel"}:
+            return self._forward_wan(
+                latent_list=[model_input[index] for index in range(model_input.shape[0])],
+                timestep_tokens=timestep_tokens,
+                context=context,
+                seq_len=timestep_tokens.shape[-1],
+                token_residual=token_residual,
+            )
+
+        if self.multiview_mode in {"independent", "independent_consistency"}:
+            batch_size, num_views, seq_len = timestep_tokens.shape
+            if self.config.view_capacity_mode == "shared":
+                flat_input = model_input.reshape(batch_size * num_views, *model_input.shape[2:])
+                prediction = self._forward_wan(
+                    latent_list=[flat_input[index] for index in range(flat_input.shape[0])],
+                    timestep_tokens=timestep_tokens.reshape(batch_size * num_views, seq_len),
+                    context=self._repeat_context_by_view(context, num_views),
+                    seq_len=seq_len,
+                    token_residual=token_residual.reshape(
+                        batch_size * num_views, seq_len, token_residual.shape[-1]
+                    ),
+                )
+                return prediction.view(batch_size, num_views, *prediction.shape[1:])
+
+            predictions = []
+            for view_index in range(num_views):
+                view_model = (
+                    wan_model if view_index == 0 else self.additional_view_models[view_index - 1]
+                )
+                prediction = self._forward_wan(
+                    latent_list=[model_input[index, view_index] for index in range(batch_size)],
+                    timestep_tokens=timestep_tokens[:, view_index],
+                    context=context,
+                    seq_len=seq_len,
+                    token_residual=token_residual[:, view_index],
+                    wan_model_override=view_model,
+                )
+                predictions.append(prediction)
+            return torch.stack(predictions, dim=1)
+
+        if self.multiview_runner is None:
+            raise RuntimeError(f"No token runner initialized for {self.multiview_mode!r}")
+        if self.multiview_mode == "joint_attention":
+            return self.multiview_runner.forward_joint(
+                wan_model=wan_model,
+                inputs=model_input,
+                timestep_tokens=timestep_tokens,
+                context=context,
+                token_residual=token_residual,
+            )
+        if self.multiview_mode == "autoregressive_high_to_wrist":
+            high_prediction = self.multiview_runner.forward_factorized(
+                wan_model=wan_model,
+                inputs=model_input[:, 0:1],
+                timestep_tokens=timestep_tokens[:, 0:1],
+                context=context,
+                token_residual=token_residual[:, 0:1],
+                view_offset=0,
+            )
+            if autoregressive_context_input is None:
+                raise ValueError("MV10 training requires a high-view trajectory context")
+            wrist_prediction = self.multiview_runner.forward_factorized(
+                wan_model=wan_model,
+                inputs=model_input[:, 1:2],
+                timestep_tokens=timestep_tokens[:, 1:2],
+                context=context,
+                token_residual=token_residual[:, 1:2],
+                context_inputs=autoregressive_context_input,
+                view_offset=1,
+            )
+            return torch.cat([high_prediction, wrist_prediction], dim=1)
+        separate_models = None
+        if self.config.view_capacity_mode == "separate":
+            separate_models = [wan_model, *self.additional_view_models]
+        return self.multiview_runner.forward_factorized(
+            wan_model=wan_model,
+            inputs=model_input,
+            timestep_tokens=timestep_tokens,
+            context=context,
+            token_residual=token_residual,
+            context_inputs=endpoint_context_input,
+            wan_models=separate_models,
+        )
+
+    def _multiview_training_step(
+        self,
+        *,
+        first_view_frames: Optional[torch.Tensor],
+        view_video_frames: Optional[torch.Tensor],
+        language_embeddings: Optional[torch.Tensor],
+        return_dict: bool,
+    ) -> Dict[str, torch.Tensor]:
+        first_view_frames, view_video_frames = self._validate_multiview_pixels(
+            first_view_frames,
+            view_video_frames,
+        )
+        batch_size = first_view_frames.shape[0]
+        full_pixels = torch.cat([first_view_frames.unsqueeze(1), view_video_frames], dim=1)
+        full_view_video = (full_pixels * 2.0 - 1.0).permute(0, 2, 3, 1, 4, 5)
+        condition_view_video = torch.zeros_like(full_view_video)
+        condition_view_video[:, :, :, 0:1] = full_view_video[:, :, :, 0:1]
+        tail_n = int(self.config.tail_condition_frames)
+        if tail_n > 0:
+            condition_view_video[:, :, :, -tail_n:] = full_view_video[:, :, :, -tail_n:]
+
+        with torch.no_grad():
+            clean_views = self._encode_view_video(full_view_video)
+            condition_views = self._encode_view_condition(
+                first_view_norm=full_view_video[:, :, :, 0:1],
+                condition_view_video=condition_view_video,
+                latent_template=clean_views,
+            )
+            endpoint_pixels = (view_video_frames[:, -1] * 2.0 - 1.0).unsqueeze(3)
+            endpoint_views = self._encode_view_video(endpoint_pixels)
+
+        clean_latent = self._pack_view_latents(clean_views)
+        condition_latent = self._pack_view_latents(condition_views)
+        if clean_latent.ndim == 5:
+            known_mask = (
+                self._known_condition_mask(clean_latent)
+                if self.config.conditioning_mode == "v0"
+                else self._first_condition_mask(clean_latent)
+            )
+            sigma_shape = (batch_size, 1, 1, 1, 1)
+        else:
+            known_mask = self._view_known_mask(clean_latent)
+            sigma_shape = (batch_size, 1, 1, 1, 1, 1)
+
+        timestep_id = torch.randint(
+            0,
+            self.fm_train_scheduler.num_train_timesteps,
+            (batch_size,),
+        )
+        timestep = self.fm_train_scheduler.timesteps[timestep_id].to(
+            dtype=self.dtype,
+            device=self.device,
+        )
+        sigma = self.fm_train_scheduler.sigmas[timestep_id].to(
+            dtype=self.dtype,
+            device=self.device,
+        ).view(*sigma_shape)
+        noise = torch.randn_like(clean_latent, dtype=self.dtype)
+        noisy_latent = clean_latent * (1 - sigma) + noise * sigma
+        noisy_latent = noisy_latent * (1 - known_mask) + condition_latent * known_mask
+        target = (noise - clean_latent) * (1 - known_mask)
+
+        frame_mask = self._frame_condition_mask(
+            batch_size,
+            clean_views.device,
+            clean_views.dtype,
+        )
+        if clean_latent.ndim == 5:
+            model_input = self._build_model_input(noisy_latent, condition_latent, frame_mask)
+            seq_len = self._wan_seq_len(noisy_latent)
+            packed_endpoint = self._pack_view_latents(endpoint_views)
+            token_residual = (
+                self.endpoint_adapter(packed_endpoint, noisy_latent, seq_len)
+                if self.endpoint_adapter is not None
+                else noisy_latent.new_zeros(
+                    batch_size, seq_len, self.video_model.wan_model.dim
+                )
+            )
+            timestep_tokens = self._timestep_tokens(timestep, noisy_latent, known_mask, seq_len)
+            endpoint_context_input = None
+            autoregressive_context_input = None
+        else:
+            model_input = self._build_view_model_input(noisy_latent, condition_latent, frame_mask)
+            seq_len = self._wan_seq_len(noisy_latent[:, 0])
+            token_residual = self._view_endpoint_residual(endpoint_views, noisy_latent, seq_len)
+            flat_timestep_tokens = self._timestep_tokens(
+                timestep.repeat_interleave(self.num_views),
+                noisy_latent.reshape(batch_size * self.num_views, *noisy_latent.shape[2:]),
+                known_mask.reshape(batch_size * self.num_views, *known_mask.shape[2:]),
+                seq_len,
+            )
+            timestep_tokens = flat_timestep_tokens.view(batch_size, self.num_views, seq_len)
+            endpoint_context_input = None
+            if self.multiview_mode == "endpoint_scene_context":
+                endpoint_context_views = self._endpoint_context_view_latent(
+                    condition_views,
+                    endpoint_views,
+                )
+                endpoint_context_input = self._build_view_model_input(
+                    endpoint_context_views,
+                    endpoint_context_views,
+                    frame_mask,
+                )
+            autoregressive_context_input = None
+            if self.multiview_mode == "autoregressive_high_to_wrist":
+                clean_context_input = self._build_view_model_input(
+                    clean_views,
+                    condition_views,
+                    frame_mask,
+                )
+                autoregressive_context_input = clean_context_input[:, 0:1]
+
+        context = self._context_list(language_embeddings, batch_size)
+        with torch.autocast(device_type="cuda", dtype=self.video_model.precision):
+            prediction = self._forward_multiview_prediction(
+                model_input=model_input,
+                timestep_tokens=timestep_tokens,
+                context=context,
+                token_residual=token_residual,
+                endpoint_context_input=endpoint_context_input,
+                autoregressive_context_input=autoregressive_context_input,
+            )
+
+        prediction_views = self._unpack_view_latents(prediction)
+        target_views = self._unpack_view_latents(target)
+        noisy_views = self._unpack_view_latents(noisy_latent)
+        view_known_mask = self._view_known_mask(clean_views)
+        loss_mask = (1 - view_known_mask).expand_as(prediction_views).float()
+        squared_error = (prediction_views.float() - target_views.float()).pow(2)
+        rgb_loss = (squared_error * loss_mask).sum() / loss_mask.sum().clamp_min(1.0)
+        view_losses = []
+        for view_index in range(self.num_views):
+            view_mask = loss_mask[:, view_index]
+            view_losses.append(
+                (squared_error[:, view_index] * view_mask).sum() / view_mask.sum().clamp_min(1.0)
+            )
+
+        consistency_loss = rgb_loss.detach().new_zeros(())
+        if self.cross_view_consistency_head is not None:
+            clean_prediction = noisy_views - sigma.view(batch_size, 1, 1, 1, 1, 1) * prediction_views
+            consistency_loss = self.cross_view_consistency_head(
+                clean_prediction,
+                1 - view_known_mask[:, 0],
+            )
+        total_loss = rgb_loss + float(self.config.multiview_consistency_weight) * consistency_loss
+        zero = total_loss.detach().new_zeros(())
+        if not return_dict:
+            return {"total_loss": total_loss}
+        result = {
+            "total_loss": total_loss,
+            "video_loss": total_loss,
+            "middle_loss": rgb_loss,
+            "base_video_loss": rgb_loss,
+            "rgb_loss": rgb_loss,
+            "weighted_rgb_loss": rgb_loss,
+            "cross_view_consistency_loss": consistency_loss,
+            "role_mask_loss": zero,
+            "weighted_role_mask_loss": zero,
+            "effective_role_mask_loss_weight": zero,
+            "role_prompt_keep_rate": zero,
+            "role_rgb_weight_mean": total_loss.detach().new_ones(()),
+            "role_rgb_weight_max": total_loss.detach().new_ones(()),
+            "interaction_weight_mean": total_loss.detach().new_ones(()),
+            "interaction_weight_max": total_loss.detach().new_ones(()),
+            "action_loss": zero,
+        }
+        for view_index, view_loss in enumerate(view_losses):
+            result[f"view_{view_index}_loss"] = view_loss
+        return result
+
+    def _mosaic_view_token_residual(
+        self,
+        latent: torch.Tensor,
+        seq_len: int,
+    ) -> Optional[torch.Tensor]:
+        if self.mosaic_view_embedding is None:
+            return None
+        _, _, latent_t, latent_h, latent_w = latent.shape
+        patch_t, patch_h, patch_w = self.video_model.wan_model.patch_size
+        grid = torch.tensor(
+            [latent_t // patch_t, latent_h // patch_h, latent_w // patch_w],
+            device=latent.device,
+            dtype=torch.long,
+        )
+        grid_sizes = grid.unsqueeze(0).expand(latent.shape[0], -1)
+        return self.mosaic_view_embedding(
+            grid_sizes=grid_sizes,
+            seq_len=seq_len,
+            layout=self.config.multiview_layout,
+        )
+
     def forward(
         self,
         first_frame: torch.Tensor,
         video_frames: torch.Tensor,
+        first_view_frames: Optional[torch.Tensor] = None,
+        view_video_frames: Optional[torch.Tensor] = None,
         first_role_mask: Optional[torch.Tensor] = None,
         role_mask_frames: Optional[torch.Tensor] = None,
         language_embeddings: Optional[torch.Tensor] = None,
@@ -1163,6 +1805,8 @@ class VGMBridgeStage1(nn.Module):
         return self.training_step(
             first_frame=first_frame,
             video_frames=video_frames,
+            first_view_frames=first_view_frames,
+            view_video_frames=view_video_frames,
             first_role_mask=first_role_mask,
             role_mask_frames=role_mask_frames,
             language_embeddings=language_embeddings,
@@ -1176,6 +1820,8 @@ class VGMBridgeStage1(nn.Module):
         self,
         first_frame: torch.Tensor,
         video_frames: torch.Tensor,
+        first_view_frames: Optional[torch.Tensor] = None,
+        view_video_frames: Optional[torch.Tensor] = None,
         first_role_mask: Optional[torch.Tensor] = None,
         role_mask_frames: Optional[torch.Tensor] = None,
         language_embeddings: Optional[torch.Tensor] = None,
@@ -1185,6 +1831,13 @@ class VGMBridgeStage1(nn.Module):
         return_dict: bool = True,
     ) -> Dict[str, torch.Tensor]:
         """Run one bridge training step for the configured conditioning mode."""
+        if getattr(self, "uses_separate_views", False):
+            return self._multiview_training_step(
+                first_view_frames=first_view_frames,
+                view_video_frames=view_video_frames,
+                language_embeddings=language_embeddings,
+                return_dict=return_dict,
+            )
         batch_size = video_frames.shape[0]
         if self.requires_role_mask_supervision and (first_role_mask is None or role_mask_frames is None):
             raise ValueError("Configured RoleMask supervision requires first_role_mask and role_mask_frames")
@@ -1311,6 +1964,10 @@ class VGMBridgeStage1(nn.Module):
             target_latent=noisy_video_latent,
             seq_len=seq_len,
         )
+        token_residual = add_token_residuals(
+            token_residual,
+            self._mosaic_view_token_residual(noisy_video_latent, seq_len),
+        )
         timestep_tokens = self._timestep_tokens(
             timestep=video_t_embed,
             latent=noisy_video_latent,
@@ -1432,12 +2089,291 @@ class VGMBridgeStage1(nn.Module):
             }
         return {"total_loss": video_loss}
 
+    def _compose_view_videos(self, view_video: torch.Tensor) -> torch.Tensor:
+        """Compose [B,V,F,C,H,W] into the configured canonical RGB layout."""
+        if view_video.ndim != 6 or view_video.shape[1] != self.num_views:
+            raise ValueError(f"view_video must be [B,V,F,C,H,W], got {tuple(view_video.shape)}")
+        concat_dim = -2 if self.config.multiview_output_layout == "vertical" else -1
+        return torch.cat(
+            [view_video[:, view_index] for view_index in range(self.num_views)],
+            dim=concat_dim,
+        )
+
+    @torch.no_grad()
+    def _decode_view_latents(self, view_latent: torch.Tensor) -> torch.Tensor:
+        batch_size, num_views = view_latent.shape[:2]
+        flat = view_latent.reshape(batch_size * num_views, *view_latent.shape[2:])
+        decoded = self.video_model.decode_video(flat.to(self.dtype)).float()
+        decoded = (decoded.clamp(-1.0, 1.0) + 1.0) * 0.5
+        decoded = decoded.permute(0, 2, 1, 3, 4).contiguous()
+        return decoded.view(batch_size, num_views, *decoded.shape[1:])
+
+    @torch.no_grad()
+    def _canonical_latent_from_view_video(self, view_video: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        composite = self._compose_view_videos(view_video)
+        composite_latent = self.video_model.encode_video(
+            (composite * 2.0 - 1.0).permute(0, 2, 1, 3, 4).to(self.dtype)
+        ).float()
+        return composite, composite_latent
+
+    @torch.no_grad()
+    def _sample_multiview(
+        self,
+        *,
+        first_view_frames: Optional[torch.Tensor],
+        last_view_frames: Optional[torch.Tensor],
+        tail_view_frames: Optional[torch.Tensor],
+        language_embeddings: Optional[torch.Tensor],
+        num_inference_steps: int,
+        generator: Optional[torch.Generator],
+        return_latent: bool,
+        return_components: bool,
+    ) -> Any:
+        if first_view_frames is None:
+            raise ValueError(f"multiview_mode={self.multiview_mode!r} requires first_view_frames")
+        first_view_frames = first_view_frames.to(device=self.device, dtype=self.dtype)
+        if first_view_frames.ndim != 5 or first_view_frames.shape[1] != self.num_views:
+            raise ValueError(
+                f"first_view_frames must be [B,{self.num_views},C,H,W], got {tuple(first_view_frames.shape)}"
+            )
+        if last_view_frames is not None:
+            last_view_frames = last_view_frames.to(device=self.device, dtype=self.dtype)
+            if last_view_frames.shape != first_view_frames.shape:
+                raise ValueError(
+                    "last_view_frames must match first_view_frames, got "
+                    f"first={tuple(first_view_frames.shape)}, last={tuple(last_view_frames.shape)}"
+                )
+        if tail_view_frames is not None:
+            tail_view_frames = tail_view_frames.to(device=self.device, dtype=self.dtype)
+        batch_size = first_view_frames.shape[0]
+        tail_n = int(self.config.tail_condition_frames)
+        if tail_n > 0:
+            if tail_view_frames is None:
+                if last_view_frames is None:
+                    raise ValueError("Multi-view bridge sampling requires last_view_frames or tail_view_frames")
+                tail_view_frames = last_view_frames.unsqueeze(1).expand(
+                    -1, tail_n, -1, -1, -1, -1
+                )
+            if tail_view_frames.shape[:3] != (batch_size, tail_n, self.num_views):
+                raise ValueError(
+                    f"tail_view_frames must be [B,{tail_n},{self.num_views},C,H,W], "
+                    f"got {tuple(tail_view_frames.shape)}"
+                )
+            endpoint_frames = tail_view_frames[:, -1]
+        else:
+            endpoint_frames = first_view_frames
+
+        condition_pixels = first_view_frames.new_zeros(
+            batch_size,
+            self.num_views,
+            first_view_frames.shape[2],
+            self.config.num_video_frames + 1,
+            first_view_frames.shape[3],
+            first_view_frames.shape[4],
+        )
+        condition_pixels[:, :, :, 0] = first_view_frames * 2.0 - 1.0
+        if tail_n > 0:
+            condition_pixels[:, :, :, -tail_n:] = (
+                tail_view_frames * 2.0 - 1.0
+            ).permute(0, 2, 3, 1, 4, 5)
+
+        latent_t = 1 + self.config.num_video_frames // 4
+        first_norm = (first_view_frames * 2.0 - 1.0).unsqueeze(3)
+        first_latent = self._encode_view_video(first_norm)
+        latent_template = first_latent.new_zeros(
+            batch_size,
+            self.num_views,
+            first_latent.shape[2],
+            latent_t,
+            first_latent.shape[4],
+            first_latent.shape[5],
+        )
+        condition_views = self._encode_view_condition(
+            first_view_norm=first_norm,
+            condition_view_video=condition_pixels,
+            latent_template=latent_template,
+        )
+        endpoint_views = self._encode_view_video(
+            (endpoint_frames * 2.0 - 1.0).unsqueeze(3)
+        )
+        frame_mask = self._frame_condition_mask(
+            batch_size,
+            condition_views.device,
+            condition_views.dtype,
+        )
+        context = self._context_list(language_embeddings, batch_size)
+
+        scheduler = FlowMatchScheduler(
+            shift=5.0,
+            sigma_min=0.0,
+            extra_one_step=True,
+            num_train_timesteps=1000,
+        )
+        scheduler.set_timesteps(num_inference_steps=num_inference_steps, training=False)
+        sigmas = scheduler.sigmas.to(device=self.device, dtype=self.dtype)
+        timesteps = scheduler.timesteps.to(device=self.device, dtype=self.dtype)
+
+        if self.multiview_mode == "autoregressive_high_to_wrist":
+            generated_views = []
+            generated_high_context = None
+            for view_index in range(self.num_views):
+                condition = condition_views[:, view_index : view_index + 1]
+                known_mask = self._view_known_mask(condition)
+                latent = torch.randn(
+                    condition.shape,
+                    device=condition.device,
+                    dtype=self.dtype,
+                    generator=generator,
+                )
+                latent = latent * (1 - known_mask) + condition * known_mask
+                seq_len = self._wan_seq_len(latent[:, 0])
+                endpoint_residual = self._view_endpoint_residual(
+                    endpoint_views[:, view_index : view_index + 1],
+                    latent,
+                    seq_len,
+                )
+                for step_index, timestep in enumerate(timesteps):
+                    model_input = self._build_view_model_input(latent, condition, frame_mask)
+                    timestep_tokens = self._timestep_tokens(
+                        timestep.expand(batch_size),
+                        latent[:, 0],
+                        known_mask[:, 0],
+                        seq_len,
+                    ).unsqueeze(1)
+                    with torch.autocast(device_type="cuda", dtype=self.video_model.precision):
+                        prediction = self.multiview_runner.forward_factorized(
+                            wan_model=self.video_model.wan_model,
+                            inputs=model_input,
+                            timestep_tokens=timestep_tokens,
+                            context=context,
+                            token_residual=endpoint_residual,
+                            context_inputs=generated_high_context,
+                            view_offset=view_index,
+                        )
+                    sigma = sigmas[step_index]
+                    sigma_next = (
+                        sigmas[step_index + 1]
+                        if step_index + 1 < len(sigmas)
+                        else sigmas.new_zeros(())
+                    )
+                    latent = latent + prediction * (sigma_next - sigma)
+                    latent = latent * (1 - known_mask) + condition * known_mask
+                generated_views.append(latent)
+                if view_index == 0:
+                    generated_high_context = self._build_view_model_input(
+                        latent,
+                        condition,
+                        frame_mask,
+                    )
+            view_latent = torch.cat(generated_views, dim=1)
+        else:
+            latent = self._pack_view_latents(condition_views)
+            latent = torch.randn(
+                latent.shape,
+                device=latent.device,
+                dtype=self.dtype,
+                generator=generator,
+            )
+            if latent.ndim == 5:
+                known_mask = (
+                    self._known_condition_mask(latent)
+                    if self.config.conditioning_mode == "v0"
+                    else self._first_condition_mask(latent)
+                )
+            else:
+                known_mask = self._view_known_mask(latent)
+            packed_condition = self._pack_view_latents(condition_views)
+            latent = latent * (1 - known_mask) + packed_condition * known_mask
+            if latent.ndim == 5:
+                seq_len = self._wan_seq_len(latent)
+                packed_endpoint = self._pack_view_latents(endpoint_views)
+                token_residual = (
+                    self.endpoint_adapter(packed_endpoint, latent, seq_len)
+                    if self.endpoint_adapter is not None
+                    else latent.new_zeros(
+                        batch_size, seq_len, self.video_model.wan_model.dim
+                    )
+                )
+            else:
+                seq_len = self._wan_seq_len(latent[:, 0])
+                token_residual = self._view_endpoint_residual(endpoint_views, latent, seq_len)
+            endpoint_context_input = None
+            if self.multiview_mode == "endpoint_scene_context":
+                endpoint_context_views = self._endpoint_context_view_latent(
+                    condition_views,
+                    endpoint_views,
+                )
+                endpoint_context_input = self._build_view_model_input(
+                    endpoint_context_views,
+                    endpoint_context_views,
+                    frame_mask,
+                )
+
+            for step_index, timestep in enumerate(timesteps):
+                if latent.ndim == 5:
+                    model_input = self._build_model_input(latent, packed_condition, frame_mask)
+                    timestep_tokens = self._timestep_tokens(
+                        timestep.expand(batch_size),
+                        latent,
+                        known_mask,
+                        seq_len,
+                    )
+                else:
+                    model_input = self._build_view_model_input(latent, packed_condition, frame_mask)
+                    flat_timestep = self._timestep_tokens(
+                        timestep.expand(batch_size * self.num_views),
+                        latent.reshape(batch_size * self.num_views, *latent.shape[2:]),
+                        known_mask.reshape(batch_size * self.num_views, *known_mask.shape[2:]),
+                        seq_len,
+                    )
+                    timestep_tokens = flat_timestep.view(batch_size, self.num_views, seq_len)
+                with torch.autocast(device_type="cuda", dtype=self.video_model.precision):
+                    prediction = self._forward_multiview_prediction(
+                        model_input=model_input,
+                        timestep_tokens=timestep_tokens,
+                        context=context,
+                        token_residual=token_residual,
+                        endpoint_context_input=endpoint_context_input,
+                    )
+                sigma = sigmas[step_index]
+                sigma_next = (
+                    sigmas[step_index + 1]
+                    if step_index + 1 < len(sigmas)
+                    else sigmas.new_zeros(())
+                )
+                latent = latent + prediction * (sigma_next - sigma)
+                latent = latent * (1 - known_mask) + packed_condition * known_mask
+            view_latent = self._unpack_view_latents(latent)
+
+        view_video = self._decode_view_latents(view_latent)
+        composite_video, composite_latent = self._canonical_latent_from_view_video(view_video)
+        if return_latent:
+            if return_components:
+                return {
+                    "rgb_latent": composite_latent,
+                    "view_latent": view_latent.float(),
+                    # Preserve the direct native-view decode for Stage 2. Re-encoding
+                    # and decoding the composite would add blur only to MV2-MV10.
+                    "rgb_video": composite_video,
+                    "view_video": view_video,
+                }
+            return composite_latent
+        if return_components:
+            return {
+                "rgb_video": composite_video,
+                "view_video": view_video,
+            }
+        return composite_video
+
     @torch.no_grad()
     def sample_bridge(
         self,
         first_frame: torch.Tensor,
         last_frame: Optional[torch.Tensor] = None,
         tail_frames: Optional[torch.Tensor] = None,
+        first_view_frames: Optional[torch.Tensor] = None,
+        last_view_frames: Optional[torch.Tensor] = None,
+        tail_view_frames: Optional[torch.Tensor] = None,
         first_role_mask: Optional[torch.Tensor] = None,
         last_role_mask: Optional[torch.Tensor] = None,
         tail_role_masks: Optional[torch.Tensor] = None,
@@ -1453,6 +2389,17 @@ class VGMBridgeStage1(nn.Module):
         was_training = self.training
         self.eval()
         try:
+            if self.uses_separate_views:
+                return self._sample_multiview(
+                    first_view_frames=first_view_frames,
+                    last_view_frames=last_view_frames,
+                    tail_view_frames=tail_view_frames,
+                    language_embeddings=language_embeddings,
+                    num_inference_steps=num_inference_steps,
+                    generator=generator,
+                    return_latent=return_latent,
+                    return_components=return_components,
+                )
             first_frame = first_frame.to(device=self.device, dtype=self.dtype)
             if last_frame is not None:
                 last_frame = last_frame.to(device=self.device, dtype=self.dtype)
@@ -1570,6 +2517,10 @@ class VGMBridgeStage1(nn.Module):
                 target_latent=latent,
                 seq_len=seq_len,
             )
+            token_residual = add_token_residuals(
+                token_residual,
+                self._mosaic_view_token_residual(latent, seq_len),
+            )
 
             for step_idx, timestep in enumerate(timesteps):
                 # 正式缓存配置共有 50 个 timestep。每一步先让 WAN 预测 flow velocity，
@@ -1666,6 +2617,11 @@ class VGMBridgeStage1(nn.Module):
         if self.role_mask_fusion_mode == "spatial" or self.requires_role_mask_prompt:
             raise NotImplementedError(
                 "Layerwise Progress cannot replay a VGM that requires external RoleMask prompts"
+            )
+        if getattr(self, "uses_separate_views", False):
+            raise NotImplementedError(
+                "Layerwise Progress replay for MV2-MV10 requires the native per-view cache fields. "
+                "Use the canonical Serial Stage 2 cache until native multi-view replay is enabled."
             )
 
         was_training = self.training
@@ -1771,6 +2727,10 @@ class VGMBridgeStage1(nn.Module):
                 last_role_mask=None,
                 target_latent=model_trajectory_latent,
                 seq_len=seq_len,
+            )
+            token_residual = add_token_residuals(
+                token_residual,
+                self._mosaic_view_token_residual(model_trajectory_latent, seq_len),
             )
             # 只做一次特征读取，不进行去噪循环；timestep: [B]，正式配置 feature_timestep=0。
             timestep = model_trajectory_latent.new_full((batch_size,), float(feature_timestep))

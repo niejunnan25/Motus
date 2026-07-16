@@ -42,6 +42,7 @@ class RoboDopamineBenchDataset:
         images_root: str | Path,
         language_manifest: str | Path,
         video_size: Tuple[int, int],
+        view_video_size: Tuple[int, int] | None = None,
         view_names: Sequence[str] = ("cam_high", "cam_left_wrist"),
         view_layout: str = "vertical",
         require_language_embedding: bool = True,
@@ -51,6 +52,11 @@ class RoboDopamineBenchDataset:
         self.images_root = Path(images_root).expanduser().resolve()
         self.language_manifest = Path(language_manifest).expanduser().resolve()
         self.video_size = (int(video_size[0]), int(video_size[1]))
+        self.view_video_size = (
+            (int(view_video_size[0]), int(view_video_size[1]))
+            if view_video_size is not None
+            else None
+        )
         self.view_names = tuple(str(name) for name in view_names)
         self.view_layout = str(view_layout)
         self.require_language_embedding = bool(require_language_embedding)
@@ -252,3 +258,28 @@ class RoboDopamineBenchDataset:
             output.append(frame)
         array = np.stack(output, axis=0)
         return torch.from_numpy(array).permute(0, 3, 1, 2).float().div(255.0)
+
+    def load_episode_view_frames(
+        self, episode_index: int, frame_indices: Sequence[int]
+    ) -> torch.Tensor:
+        """Load benchmark images as [F,V,C,H,W] without RGB mosaic fusion."""
+        episode = self.episodes[int(episode_index)]
+        total_frames = int(episode["num_frames"])
+        indices = [int(index) for index in frame_indices]
+        if any(index < 0 or index >= total_frames for index in indices):
+            raise IndexError(
+                f"Frame indices out of bounds for {episode['episode_name']}: "
+                f"indices={indices}, total_frames={total_frames}"
+            )
+        output: List[np.ndarray] = []
+        view_files: Sequence[Sequence[Path]] = episode["view_files"]
+        for frame_index in indices:
+            views = []
+            for files in view_files:
+                frame = np.array(Image.open(files[frame_index]).convert("RGB"), copy=True)
+                if self.view_video_size is not None and frame.shape[:2] != self.view_video_size:
+                    frame = resize_with_padding(frame, self.view_video_size)
+                views.append(frame)
+            output.append(np.stack(views, axis=0))
+        array = np.stack(output, axis=0)
+        return torch.from_numpy(array).permute(0, 1, 4, 2, 3).float().div(255.0)

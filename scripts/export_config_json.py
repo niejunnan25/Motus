@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import sys
 from pathlib import Path
 from omegaconf import OmegaConf
+
+sys.path.append(str(Path(__file__).parent.parent))
+
+from utils.config_utils import load_config_with_base
 
 def main():
     parser = argparse.ArgumentParser(description="Export filtered training YAML to config.json in a checkpoint directory")
@@ -10,7 +15,7 @@ def main():
     parser.add_argument("--ckpt_dir", required=True, help="Path to checkpoint directory (e.g., .../checkpoint_step_40000)")
     args = parser.parse_args()
 
-    cfg = OmegaConf.load(args.yaml)
+    cfg = load_config_with_base(args.yaml)
     cfg_dict = OmegaConf.to_container(cfg, resolve=True)
 
     # Filter only requested sections
@@ -33,4 +38,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

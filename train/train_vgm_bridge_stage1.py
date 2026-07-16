@@ -5,6 +5,7 @@ import argparse
 import logging
 import os
 import re
+import subprocess
 import sys
 import time
 import warnings
@@ -18,7 +19,7 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import torch
 import torch.distributed as dist
 from accelerate import Accelerator
-from accelerate.utils import DeepSpeedPlugin, ProjectConfiguration
+from accelerate.utils import DeepSpeedPlugin, ProjectConfiguration, set_seed
 from omegaconf import OmegaConf
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
@@ -34,6 +35,8 @@ sys.path.append(str(Path(__file__).parent.parent))
 
 from data.video_bridge.video_bridge_dataset import VideoBridgeDataset, video_bridge_collate_fn
 from models.vgm_bridge_stage1 import VGMBridgeStage1, VGMBridgeStage1Config
+from models.vgm_multiview import MULTIVIEW_MODES, SEPARATE_VIEW_MODES
+from utils.config_utils import load_config_with_base
 from utils.scheduler import create_scheduler
 
 
@@ -59,12 +62,112 @@ def load_config(config_path: str) -> OmegaConf:
     if not os.path.exists(config_path):
         raise FileNotFoundError(f"Config file not found: {config_path}")
 
-    config = OmegaConf.load(config_path)
+    config = load_config_with_base(config_path)
     logger.info("Loaded config from %s", config_path)
     logger.info("Dataset type: %s", config.dataset.type)
     logger.info("Training mode: %s", getattr(config, "training_mode", "unset"))
     logger.info("Video frames: %s", config.common.num_video_frames)
     return config
+
+
+def validate_multiview_experiment_config(config: OmegaConf) -> None:
+    """Fail before model allocation when a controlled multi-view config is inconsistent."""
+    if not bool(config.common.get("multiview_experiment", False)):
+        return
+    mode = str(config.common.get("multiview_mode", "legacy"))
+    if mode not in MULTIVIEW_MODES:
+        raise ValueError(f"Unknown controlled multiview_mode={mode!r}")
+    num_views = int(config.common.get("num_views", 2))
+    if num_views != 2:
+        raise ValueError(
+            f"The controlled LIBERO matrix is defined for high/wrist only; got num_views={num_views}"
+        )
+    if int(config.common.get("num_video_frames", 0)) != 52:
+        raise ValueError("Controlled multi-view experiments require 52 future frames (53 total)")
+    if str(config.common.get("conditioning_mode", "")) != "v1_mask_endpoint":
+        raise ValueError("Controlled multi-view experiments require V1-proper conditioning")
+    if int(config.common.get("tail_condition_frames", 0)) != 1:
+        raise ValueError("Controlled multi-view experiments require exactly one goal frame")
+    if str(config.dataset.get("bridge_sampling_mode", "")) != "full_episode_uniform":
+        raise ValueError("Controlled multi-view experiments require full_episode_uniform sampling")
+    if not bool(config.dataset.get("bridge_sampling_jitter", False)):
+        raise ValueError("Controlled multi-view experiments require jittered interior frame bins")
+    if not bool(config.dataset.get("index_seeded_sampling", False)):
+        raise ValueError(
+            "Controlled multi-view experiments require index_seeded_sampling=true so DDP ranks "
+            "do not replay identical random episode draws"
+        )
+    if not bool(config.dataset.get("require_language_embedding", False)):
+        raise ValueError("Controlled multi-view experiments require task language embeddings")
+    image_columns = list(config.dataset.get("image_columns", []))
+    view_names = list(config.dataset.get("view_names", []))
+    if len(image_columns) != num_views:
+        raise ValueError(
+            f"Controlled multi-view configs require {num_views} image columns, got {image_columns}"
+        )
+    if len(view_names) != num_views:
+        raise ValueError(
+            f"Controlled multi-view configs require {num_views} view names, got {view_names}"
+        )
+    if [str(name) for name in view_names] != ["high", "wrist"]:
+        raise ValueError(
+            f"Controlled LIBERO view order must be ['high', 'wrist'], got {view_names}"
+        )
+    return_separate = bool(config.dataset.get("return_separate_views", False))
+    if return_separate != (mode in SEPARATE_VIEW_MODES):
+        raise ValueError(
+            f"multiview_mode={mode!r} requires return_separate_views="
+            f"{mode in SEPARATE_VIEW_MODES}, got {return_separate}"
+        )
+    view_size = tuple(int(value) for value in config.dataset.get("view_video_size", []))
+    if len(view_size) != 2 or min(view_size) < 1:
+        raise ValueError(f"view_video_size must be [H,W] with positive values, got {view_size}")
+    if view_size != (224, 224):
+        raise ValueError(f"Controlled LIBERO views must remain 224x224, got {view_size}")
+    layout = str(config.dataset.get("view_layout", "single"))
+    if layout not in {"vertical", "horizontal"}:
+        raise ValueError(f"Controlled two-view configs require vertical/horizontal layout, got {layout!r}")
+    model_layout = str(config.common.get("multiview_layout", layout))
+    if model_layout != layout:
+        raise ValueError(
+            "dataset.view_layout and common.multiview_layout must match: "
+            f"{layout!r} != {model_layout!r}"
+        )
+    output_layout = str(config.common.get("multiview_output_layout", layout))
+    if output_layout != layout:
+        raise ValueError(
+            "dataset.view_layout and common.multiview_output_layout must match so GT, generated "
+            f"videos, and the canonical Stage-2 cache share one layout: {layout!r} != {output_layout!r}"
+        )
+    expected_h = view_size[0] * num_views if layout == "vertical" else view_size[0]
+    expected_w = view_size[1] if layout == "vertical" else view_size[1] * num_views
+    actual_size = (int(config.common.video_height), int(config.common.video_width))
+    if actual_size != (expected_h, expected_w):
+        raise ValueError(
+            f"Composite video size must be {(expected_h, expected_w)} for {num_views} "
+            f"{view_size} views in {layout} layout, got {actual_size}"
+        )
+
+
+def collect_git_provenance(repo_root: Path) -> Dict[str, Any]:
+    """Capture the exact code state that will be written into resolved checkpoints."""
+    def git(*args: str) -> Optional[str]:
+        result = subprocess.run(
+            ["git", "-C", str(repo_root), *args],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        return result.stdout.strip() if result.returncode == 0 else None
+
+    status = git("status", "--porcelain=v1")
+    return {
+        "git_commit": git("rev-parse", "HEAD"),
+        "git_branch": git("branch", "--show-current"),
+        "git_remote": git("remote", "get-url", "niejunnan25") or git("remote", "get-url", "origin"),
+        "git_dirty": bool(status) if status is not None else None,
+        "source_root": str(repo_root.resolve()),
+    }
 
 
 def normalize_report_to(value: Any) -> list[str]:
@@ -116,6 +219,9 @@ class VGMBridgeStage1Trainer:
         self.global_step = 0
         self.epoch = 0
         self._distributed_sync_verified = world_size <= 1
+        self._gradient_probe_handle = None
+        self._gradient_probe_name: Optional[str] = None
+        self._gradient_probe_records: list[torch.Tensor] = []
 
         if rank == 0:
             self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -123,10 +229,159 @@ class VGMBridgeStage1Trainer:
         logger.info("VGMBridgeStage1 trainer initialized on rank %s/%s", rank, world_size)
         logger.info("Logging backends: %s", self.report_to)
 
-    def _verify_distributed_gradient_sync(self) -> None:
+    def _install_deepspeed_gradient_probe(self) -> None:
+        """Capture first-update gradients before ZeRO releases its partitions."""
+        if (
+            self._distributed_sync_verified
+            or self._gradient_probe_handle is not None
+            or self.world_size <= 1
+        ):
+            return
+        engine_optimizer = getattr(self.model, "optimizer", None)
+        if engine_optimizer is None or not hasattr(engine_optimizer, "averaged_gradients"):
+            return
+
+        unwrapped_model = self.accelerator.unwrap_model(self.model)
+        for name, parameter in unwrapped_model.named_parameters():
+            if not parameter.requires_grad:
+                continue
+
+            self._gradient_probe_name = name
+
+            def record_gradient(gradient: torch.Tensor) -> torch.Tensor:
+                gradient_fp32 = gradient.detach().float()
+                finite = torch.isfinite(gradient_fp32)
+                finite_values = gradient_fp32[finite]
+                if finite_values.numel() > 0:
+                    mean_abs = finite_values.abs().mean()
+                    max_abs = finite_values.abs().max()
+                else:
+                    mean_abs = torch.zeros((), device=gradient.device, dtype=torch.float32)
+                    max_abs = torch.zeros((), device=gradient.device, dtype=torch.float32)
+                self._gradient_probe_records.append(
+                    torch.stack(
+                        [
+                            finite.float().mean(),
+                            mean_abs,
+                            max_abs,
+                        ]
+                    )
+                )
+                return gradient
+
+            self._gradient_probe_handle = parameter.register_hook(record_gradient)
+            return
+        raise RuntimeError("Could not find a trainable parameter for DeepSpeed gradient probing")
+
+    def _verify_distributed_gradient_sync(self, grad_norm: Optional[torch.Tensor] = None) -> None:
         """Fail fast when a multi-rank backward did not synchronize gradients."""
         if self._distributed_sync_verified or self.accelerator is None or self.world_size <= 1:
             return
+
+        # Accelerate's DeepSpeed wrapper performs ``engine.backward()`` and
+        # ``engine.step()`` together, so gradients have already been released
+        # when control returns here. ZeRO-2 keeps model parameters replicated;
+        # therefore equal post-step parameter signatures plus equal engine
+        # step counters are the appropriate synchronization invariant.
+        engine_optimizer = getattr(self.model, "optimizer", None)
+        if engine_optimizer is not None and hasattr(engine_optimizer, "averaged_gradients"):
+            if not self._gradient_probe_records:
+                raise RuntimeError("DeepSpeed gradient probe did not observe a trainable gradient")
+            local_probe = torch.stack(self._gradient_probe_records).mean(dim=0)
+            gathered_probe = self.accelerator.gather(local_probe).view(self.world_size, -1)
+            if not torch.isfinite(gathered_probe).all() or not torch.all(
+                gathered_probe[:, 0] == 1.0
+            ):
+                raise RuntimeError(
+                    "DeepSpeed backward produced non-finite gradients for "
+                    f"{self._gradient_probe_name}: per-rank "
+                    f"[finite_fraction, mean_abs, max_abs]={gathered_probe.cpu().tolist()}"
+                )
+            if grad_norm is None:
+                raise RuntimeError("DeepSpeed did not expose its global gradient norm")
+            local_grad_norm = torch.as_tensor(
+                grad_norm,
+                device=self.device,
+                dtype=torch.float32,
+            ).reshape(1)
+            gathered_grad_norms = self.accelerator.gather(local_grad_norm).reshape(self.world_size)
+            if not torch.isfinite(gathered_grad_norms).all() or torch.any(gathered_grad_norms < 0):
+                raise RuntimeError(
+                    "DeepSpeed reported an invalid global gradient norm: "
+                    f"per-rank norms={gathered_grad_norms.cpu().tolist()}, "
+                    f"probe={gathered_probe.cpu().tolist()}"
+                )
+            engine_step = torch.tensor(
+                [int(getattr(self.model, "global_steps", 0))],
+                device=self.device,
+                dtype=torch.long,
+            )
+            gathered_steps = self.accelerator.gather(engine_step).reshape(self.world_size)
+            if int(gathered_steps.min()) < 1 or not torch.equal(
+                gathered_steps,
+                gathered_steps[0].expand_as(gathered_steps),
+            ):
+                raise RuntimeError(
+                    "DeepSpeed ranks disagree on the completed optimizer step: "
+                    f"{gathered_steps.cpu().tolist()}"
+                )
+            unwrapped_model = self.accelerator.unwrap_model(self.model)
+            for name, parameter in unwrapped_model.named_parameters():
+                if not parameter.requires_grad:
+                    continue
+                value = parameter.detach().float()
+                if value.numel() == 0:
+                    continue
+                flat_value = value.flatten()
+                sample_count = min(64, flat_value.numel())
+                sample_indices = torch.linspace(
+                    0,
+                    flat_value.numel() - 1,
+                    steps=sample_count,
+                    device=flat_value.device,
+                ).long()
+                signature = torch.cat(
+                    [
+                        torch.stack(
+                            [
+                                value.mean(),
+                                value.abs().mean(),
+                                value.square().mean(),
+                            ]
+                        ),
+                        flat_value[sample_indices],
+                    ]
+                )
+                gathered = self.accelerator.gather(signature).view(self.world_size, -1)
+                if not torch.isfinite(gathered).all():
+                    raise RuntimeError(
+                        f"DeepSpeed produced invalid post-step parameters for {name}: "
+                        f"per-rank stats={gathered.cpu().tolist()}"
+                    )
+                if not torch.allclose(
+                    gathered,
+                    gathered[0:1].expand_as(gathered),
+                    rtol=1e-4,
+                    atol=1e-7,
+                ):
+                    raise RuntimeError(
+                        "DeepSpeed parameter synchronization check failed for "
+                        f"{name}: per-rank stats={gathered.cpu().tolist()}"
+                    )
+                self._distributed_sync_verified = True
+                if self._gradient_probe_handle is not None:
+                    self._gradient_probe_handle.remove()
+                    self._gradient_probe_handle = None
+                self._gradient_probe_records.clear()
+                if self.rank == 0:
+                    logger.info(
+                        "Verified ZeRO synchronized update across %s ranks at engine step %s using %s",
+                        self.world_size,
+                        int(engine_step[0]),
+                        name,
+                    )
+                return
+            raise RuntimeError("Could not find a trainable parameter for DeepSpeed verification")
 
         unwrapped_model = self.accelerator.unwrap_model(self.model)
         for name, parameter in unwrapped_model.named_parameters():
@@ -216,7 +471,7 @@ class VGMBridgeStage1Trainer:
 
         logger.info("Checkpoint loaded from %s", checkpoint_path)
 
-    def train_step(self, batch: Dict[str, Any]) -> Dict[str, float]:
+    def train_step(self, batch: Dict[str, Any]) -> Dict[str, torch.Tensor]:
         """Run one VGM bridge optimization step."""
         self.model.train()
 
@@ -228,6 +483,12 @@ class VGMBridgeStage1Trainer:
         with accumulate_context:
             first_frame = batch["first_frame"].to(self.device, dtype=self.dtype)
             video_frames = batch["video_frames"].to(self.device, dtype=self.dtype)
+            first_view_frames = batch.get("first_view_frames")
+            view_video_frames = batch.get("view_video_frames")
+            if first_view_frames is not None:
+                first_view_frames = first_view_frames.to(self.device, dtype=self.dtype)
+            if view_video_frames is not None:
+                view_video_frames = view_video_frames.to(self.device, dtype=self.dtype)
             first_role_mask = batch.get("first_role_mask")
             role_mask_frames = batch.get("role_mask_frames")
             if first_role_mask is not None:
@@ -247,6 +508,8 @@ class VGMBridgeStage1Trainer:
             loss_dict = self.model(
                 first_frame=first_frame,
                 video_frames=video_frames,
+                first_view_frames=first_view_frames,
+                view_video_frames=view_video_frames,
                 first_role_mask=first_role_mask,
                 role_mask_frames=role_mask_frames,
                 language_embeddings=language_embeddings,
@@ -257,16 +520,48 @@ class VGMBridgeStage1Trainer:
             )
             total_loss = loss_dict["total_loss"]
 
+            if not torch.isfinite(total_loss.detach()):
+                raise RuntimeError(f"Non-finite training loss before backward: {total_loss.detach()}")
+
             if self.accelerator is not None:
+                self._install_deepspeed_gradient_probe()
                 self.accelerator.backward(total_loss)
                 if self.accelerator.sync_gradients:
-                    self._verify_distributed_gradient_sync()
                     grad_clip_norm = getattr(self.config.training, "grad_clip_norm", 1.0)
-                    self.accelerator.clip_grad_norm_(self.model.parameters(), max_norm=grad_clip_norm)
+                    observed_grad_norm = self.accelerator.clip_grad_norm_(
+                        self.model.parameters(),
+                        max_norm=grad_clip_norm,
+                    )
+                    if observed_grad_norm is not None:
+                        observed_grad_norm = torch.as_tensor(
+                            observed_grad_norm,
+                            device=self.device,
+                            dtype=torch.float32,
+                        )
+                        engine_optimizer = getattr(self.model, "optimizer", None)
+                        is_deepspeed = engine_optimizer is not None and hasattr(
+                            engine_optimizer,
+                            "averaged_gradients",
+                        )
+                        if (
+                            not is_deepspeed
+                            and (not torch.isfinite(observed_grad_norm) or observed_grad_norm < 0)
+                        ):
+                            raise RuntimeError(
+                                f"Invalid global gradient norm before optimizer update: {observed_grad_norm}"
+                            )
+                    self._verify_distributed_gradient_sync(observed_grad_norm)
             else:
                 total_loss.backward()
                 grad_clip_norm = getattr(self.config.training, "grad_clip_norm", 1.0)
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=grad_clip_norm)
+                observed_grad_norm = torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(),
+                    max_norm=grad_clip_norm,
+                )
+                if not torch.isfinite(observed_grad_norm):
+                    raise RuntimeError(
+                        f"Invalid global gradient norm before optimizer update: {observed_grad_norm}"
+                    )
 
             self.optimizer.step()
             should_step_scheduler = self.accelerator is None or self.accelerator.sync_gradients
@@ -274,7 +569,19 @@ class VGMBridgeStage1Trainer:
                 self.scheduler.step()
             self.optimizer.zero_grad(set_to_none=True)
 
-        return {key: value.item() if torch.is_tensor(value) else value for key, value in loss_dict.items()}
+        metrics: Dict[str, torch.Tensor] = {}
+        for key, value in loss_dict.items():
+            if torch.is_tensor(value):
+                if value.numel() != 1:
+                    raise ValueError(
+                        f"Training metric {key!r} must be scalar, got {tuple(value.shape)}"
+                    )
+                metrics[key] = value.detach().float()
+            else:
+                metrics[key] = torch.tensor(float(value), device=self.device)
+        if "observed_grad_norm" in locals() and observed_grad_norm is not None:
+            metrics["grad_norm"] = observed_grad_norm.detach().float()
+        return metrics
 
     def train(self, max_steps: int, resume_from: Optional[str] = None) -> None:
         """Main step-based training loop."""
@@ -283,7 +590,10 @@ class VGMBridgeStage1Trainer:
 
         logger.info("Starting VGMBridgeStage1 training for %s steps", max_steps)
         start_time = time.time()
+        optimizer_step_start = start_time
         data_iter = iter(self.train_dataloader)
+        accumulated_metrics: Dict[str, torch.Tensor] = {}
+        accumulated_micro_steps = 0
 
         while self.global_step < max_steps:
             try:
@@ -298,28 +608,47 @@ class VGMBridgeStage1Trainer:
             if batch is None:
                 continue
 
-            step_start_time = time.time()
-            metrics = self.train_step(batch)
+            micro_metrics = self.train_step(batch)
+            for key, value in micro_metrics.items():
+                accumulated_metrics[key] = (
+                    accumulated_metrics.get(key, torch.zeros_like(value)) + value
+                )
+            accumulated_micro_steps += 1
 
             if self.accelerator is not None and not self.accelerator.sync_gradients:
                 continue
 
-            step_time = time.time() - step_start_time
+            metrics = {
+                key: value / float(accumulated_micro_steps)
+                for key, value in accumulated_metrics.items()
+            }
+            if self.accelerator is not None and self.world_size > 1:
+                metrics = {
+                    key: self.accelerator.reduce(value, reduction="mean")
+                    for key, value in metrics.items()
+                }
+            accumulated_metrics = {}
+            accumulated_micro_steps = 0
+
+            step_time = time.time() - optimizer_step_start
+            optimizer_step_start = time.time()
             self.global_step += 1
 
             if self.global_step % self.log_interval == 0 and self.rank == 0:
+                scalar_metrics = {key: float(value.cpu()) for key, value in metrics.items()}
                 lrs = [group["lr"] for group in self.optimizer.param_groups]
                 lr = lrs[0] if lrs else 0.0
                 log_str = (
                     f"Step {self.global_step}/{max_steps}, "
-                    f"Loss: {metrics['total_loss']:.4f} "
-                    f"(Video: {metrics['video_loss']:.4f}, Middle: {metrics['middle_loss']:.4f}), "
+                    f"Loss: {scalar_metrics['total_loss']:.4f} "
+                    f"(Video: {scalar_metrics['video_loss']:.4f}, "
+                    f"Middle: {scalar_metrics['middle_loss']:.4f}), "
                     f"LR: {lr:.2e}, Time: {step_time:.2f}s"
                 )
                 logger.info(log_str)
 
                 log_payload = {
-                    **metrics,
+                    **scalar_metrics,
                     "learning_rate": lr,
                     "step_time": step_time,
                     "epoch": self.epoch,
@@ -337,7 +666,8 @@ class VGMBridgeStage1Trainer:
         total_time = time.time() - start_time
         if self.rank == 0:
             logger.info("VGMBridgeStage1 training completed in %.2fs (%s steps)", total_time, self.global_step)
-        self.save_checkpoint()
+        if bool(self.config.system.get("save_final_checkpoint", True)):
+            self.save_checkpoint()
 
 
 def create_model_and_optimizer(config: OmegaConf) -> tuple[VGMBridgeStage1, torch.optim.Optimizer, Any]:
@@ -382,6 +712,18 @@ def create_model_and_optimizer(config: OmegaConf) -> tuple[VGMBridgeStage1, torc
         role_mask_loss_warmup_steps=config.common.get("role_mask_loss_warmup_steps", 0),
         role_rgb_max_weight=config.common.get("role_rgb_max_weight", 8.0),
         role_rgb_weight_warmup_steps=config.common.get("role_rgb_weight_warmup_steps", 1000),
+        multiview_mode=config.common.get("multiview_mode", "legacy"),
+        num_views=config.common.get("num_views", 2),
+        multiview_layout=config.common.get("multiview_layout", config.dataset.get("view_layout", "vertical")),
+        view_capacity_mode=config.common.get("view_capacity_mode", "shared"),
+        multiview_layer_indices=config.common.get("multiview_layer_indices", None),
+        multiview_adapter_dim=config.common.get("multiview_adapter_dim", 256),
+        multiview_adapter_heads=config.common.get("multiview_adapter_heads", 8),
+        multiview_scene_tokens=config.common.get("multiview_scene_tokens", 4),
+        multiview_consistency_weight=config.common.get("multiview_consistency_weight", 0.1),
+        multiview_consistency_temperature=config.common.get("multiview_consistency_temperature", 0.07),
+        multiview_consistency_projection_dim=config.common.get("multiview_consistency_projection_dim", 128),
+        multiview_output_layout=config.common.get("multiview_output_layout", "vertical"),
         load_pretrained_backbones=getattr(config.model, "load_pretrained_backbones", None),
     )
     model = VGMBridgeStage1(model_config)
@@ -476,6 +818,11 @@ def create_train_dataloader(config: OmegaConf, rank: int, world_size: int) -> Da
         image_column=config.dataset.get("image_column", "image"),
         image_columns=config.dataset.get("image_columns", None),
         view_layout=config.dataset.get("view_layout", "single"),
+        return_separate_views=config.dataset.get(
+            "return_separate_views",
+            config.common.get("multiview_mode", "legacy") in SEPARATE_VIEW_MODES,
+        ),
+        view_video_size=tuple(config.dataset.get("view_video_size", [224, 224])),
         task_language_embedding_dir=config.dataset.get("task_language_embedding_dir", None),
         task_language_embedding_pattern=config.dataset.get("task_language_embedding_pattern", "task_{task_index:06d}.pt"),
         task_language_caption_version=config.dataset.get("task_language_caption_version", None),
@@ -486,6 +833,8 @@ def create_train_dataloader(config: OmegaConf, rank: int, world_size: int) -> Da
         state_column=config.dataset.get("state_column", "observation.state"),
         bridge_sampling_mode=config.dataset.get("bridge_sampling_mode", "sliding_window"),
         bridge_sampling_jitter=config.dataset.get("bridge_sampling_jitter", False),
+        index_seeded_sampling=config.dataset.get("index_seeded_sampling", False),
+        sampling_seed=int(config.training.get("seed", 0)),
         load_role_mask=config.dataset.get("load_role_mask", False),
         role_mask_columns=config.dataset.get("role_mask_columns", None),
         role_mask_render_mode=config.dataset.get("role_mask_render_mode", "binary"),
@@ -499,6 +848,8 @@ def create_train_dataloader(config: OmegaConf, rank: int, world_size: int) -> Da
     )
     # Accelerator.prepare() shards the batch sampler across ranks. Adding a
     # DistributedSampler here would shard the dataset a second time.
+    data_generator = torch.Generator()
+    data_generator.manual_seed(int(config.training.get("seed", 0)))
     return DataLoader(
         train_dataset,
         batch_size=config.training.batch_size,
@@ -507,6 +858,7 @@ def create_train_dataloader(config: OmegaConf, rank: int, world_size: int) -> Da
         pin_memory=config.system.pin_memory,
         collate_fn=video_bridge_collate_fn,
         drop_last=True,
+        generator=data_generator,
     )
 
 
@@ -525,6 +877,23 @@ def main() -> None:
     parser.add_argument("--wandb_project", type=str, default=None, help="Override WandB project name")
     parser.add_argument("--run_name", type=str, default=None, help="Override run name")
     parser.add_argument("--resume_from", type=str, default=None, help="Override resume checkpoint path")
+    parser.add_argument("--seed", type=int, default=None, help="Override training.seed")
+    parser.add_argument("--max_steps", type=int, default=None, help="Override training.max_steps")
+    parser.add_argument("--batch_size", type=int, default=None, help="Override per-rank training.batch_size")
+    parser.add_argument(
+        "--gradient_accumulation_steps",
+        type=int,
+        default=None,
+        help="Override training.gradient_accumulation_steps",
+    )
+    parser.add_argument("--max_episodes", type=int, default=None, help="Override dataset.max_episodes")
+    parser.add_argument("--num_workers", type=int, default=None, help="Override system.num_workers")
+    parser.add_argument("--save_interval", type=int, default=None, help="Override system.save_interval")
+    parser.add_argument(
+        "--skip_final_checkpoint",
+        action="store_true",
+        help="Do not write the final checkpoint (intended for smoke tests only)",
+    )
     parser.add_argument("--deepspeed", type=str, default=None, help="Path to DeepSpeed config file")
     parser.add_argument("--local_rank", type=int, default=-1, help="Local rank for distributed launchers")
     args = parser.parse_args()
@@ -546,6 +915,38 @@ def main() -> None:
         config.logging.run_name = args.run_name
     if args.resume_from is not None:
         config.resume.checkpoint_path = args.resume_from
+    if args.seed is not None:
+        if args.seed < 0:
+            raise ValueError("--seed cannot be negative")
+        config.training.seed = args.seed
+    if args.max_steps is not None:
+        if args.max_steps < 1:
+            raise ValueError("--max_steps must be positive")
+        config.training.max_steps = args.max_steps
+    if args.batch_size is not None:
+        if args.batch_size < 1:
+            raise ValueError("--batch_size must be positive")
+        config.training.batch_size = args.batch_size
+    if args.gradient_accumulation_steps is not None:
+        if args.gradient_accumulation_steps < 1:
+            raise ValueError("--gradient_accumulation_steps must be positive")
+        config.training.gradient_accumulation_steps = args.gradient_accumulation_steps
+    if args.max_episodes is not None:
+        if args.max_episodes < 1:
+            raise ValueError("--max_episodes must be positive")
+        config.dataset.max_episodes = args.max_episodes
+    if args.num_workers is not None:
+        if args.num_workers < 0:
+            raise ValueError("--num_workers cannot be negative")
+        config.system.num_workers = args.num_workers
+    if args.save_interval is not None:
+        if args.save_interval < 1:
+            raise ValueError("--save_interval must be positive")
+        config.system.save_interval = args.save_interval
+    if args.skip_final_checkpoint:
+        config.system.save_final_checkpoint = False
+
+    validate_multiview_experiment_config(config)
 
     if getattr(config.resume, "checkpoint_path", None):
         config.model.load_pretrained_backbones = False
@@ -590,9 +991,50 @@ def main() -> None:
     if not torch.cuda.is_available():
         raise RuntimeError("train_vgm_bridge_stage1.py requires CUDA; run it on the training server.")
     torch.cuda.set_device(accelerator.local_process_index)
+    training_seed = int(config.training.get("seed", 0))
+    set_seed(training_seed, device_specific=False)
+    effective_global_batch = (
+        int(config.training.batch_size)
+        * int(config.training.get("gradient_accumulation_steps", 1))
+        * world_size
+    )
+    expected_global_batch = config.training.get("expected_global_batch_size", None)
+    if expected_global_batch is not None and effective_global_batch != int(expected_global_batch):
+        raise ValueError(
+            "Effective global batch does not match the controlled experiment contract: "
+            f"per_rank={config.training.batch_size}, world_size={world_size}, "
+            f"accumulation={config.training.get('gradient_accumulation_steps', 1)} -> "
+            f"{effective_global_batch}, expected={expected_global_batch}"
+        )
+    config.provenance = OmegaConf.create(
+        {
+            **collect_git_provenance(Path(__file__).resolve().parents[1]),
+            "source_config": str(Path(args.config).expanduser().resolve()),
+            "command": [sys.executable, *sys.argv],
+        }
+    )
+    config.runtime = OmegaConf.create(
+        {
+            "world_size": world_size,
+            "per_rank_batch_size": int(config.training.batch_size),
+            "gradient_accumulation_steps": int(
+                config.training.get("gradient_accumulation_steps", 1)
+            ),
+            "effective_global_batch_size": effective_global_batch,
+            "seed": training_seed,
+        }
+    )
 
     logger.info("Dataset: %s", dataset_name)
     logger.info("Checkpoints will be saved to: %s", config.system.checkpoint_dir)
+    logger.info(
+        "Controlled run: seed=%s, world_size=%s, effective_global_batch=%s, git=%s dirty=%s",
+        training_seed,
+        world_size,
+        effective_global_batch,
+        config.provenance.git_commit,
+        config.provenance.git_dirty,
+    )
 
     tb_writer = None
     if rank == 0 and "tensorboard" in report_to:
@@ -625,6 +1067,9 @@ def main() -> None:
             train_dataloader,
             scheduler,
         )
+        # Model initialization must be identical before DDP wraps it, but the
+        # diffusion noise, timestep draws, and dropout masks should differ by rank.
+        set_seed(training_seed, device_specific=True)
 
         trainer = VGMBridgeStage1Trainer(
             model=model,

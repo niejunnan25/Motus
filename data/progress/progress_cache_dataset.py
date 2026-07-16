@@ -37,6 +37,7 @@ class ProgressEpisodeCacheDataset(Dataset):
         load_language_embedding: bool = False,
         expected_num_progress_bins: Optional[int] = None,
         require_trajectory_role_latent: bool = False,
+        require_trajectory_view_latent: bool = False,
         max_episodes: Optional[int] = None,
     ) -> None:
         super().__init__()
@@ -48,6 +49,7 @@ class ProgressEpisodeCacheDataset(Dataset):
             else None
         )
         self.require_trajectory_role_latent = bool(require_trajectory_role_latent)
+        self.require_trajectory_view_latent = bool(require_trajectory_view_latent)
         manifest_path = self.cache_dir / manifest_name
         if not manifest_path.exists():
             raise FileNotFoundError(
@@ -107,6 +109,7 @@ class ProgressEpisodeCacheDataset(Dataset):
         # Serial 不使用它；Layerwise 用它重放一次冻结 WAN，以提取 30 层 hidden state。
         trajectory_latent = payload["trajectory_latent"]
         trajectory_role_latent = payload.get("trajectory_role_latent")
+        trajectory_view_latent = payload.get("trajectory_view_latent")
         # trajectory_frame_latents: [F=53, C_z, 1, H_z, W_z]。
         # 两种模型都使用它作为最终 53-bin 匹配的显式轨迹 memory。
         trajectory_frame_latents = payload["trajectory_frame_latents"]
@@ -135,6 +138,45 @@ class ProgressEpisodeCacheDataset(Dataset):
                 f"Layerwise joint RoleMask Progress requires trajectory_role_latent in {cache_path}; "
                 "regenerate this cache with the updated Stage 1 cache script"
             )
+        if trajectory_view_latent is not None:
+            if trajectory_view_latent.ndim != 5:
+                raise ValueError(
+                    f"trajectory_view_latent must be [V,C,T,H,W] in {cache_path}"
+                )
+            if (
+                trajectory_view_latent.shape[1] != trajectory_latent.shape[0]
+                or trajectory_view_latent.shape[2] != trajectory_latent.shape[1]
+            ):
+                raise ValueError(
+                    "Each native view latent must share [C,T] with the canonical latent, got "
+                    f"view={tuple(trajectory_view_latent.shape)} and "
+                    f"canonical={tuple(trajectory_latent.shape)} in {cache_path}"
+                )
+        if self.require_trajectory_view_latent and trajectory_view_latent is None:
+            raise ValueError(
+                f"Native multi-view Layerwise Progress requires trajectory_view_latent in {cache_path}; "
+                "regenerate this cache with a multi-view Stage 1 checkpoint"
+            )
+        first_view_frames = payload.get("first_view_frames")
+        last_view_frames = payload.get("last_view_frames")
+        if trajectory_view_latent is not None:
+            if first_view_frames is None or last_view_frames is None:
+                raise ValueError(
+                    f"Native multi-view cache is missing first/last_view_frames in {cache_path}"
+                )
+            expected_endpoint_shape = (
+                trajectory_view_latent.shape[0],
+                3,
+            )
+            for name, endpoint in (
+                ("first_view_frames", first_view_frames),
+                ("last_view_frames", last_view_frames),
+            ):
+                if endpoint.ndim != 4 or endpoint.shape[:2] != expected_endpoint_shape:
+                    raise ValueError(
+                        f"{name} must be [V,3,H,W] with V={trajectory_view_latent.shape[0]} "
+                        f"in {cache_path}, got {tuple(endpoint.shape)}"
+                    )
         # 显式帧 memory 必须是 rank 5，且每个 slot 的单帧 temporal latent 维必须 T=1。
         if trajectory_frame_latents.ndim != 5 or trajectory_frame_latents.shape[2] != 1:
             raise ValueError(
@@ -226,6 +268,7 @@ class ProgressEpisodeCacheDataset(Dataset):
             # Optional [C_z,T_z,H_z,W_z] generated RoleMask latent for joint-VGM
             # Layerwise replay. Serial Progress intentionally ignores this field.
             "trajectory_role_latent": trajectory_role_latent,
+            "trajectory_view_latent": trajectory_view_latent,
             # [F=53,C_z,1,H_z,W_z]。
             "trajectory_frame_latents": trajectory_frame_latents,
             # [N,C_z,1,H_z,W_z]。
@@ -237,6 +280,9 @@ class ProgressEpisodeCacheDataset(Dataset):
             # 各为 [C_img,H_img,W_img] uint8；Trainer 再恢复 batch 维。
             "first_frame": payload["first_frame"],
             "last_frame": payload["last_frame"],
+            "first_view_frames": first_view_frames,
+            "last_view_frames": last_view_frames,
+            "multiview_mode": payload.get("multiview_mode", "legacy"),
             "episode_name": payload.get("episode_name", entry.get("episode_name")),
             "task_index": payload.get("task_index", entry.get("task_index")),
             "total_frames": total_frames,

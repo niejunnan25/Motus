@@ -24,6 +24,7 @@ sys.path.append(str(Path(__file__).parent.parent))
 from data.progress import RoboDopamineBenchDataset
 from data.progress.progress_cache_dataset import SCHEMA_VERSION
 from train.eval_vgm_bridge_stage1 import build_dataset, build_model
+from utils.config_utils import load_config_with_base
 
 
 logger = logging.getLogger(__name__)
@@ -300,6 +301,33 @@ def decode_generated_trajectory_frames(
     return decoded[0].contiguous()
 
 
+def sampled_trajectory_frames(
+    model: Any,
+    sample_output: Any,
+    trajectory_latent: torch.Tensor,
+    expected_frames: int,
+) -> torch.Tensor:
+    """Use directly decoded native-view RGB when the Stage 1 sampler provides it."""
+    if isinstance(sample_output, dict) and sample_output.get("rgb_video") is not None:
+        video = sample_output["rgb_video"].detach().float().clamp(0.0, 1.0)
+        if video.ndim != 5 or video.shape[0] != 1:
+            raise RuntimeError(
+                "Component Stage 1 sampling must return rgb_video [1,F,C,H,W], got "
+                f"{tuple(video.shape)}"
+            )
+        if video.shape[1] != expected_frames:
+            raise RuntimeError(
+                f"VGM returned {video.shape[1]} direct RGB frames but Progress requires "
+                f"{expected_frames} bins"
+            )
+        return video[0].contiguous()
+    return decode_generated_trajectory_frames(
+        model,
+        trajectory_latent,
+        expected_frames,
+    )
+
+
 def cache_episode(
     *,
     model: Any,
@@ -347,6 +375,11 @@ def cache_episode(
         endpoint_frames = dataset.load_episode_frames(
             episode_index, [0, total_frames - 1]
         )
+        endpoint_view_frames = (
+            dataset.load_episode_view_frames(episode_index, [0, total_frames - 1])
+            if model.uses_separate_views
+            else None
+        )
         # 保留 batch 维，first_frame: [1,C_img,H_img,W_img]。
         first_frame = endpoint_frames[0:1]
         # 保留 batch 维，last_frame: [1,C_img,H_img,W_img]。
@@ -365,20 +398,36 @@ def cache_episode(
         sample_output = model.sample_bridge(
             first_frame=first_frame,
             last_frame=last_frame,
+            first_view_frames=(endpoint_view_frames[0:1] if endpoint_view_frames is not None else None),
+            last_view_frames=(endpoint_view_frames[1:2] if endpoint_view_frames is not None else None),
             language_embeddings=language_batch,
             num_inference_steps=int(config.cache.num_inference_steps),
             generator=generator,
             return_latent=True,
-            return_components=bool(model.predict_role_mask),
+            return_components=bool(model.predict_role_mask or model.uses_separate_views),
         )
+        trajectory_view_latent = (
+            sample_output.get("view_latent")
+            if isinstance(sample_output, dict)
+            else None
+        )
+        if trajectory_view_latent is not None:
+            if trajectory_view_latent.ndim != 6:
+                raise RuntimeError(
+                    "Multi-view Stage 1 sampling must return view_latent [B,V,C,T,H,W], got "
+                    f"{tuple(trajectory_view_latent.shape)}"
+                )
+            if trajectory_view_latent.shape[0] != 1:
+                raise RuntimeError("Progress cache expects one generated episode at a time")
         trajectory_latent, trajectory_role_latent = split_sampled_trajectory_latents(
             model, sample_output
         )
         # cache_dtype 只决定落盘精度（正式为 float16），不改变上面 VGM 推理使用的精度。
         cache_dtype = tensor_cache_dtype(cache_dtype_name)
         # 先解码成显式生成轨迹: [F=53, C_img, H_img, W_img]。
-        trajectory_frames = decode_generated_trajectory_frames(
+        trajectory_frames = sampled_trajectory_frames(
             model,
+            sample_output,
             trajectory_latent,
             num_progress_bins,
         )
@@ -426,6 +475,15 @@ def cache_episode(
                 else None
             ),
             "trajectory_role_latent_included": trajectory_role_latent is not None,
+            # Optional native multi-view trajectory. Serial Stage 2 consumes the 53
+            # independently encoded trajectory_frame_latents below; this field preserves
+            # camera identity for diagnostics and future native Layerwise replay.
+            "trajectory_view_latent": (
+                trajectory_view_latent[0].detach().cpu().to(cache_dtype)
+                if trajectory_view_latent is not None
+                else None
+            ),
+            "trajectory_view_latent_included": trajectory_view_latent is not None,
             # [F=53, C_z, 1, H_z, W_z]；Serial 与 Layerwise 都用于最终 53-bin 对齐。
             "trajectory_frame_latents": trajectory_frame_latents,
             # [N, C_z, 1, H_z, W_z]；每一项对应一张真实在线观测。
@@ -437,6 +495,16 @@ def cache_episode(
             # 去掉 batch 后各为 [C_img,H_img,W_img] uint8，仅 Layerwise 重放条件和可视化使用。
             "first_frame": (first_frame[0].clamp(0, 1) * 255.0).round().to(torch.uint8),
             "last_frame": (last_frame[0].clamp(0, 1) * 255.0).round().to(torch.uint8),
+            "first_view_frames": (
+                (endpoint_view_frames[0].clamp(0, 1) * 255.0).round().to(torch.uint8)
+                if endpoint_view_frames is not None
+                else None
+            ),
+            "last_view_frames": (
+                (endpoint_view_frames[1].clamp(0, 1) * 255.0).round().to(torch.uint8)
+                if endpoint_view_frames is not None
+                else None
+            ),
             # 字符串路径，不在每个 episode payload 中重复保存 [L_text,D_text] embedding tensor。
             "language_file": language_file,
             "vgm_config": vgm_config_path,
@@ -447,6 +515,9 @@ def cache_episode(
             "trajectory_frame_encoding": "independent_single_frame_vae",
             "cache_dtype": cache_dtype_name,
             "seed": episode_seed,
+            "multiview_mode": str(vgm_config.common.get("multiview_mode", "legacy")),
+            "multiview_layout": str(vgm_config.common.get("multiview_layout", "vertical")),
+            "multiview_output_layout": str(vgm_config.common.get("multiview_output_layout", "vertical")),
         }
         atomic_torch_save(payload, cache_path)
     else:
@@ -467,12 +538,27 @@ def cache_episode(
             "total_frames": total_frames,
             "num_progress_bins": num_progress_bins,
             "seed": episode_seed,
+            "multiview_mode": str(vgm_config.common.get("multiview_mode", "legacy")),
+            "multiview_layout": str(vgm_config.common.get("multiview_layout", "vertical")),
+            "multiview_output_layout": str(vgm_config.common.get("multiview_output_layout", "vertical")),
         }
         expects_role_trajectory = bool(
             model.predict_role_mask and model.role_mask_fusion_mode == "latent_channel"
         )
         if expects_role_trajectory:
             expected["trajectory_role_latent_included"] = True
+        if model.uses_separate_views:
+            expected["trajectory_view_latent_included"] = True
+        if (
+            str(vgm_config.common.get("multiview_mode", "legacy")) == "legacy"
+            and "multiview_mode" not in existing
+        ):
+            for key in (
+                "multiview_mode",
+                "multiview_layout",
+                "multiview_output_layout",
+            ):
+                expected.pop(key, None)
         mismatched = {
             key: (existing.get(key), value)
             for key, value in expected.items()
@@ -502,6 +588,8 @@ def cache_episode(
         "trajectory_role_latent_included": bool(
             model.predict_role_mask and model.role_mask_fusion_mode == "latent_channel"
         ),
+        "trajectory_view_latent_included": bool(model.uses_separate_views),
+        "multiview_mode": str(vgm_config.common.get("multiview_mode", "legacy")),
     }
 
 
@@ -586,6 +674,7 @@ def build_cache_dataset(
             int(vgm_config.common.video_height),
             int(vgm_config.common.video_width),
         ),
+        view_video_size=tuple(vgm_config.dataset.get("view_video_size", [224, 224])),
         view_names=benchmark_views,
         view_layout=str(
             benchmark.get(
@@ -627,7 +716,7 @@ def main() -> None:
         if args.num_inference_steps < 1:
             raise ValueError("--num_inference_steps must be positive")
         config.cache.num_inference_steps = args.num_inference_steps
-    vgm_config = OmegaConf.load(config.source.vgm_config)
+    vgm_config = load_config_with_base(config.source.vgm_config)
     if (
         vgm_config.dataset.get("bridge_sampling_mode", "sliding_window")
         != "full_episode_uniform"
