@@ -37,6 +37,7 @@ class ProgressEpisodeCacheDataset(Dataset):
         manifest_name: str = "manifest.jsonl",
         load_language_embedding: bool = False,
         expected_num_progress_bins: Optional[int] = None,
+        require_trajectory_role_latent: bool = False,
         max_episodes: Optional[int] = None,
     ) -> None:
         super().__init__()
@@ -47,6 +48,7 @@ class ProgressEpisodeCacheDataset(Dataset):
             if expected_num_progress_bins is not None
             else None
         )
+        self.require_trajectory_role_latent = bool(require_trajectory_role_latent)
         manifest_path = self.cache_dir / manifest_name
         if not manifest_path.exists():
             raise FileNotFoundError(
@@ -105,6 +107,7 @@ class ProgressEpisodeCacheDataset(Dataset):
         # trajectory_latent: [C_z, T_z, H_z, W_z]，正式 53F 缓存中 T_z=14。
         # Serial 不使用它；Layerwise 用它重放一次冻结 WAN，以提取 30 层 hidden state。
         trajectory_latent = payload["trajectory_latent"]
+        trajectory_role_latent = payload.get("trajectory_role_latent")
         # trajectory_frame_latents: [F=53, C_z, 1, H_z, W_z]。
         # 两种模型都使用它作为最终 53-bin 匹配的显式轨迹 memory。
         trajectory_frame_latents = payload["trajectory_frame_latents"]
@@ -117,6 +120,22 @@ class ProgressEpisodeCacheDataset(Dataset):
         # trajectory_latent 去掉 cache 生成时的 batch 维后必须是 rank 4: [C_z,T_z,H_z,W_z]。
         if trajectory_latent.ndim != 4:
             raise ValueError(f"trajectory_latent must be [C,T,H,W] in {cache_path}")
+        if trajectory_role_latent is not None:
+            if trajectory_role_latent.ndim != 4:
+                raise ValueError(
+                    f"trajectory_role_latent must be [C,T,H,W] in {cache_path}"
+                )
+            if trajectory_role_latent.shape != trajectory_latent.shape:
+                raise ValueError(
+                    "RGB and RoleMask trajectory latents must have identical shapes, got "
+                    f"{tuple(trajectory_latent.shape)} and "
+                    f"{tuple(trajectory_role_latent.shape)} in {cache_path}"
+                )
+        if self.require_trajectory_role_latent and trajectory_role_latent is None:
+            raise ValueError(
+                f"Layerwise joint RoleMask Progress requires trajectory_role_latent in {cache_path}; "
+                "regenerate this cache with the updated Stage 1 cache script"
+            )
         # 显式帧 memory 必须是 rank 5，且每个 slot 的单帧 temporal latent 维必须 T=1。
         if trajectory_frame_latents.ndim != 5 or trajectory_frame_latents.shape[2] != 1:
             raise ValueError(
@@ -171,6 +190,9 @@ class ProgressEpisodeCacheDataset(Dataset):
             # Dataset item 保留 episode 维度结构，不在这里添加 batch 维。
             # [C_z,T_z=14,H_z,W_z]。
             "trajectory_latent": trajectory_latent,
+            # Optional [C_z,T_z,H_z,W_z] generated RoleMask latent for joint-VGM
+            # Layerwise replay. Serial Progress intentionally ignores this field.
+            "trajectory_role_latent": trajectory_role_latent,
             # [F=53,C_z,1,H_z,W_z]。
             "trajectory_frame_latents": trajectory_frame_latents,
             # [N,C_z,1,H_z,W_z]。

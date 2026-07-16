@@ -135,3 +135,32 @@ def test_role_region_pixel_metrics_ignore_background_error() -> None:
 
     assert metrics["rgb_role_foreground_mse"] == pytest.approx(1.0)
     assert metrics["rgb_role_active_mse"] == pytest.approx(1.0)
+
+
+def test_vertical_dual_view_role_trajectory_metrics_are_reported_per_camera() -> None:
+    colors = {
+        0: [0, 0, 0],
+        1: [255, 0, 0],
+        2: [0, 255, 0],
+        4: [0, 0, 255],
+    }
+    gt = torch.zeros(1, 3, 3, 4, 4)
+    # Active object appears independently in the top and bottom 2x4 camera views.
+    gt[:, :, 0, 0, 0] = 1.0
+    gt[:, :, 0, 3, 3] = 1.0
+    pred = gt.clone()
+
+    metrics = role_mask_metrics(
+        gt,
+        pred,
+        "role_color",
+        role_mask_palette=colors,
+        tail_condition_frames=0,
+        view_layout="vertical",
+        view_names=["main", "wrist"],
+    )
+
+    assert metrics["role_mask_active_main_centroid_l2"] == pytest.approx(0.0)
+    assert metrics["role_mask_active_wrist_centroid_l2"] == pytest.approx(0.0)
+    assert metrics["role_mask_active_macro_centroid_l2"] == pytest.approx(0.0)
+    assert "role_mask_active_centroid_l2" not in metrics

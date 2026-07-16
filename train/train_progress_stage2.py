@@ -144,6 +144,20 @@ def load_frozen_vgm(config: Any, device: torch.device):
     return vgm
 
 
+def source_requires_trajectory_role_latent(config: Any) -> bool:
+    """Return whether Layerwise replay needs the joint RoleMask trajectory cache field."""
+    if str(config.progress_model.fusion_mode) != "layerwise_wvm":
+        return False
+    vgm_config = OmegaConf.load(config.source.vgm_config)
+    return (
+        str(vgm_config.common.get("role_mask_fusion_mode", "none")) == "latent_channel"
+        and str(vgm_config.common.get("role_mask_training_mode", "legacy"))
+        in {"joint_flow", "joint_flow_rgb_weight"}
+        and str(vgm_config.common.get("role_mask_condition_mode", "legacy"))
+        in {"none", "first_prompt_dropout"}
+    )
+
+
 def prepare_episode_queries(
     current_latents: torch.Tensor,
     progress: torch.Tensor,
@@ -213,6 +227,15 @@ def prepare_episode_micro_batch(
     trajectory_latent = torch.stack(
         [episode["trajectory_latent"] for episode in episodes], dim=0
     )
+    role_latents = [episode.get("trajectory_role_latent") for episode in episodes]
+    if all(value is None for value in role_latents):
+        trajectory_role_latent = None
+    elif any(value is None for value in role_latents):
+        raise ValueError(
+            "An episode micro-batch cannot mix caches with and without trajectory_role_latent"
+        )
+    else:
+        trajectory_role_latent = torch.stack(role_latents, dim=0)
     # trajectory_frame_latents: E * [F=53,C_z,1,H_z,W_z]
     # -> [E,F=53,C_z,1,H_z,W_z]。
     trajectory_frame_latents = torch.stack(
@@ -251,6 +274,7 @@ def prepare_episode_micro_batch(
 
     return {
         "trajectory_latent": trajectory_latent,
+        "trajectory_role_latent": trajectory_role_latent,
         "trajectory_frame_latents": trajectory_frame_latents,
         # [sum_e Q_e,C_z,1,H_z,W_z]；正式 mixed batch 中 Q_e 都等于配置 Q。
         "current_latents": torch.cat(current_latents, dim=0),
@@ -284,6 +308,7 @@ def extract_episode_video_features(
         # 返回 hidden_states: 30 * [E,L_video,D_video]、grid_sizes: [E,3]。
         return frozen_vgm.extract_bridge_hidden_states(
             trajectory_latent=prepared["trajectory_latent"],
+            trajectory_role_latent=prepared.get("trajectory_role_latent"),
             first_frame=first_frame,
             last_frame=last_frame,
             language_embeddings=language_embeddings,
@@ -410,6 +435,7 @@ def train(config: Any, accelerator: Accelerator, resume_from: Optional[str]) -> 
         split="train",
         load_language_embedding=model_config.fusion_mode == "layerwise_wvm",
         expected_num_progress_bins=model_config.num_progress_bins,
+        require_trajectory_role_latent=source_requires_trajectory_role_latent(config),
         max_episodes=config.training.get("max_episodes", None),
     )
     # DataLoader 的 batch_size=E（每个 rank）；collate 保留长度 E 的 episode list，

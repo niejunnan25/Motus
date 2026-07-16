@@ -12,7 +12,7 @@ import random
 import sys
 import uuid
 from pathlib import Path
-from typing import Any, Dict, Iterable, List
+from typing import Any, Dict, Iterable, List, Optional
 
 import numpy as np
 import torch
@@ -60,6 +60,43 @@ def supports_rgb_only_progress_cache(vgm_config: Any) -> bool:
         and training_mode in {"joint_flow", "joint_flow_rgb_weight"}
         and condition_mode in {"none", "first_prompt_dropout"}
     )
+
+
+def split_sampled_trajectory_latents(
+    model: Any, sample_output: Any
+) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Normalize Stage 1 sampling output into RGB and optional joint RoleMask latents."""
+    if isinstance(sample_output, dict):
+        if "rgb_latent" not in sample_output:
+            raise RuntimeError("Component sampling output is missing rgb_latent")
+        trajectory_latent = sample_output["rgb_latent"]
+        trajectory_role_latent = sample_output.get("role_latent")
+    else:
+        trajectory_latent = sample_output
+        trajectory_role_latent = None
+    if not torch.is_tensor(trajectory_latent) or trajectory_latent.ndim != 5:
+        raise RuntimeError(
+            "Stage 1 RGB trajectory sampling must return [B,C,T,H,W], got "
+            f"{type(trajectory_latent).__name__}"
+        )
+    expects_role_trajectory = bool(
+        model.predict_role_mask and model.role_mask_fusion_mode == "latent_channel"
+    )
+    if expects_role_trajectory and trajectory_role_latent is None:
+        raise RuntimeError(
+            "Joint RoleMask VGM sampling did not return role_latent; refusing to create an "
+            "incomplete cache that Layerwise Progress cannot replay"
+        )
+    if trajectory_role_latent is not None:
+        if not torch.is_tensor(trajectory_role_latent):
+            raise RuntimeError("role_latent must be a tensor")
+        if trajectory_role_latent.shape != trajectory_latent.shape:
+            raise RuntimeError(
+                "RGB and RoleMask trajectory latents must have identical shapes, got "
+                f"rgb={tuple(trajectory_latent.shape)} and "
+                f"role={tuple(trajectory_role_latent.shape)}"
+            )
+    return trajectory_latent, trajectory_role_latent
 
 
 def setup_logging(rank: int, level: str) -> None:
@@ -325,13 +362,17 @@ def cache_episode(
         # [1, C_z, T_z, H_z, W_z]，正式 53F 配置中 T_z=14。
         # first/last 提供首尾视觉条件；language_batch 提供任务语义；generator 固定初始噪声。
         # num_inference_steps 正式配置为 50；return_latent=True 阻止内部 VAE decode。
-        trajectory_latent = model.sample_bridge(
+        sample_output = model.sample_bridge(
             first_frame=first_frame,
             last_frame=last_frame,
             language_embeddings=language_batch,
             num_inference_steps=int(config.cache.num_inference_steps),
             generator=generator,
             return_latent=True,
+            return_components=bool(model.predict_role_mask),
+        )
+        trajectory_latent, trajectory_role_latent = split_sampled_trajectory_latents(
+            model, sample_output
         )
         # cache_dtype 只决定落盘精度（正式为 float16），不改变上面 VGM 推理使用的精度。
         cache_dtype = tensor_cache_dtype(cache_dtype_name)
@@ -377,6 +418,14 @@ def cache_episode(
             "num_progress_bins": num_progress_bins,
             # 去掉 batch 维后保存: [C_z, T_z, H_z, W_z]；仅 Layerwise 分支直接使用。
             "trajectory_latent": trajectory_latent[0].detach().cpu().to(cache_dtype),
+            # Joint RoleMask VGM 才包含此字段；它与 RGB latent 来自同一次联合去噪，
+            # Layerwise replay 必须使用真实生成值，不能补零或重新采样。
+            "trajectory_role_latent": (
+                trajectory_role_latent[0].detach().cpu().to(cache_dtype)
+                if trajectory_role_latent is not None
+                else None
+            ),
+            "trajectory_role_latent_included": trajectory_role_latent is not None,
             # [F=53, C_z, 1, H_z, W_z]；Serial 与 Layerwise 都用于最终 53-bin 对齐。
             "trajectory_frame_latents": trajectory_frame_latents,
             # [N, C_z, 1, H_z, W_z]；每一项对应一张真实在线观测。
@@ -419,6 +468,11 @@ def cache_episode(
             "num_progress_bins": num_progress_bins,
             "seed": episode_seed,
         }
+        expects_role_trajectory = bool(
+            model.predict_role_mask and model.role_mask_fusion_mode == "latent_channel"
+        )
+        if expects_role_trajectory:
+            expected["trajectory_role_latent_included"] = True
         mismatched = {
             key: (existing.get(key), value)
             for key, value in expected.items()
@@ -445,6 +499,9 @@ def cache_episode(
         ),
         "cache_file": str(cache_path.relative_to(cache_dir)),
         "language_file": language_file,
+        "trajectory_role_latent_included": bool(
+            model.predict_role_mask and model.role_mask_fusion_mode == "latent_channel"
+        ),
     }
 
 

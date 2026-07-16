@@ -8,7 +8,8 @@ common:
   role_mask_fusion_mode: "latent_channel"
   role_mask_training_mode: "joint_flow"
   role_mask_condition_mode: "first_prompt_dropout"
-  role_mask_loss_weight: 1.0
+  role_mask_loss_weight: 0.1
+  role_mask_loss_warmup_steps: 1000
   role_mask_prompt_dropout: 0.5
   role_rgb_max_weight: 8.0
   role_rgb_weight_warmup_steps: 1000

@@ -8,7 +8,10 @@ common:
   role_mask_fusion_mode: "latent_channel"
   role_mask_training_mode: "joint_flow"
   role_mask_condition_mode: "none"
-  role_mask_loss_weight: 1.0
+  # RoleMask is an auxiliary target: the 0.1 cap keeps RGB as the primary
+  # objective, while the warmup avoids a fresh output head dominating step 0.
+  role_mask_loss_weight: 0.1
+  role_mask_loss_warmup_steps: 1000
   role_rgb_max_weight: 8.0
   role_rgb_weight_warmup_steps: 1000
   video_height: 448

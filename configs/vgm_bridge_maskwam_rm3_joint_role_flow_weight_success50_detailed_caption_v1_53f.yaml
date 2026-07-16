@@ -8,7 +8,8 @@ common:
   role_mask_fusion_mode: "latent_channel"
   role_mask_training_mode: "joint_flow_rgb_weight"
   role_mask_condition_mode: "none"
-  role_mask_loss_weight: 1.0
+  role_mask_loss_weight: 0.1
+  role_mask_loss_warmup_steps: 1000
   role_rgb_max_weight: 8.0
   role_rgb_weight_warmup_steps: 1000
   video_height: 448

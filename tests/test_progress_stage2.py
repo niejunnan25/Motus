@@ -24,6 +24,7 @@ from models.progress_stage2 import (
 from train.train_progress_stage2 import (
     extract_episode_video_features,
     model_config_from_yaml,
+    prepare_episode_micro_batch,
     prepare_episode_queries,
     query_chunk_bounds,
     synchronize_forward_count,
@@ -544,12 +545,33 @@ def test_progress_cache_dataset_preserves_whole_episode(tmp_path):
     assert sample["trajectory_frame_latents"].shape == (53, 4, 1, 8, 8)
     assert sample["num_progress_bins"] == 53
     assert sample["current_latents"].shape[0] == 7
+    assert sample["trajectory_role_latent"] is None
     assert sample["progress"].tolist() == torch.linspace(0.0, 1.0, 7).tolist()
     collated = progress_episode_collate_fn([sample, sample])
     # collate 只保留长度 E=2 的 episode list，不会尝试 stack 不同长度的 N 维。
     assert len(collated) == 2
     assert collated[0] is sample
     assert collated[1] is sample
+
+    with pytest.raises(ValueError, match="requires trajectory_role_latent"):
+        ProgressEpisodeCacheDataset(
+            tmp_path,
+            split="train",
+            load_language_embedding=True,
+            expected_num_progress_bins=53,
+            require_trajectory_role_latent=True,
+        )[0]
+
+    payload["trajectory_role_latent"] = torch.randn_like(payload["trajectory_latent"])
+    torch.save(payload, episode_dir / "episode.pt")
+    joint_sample = ProgressEpisodeCacheDataset(
+        tmp_path,
+        split="train",
+        load_language_embedding=True,
+        expected_num_progress_bins=53,
+        require_trajectory_role_latent=True,
+    )[0]
+    assert joint_sample["trajectory_role_latent"].shape == (4, 3, 8, 8)
 
 
 def test_layerwise_episode_features_preserve_variable_language_lengths():
@@ -564,6 +586,7 @@ def test_layerwise_episode_features_preserve_variable_language_lengths():
                 torch.Size([8, 16]),
             ]
             assert kwargs["trajectory_latent"].shape[0] == 2
+            assert kwargs["trajectory_role_latent"].shape == (2, 4, 3, 8, 8)
             return {"hidden_states": [], "grid_sizes": torch.ones(2, 3)}
 
     episodes = [
@@ -581,6 +604,7 @@ def test_layerwise_episode_features_preserve_variable_language_lengths():
     prepared = {
         "episodes": episodes,
         "trajectory_latent": torch.randn(2, 4, 3, 8, 8),
+        "trajectory_role_latent": torch.randn(2, 4, 3, 8, 8),
     }
     output = extract_episode_video_features(
         FakeFrozenVGM(),
@@ -588,6 +612,45 @@ def test_layerwise_episode_features_preserve_variable_language_lengths():
         prepared,
     )
     assert output["grid_sizes"].shape == (2, 3)
+
+
+def test_episode_micro_batch_stacks_joint_role_trajectory_latents():
+    episodes = []
+    for index in range(2):
+        episodes.append(
+            {
+                "trajectory_latent": torch.full((4, 3, 8, 8), float(index)),
+                "trajectory_role_latent": torch.full((4, 3, 8, 8), float(index + 10)),
+                "trajectory_frame_latents": torch.randn(53, 4, 1, 8, 8),
+                "current_latents": torch.randn(3, 4, 1, 8, 8),
+                "progress": torch.linspace(0.0, 1.0, 3),
+                "episode_name": f"episode_{index}",
+            }
+        )
+
+    prepared = prepare_episode_micro_batch(episodes, queries_per_episode=2)
+
+    assert prepared["trajectory_latent"].shape == (2, 4, 3, 8, 8)
+    assert prepared["trajectory_role_latent"].shape == (2, 4, 3, 8, 8)
+    assert torch.all(prepared["trajectory_role_latent"][0] == 10)
+    assert torch.all(prepared["trajectory_role_latent"][1] == 11)
+
+
+def test_episode_micro_batch_rejects_mixed_joint_and_rgb_only_caches():
+    common = {
+        "trajectory_latent": torch.randn(4, 3, 8, 8),
+        "trajectory_frame_latents": torch.randn(53, 4, 1, 8, 8),
+        "current_latents": torch.randn(2, 4, 1, 8, 8),
+        "progress": torch.tensor([0.0, 1.0]),
+    }
+    with pytest.raises(ValueError, match="cannot mix caches"):
+        prepare_episode_micro_batch(
+            [
+                {**common, "episode_name": "joint", "trajectory_role_latent": torch.randn(4, 3, 8, 8)},
+                {**common, "episode_name": "rgb", "trajectory_role_latent": None},
+            ],
+            queries_per_episode=1,
+        )
 
 
 def test_prepare_episode_queries_rejects_empty_episode():

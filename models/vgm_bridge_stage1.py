@@ -135,6 +135,7 @@ class VGMBridgeStage1Config:
     role_mask_training_mode: str = "legacy"
     role_mask_condition_mode: str = "legacy"
     role_mask_prompt_dropout: float = 0.5
+    role_mask_loss_warmup_steps: int = 0
     role_rgb_max_weight: float = 8.0
     role_rgb_weight_warmup_steps: int = 1000
     load_pretrained_backbones: Optional[bool] = None
@@ -201,6 +202,8 @@ class VGMBridgeStage1(nn.Module):
             )
         if not 0.0 <= float(config.role_mask_prompt_dropout) <= 1.0:
             raise ValueError("role_mask_prompt_dropout must be in [0, 1]")
+        if int(config.role_mask_loss_warmup_steps) < 0:
+            raise ValueError("role_mask_loss_warmup_steps must be >= 0")
         if float(config.role_rgb_max_weight) < 1.0:
             raise ValueError("role_rgb_max_weight must be >= 1")
         if int(config.role_rgb_weight_warmup_steps) < 0:
@@ -774,9 +777,14 @@ class VGMBridgeStage1(nn.Module):
         first_role_mask: Optional[torch.Tensor],
         condition_role: torch.Tensor,
         latent_template: torch.Tensor,
-        apply_prompt_dropout: bool,
+        prompt_policy: str,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Encode only the RoleMask prompts allowed by the configured deployment contract."""
+        if prompt_policy not in {"drop", "keep", "stochastic"}:
+            raise ValueError(
+                f"Unsupported RoleMask prompt_policy={prompt_policy!r}; "
+                "expected 'drop', 'keep', or 'stochastic'"
+            )
         if self.role_mask_condition_mode == "none":
             return torch.zeros_like(latent_template), latent_template.new_zeros(())
 
@@ -793,11 +801,13 @@ class VGMBridgeStage1(nn.Module):
         if self.role_mask_condition_mode != "first_prompt_dropout":
             raise ValueError(f"Unsupported role_mask_condition_mode={self.role_mask_condition_mode!r}")
 
-        batch_size, _, _, height, width = condition_role.shape
+        batch_size = condition_role.shape[0]
+        if prompt_policy == "drop":
+            return torch.zeros_like(latent_template), latent_template.new_zeros(())
         if first_role_mask is None:
-            first_role_mask = condition_role.new_zeros(batch_size, 3, height, width)
-            keep = condition_role.new_zeros(batch_size, 1, 1, 1)
-        elif apply_prompt_dropout:
+            raise ValueError(f"RoleMask prompt_policy={prompt_policy!r} requires first_role_mask")
+
+        if prompt_policy == "stochastic":
             keep = (
                 torch.rand(batch_size, 1, 1, 1, device=first_role_mask.device)
                 >= float(self.config.role_mask_prompt_dropout)
@@ -805,18 +815,38 @@ class VGMBridgeStage1(nn.Module):
         else:
             keep = first_role_mask.new_ones(batch_size, 1, 1, 1)
 
-        prompt = first_role_mask * keep
-        prompt_norm = prompt * 2.0 - 1.0
-        # RoleMask pixels use black as the empty class. In the VAE's [-1, 1]
-        # input space that is -1, not the zero-valued (mid-gray) RGB sentinel.
-        prompt_video = torch.full_like(condition_role, -1.0)
-        prompt_video[:, :, 0:1] = prompt_norm.unsqueeze(2)
-        latent = self._encode_condition_latent(
-            first_frame_norm=prompt_norm.unsqueeze(2),
-            condition_video=prompt_video,
-            latent_template=latent_template,
-        )
+        latent = torch.zeros_like(latent_template)
+        kept_indices = keep.flatten().bool()
+        if bool(kept_indices.any()):
+            prompt_norm = (first_role_mask[kept_indices] * 2.0 - 1.0).unsqueeze(2)
+            first_latent = self.video_model.encode_video(prompt_norm.to(self.dtype))
+            if first_latent.shape[2] != 1:
+                raise RuntimeError(
+                    "A single-frame RoleMask prompt must encode to exactly one temporal latent slice; "
+                    f"got {tuple(first_latent.shape)}"
+                )
+            if first_latent.shape[1:] != latent_template.shape[1:2] + (1,) + latent_template.shape[3:]:
+                raise RuntimeError(
+                    "RoleMask prompt latent is incompatible with the trajectory latent template: "
+                    f"prompt={tuple(first_latent.shape)}, template={tuple(latent_template.shape)}"
+                )
+            latent[kept_indices, :, 0:1] = first_latent
         return latent, keep.float().mean()
+
+    def _training_role_prompt_policy(self) -> str:
+        """Use prompts only as stochastic training-time augmentation, never for formal eval loss."""
+        return "stochastic" if self.training else "drop"
+
+    def _effective_role_mask_loss_weight(self, global_step: Optional[int]) -> float:
+        """Return the configured auxiliary RoleMask weight after optimizer-step warmup."""
+        if not getattr(self, "predict_role_mask", True):
+            return 0.0
+        weight = float(self.config.role_mask_loss_weight)
+        warmup_steps = int(self.config.role_mask_loss_warmup_steps)
+        if warmup_steps <= 0 or global_step is None:
+            return weight
+        scale = min(max(float(global_step) / float(warmup_steps), 0.0), 1.0)
+        return weight * scale
 
     def _encode_condition_latent(
         self,
@@ -1225,7 +1255,9 @@ class VGMBridgeStage1(nn.Module):
                     first_role_mask=first_role_mask,
                     condition_role=condition_role,
                     latent_template=clean_role_latent,
-                    apply_prompt_dropout=self.training,
+                    # Formal loss evaluation must use the same RGB-only contract as
+                    # deployment. Only training samples the optional first-mask prompt.
+                    prompt_policy=self._training_role_prompt_policy(),
                 )
                 clean_full_latent = torch.cat([clean_rgb_latent, clean_role_latent], dim=1)
                 condition_latent = torch.cat([condition_rgb_latent, condition_role_latent], dim=1)
@@ -1305,20 +1337,24 @@ class VGMBridgeStage1(nn.Module):
             expanded = mask.expand_as(error).float()
             return (error * expanded).sum() / expanded.sum().clamp_min(1.0)
 
+        effective_role_mask_loss_weight = self._effective_role_mask_loss_weight(global_step)
         if self.role_mask_fusion_mode == "spatial":
             if video_pred.shape[-1] % 2 != 0:
                 raise ValueError(f"Spatial role-mask latent width must be even, got {video_pred.shape[-1]}")
             split = video_pred.shape[-1] // 2
             rgb_loss = masked_mean(sq_error[..., :split])
             role_mask_loss = masked_mean(sq_error[..., split:])
-            base_video_loss = rgb_loss + float(self.config.role_mask_loss_weight) * role_mask_loss
+            weighted_role_mask_loss = effective_role_mask_loss_weight * role_mask_loss
+            base_video_loss = rgb_loss + weighted_role_mask_loss
         elif self.role_mask_fusion_mode == "latent_channel":
             rgb_loss = masked_mean(sq_error[:, : self.latent_channels])
             role_mask_loss = masked_mean(sq_error[:, self.latent_channels :])
-            base_video_loss = rgb_loss + float(self.config.role_mask_loss_weight) * role_mask_loss
+            weighted_role_mask_loss = effective_role_mask_loss_weight * role_mask_loss
+            base_video_loss = rgb_loss + weighted_role_mask_loss
         else:
             rgb_loss = masked_mean(sq_error)
             role_mask_loss = rgb_loss.detach().new_zeros(())
+            weighted_role_mask_loss = role_mask_loss
             base_video_loss = rgb_loss
 
         expanded_loss_mask = loss_mask.expand_as(video_pred).float()
@@ -1346,7 +1382,7 @@ class VGMBridgeStage1(nn.Module):
             expanded_weight = role_rgb_weight.float().expand_as(rgb_error)
             weighted_mask = rgb_loss_mask * expanded_weight
             weighted_rgb_loss = (rgb_error * weighted_mask).sum() / weighted_mask.sum().clamp_min(1.0)
-            video_loss = weighted_rgb_loss + float(self.config.role_mask_loss_weight) * role_mask_loss
+            video_loss = weighted_rgb_loss + weighted_role_mask_loss
             role_rgb_weight_mean = (
                 (role_rgb_weight.float() * (1 - known_mask).float().expand_as(role_rgb_weight)).sum()
                 / (1 - known_mask).float().expand_as(role_rgb_weight).sum().clamp_min(1.0)
@@ -1383,6 +1419,10 @@ class VGMBridgeStage1(nn.Module):
                 "rgb_loss": rgb_loss,
                 "weighted_rgb_loss": weighted_rgb_loss,
                 "role_mask_loss": role_mask_loss,
+                "weighted_role_mask_loss": weighted_role_mask_loss,
+                "effective_role_mask_loss_weight": video_loss.detach().new_tensor(
+                    effective_role_mask_loss_weight
+                ),
                 "role_prompt_keep_rate": role_prompt_keep_rate.detach(),
                 "role_rgb_weight_mean": role_rgb_weight_mean.detach(),
                 "role_rgb_weight_max": role_rgb_weight_max.detach(),
@@ -1462,7 +1502,7 @@ class VGMBridgeStage1(nn.Module):
                     first_role_mask=first_role_mask,
                     condition_role=condition_role,
                     latent_template=condition_rgb_latent,
-                    apply_prompt_dropout=False,
+                    prompt_policy="keep" if first_role_mask is not None else "drop",
                 )
                 condition_latent = torch.cat([condition_rgb_latent, condition_role_latent], dim=1)
             else:
@@ -1615,6 +1655,7 @@ class VGMBridgeStage1(nn.Module):
         last_frame: torch.Tensor,
         language_embeddings: Optional[torch.Tensor] = None,
         feature_timestep: float = 0.0,
+        trajectory_role_latent: Optional[torch.Tensor] = None,
     ) -> Dict[str, Any]:
         """Run a clean bridge latent once and expose all WAN block hidden states.
 
@@ -1622,16 +1663,45 @@ class VGMBridgeStage1(nn.Module):
         the V1-proper condition/mask/endpoint inputs while keeping Progress
         strictly read-only with respect to the video branch.
         """
-        if self.role_mask_fusion_mode != "none":
+        if self.role_mask_fusion_mode == "spatial" or self.requires_role_mask_prompt:
             raise NotImplementedError(
-                "Progress hidden-state extraction currently supports RGB-only VGM checkpoints"
+                "Layerwise Progress cannot replay a VGM that requires external RoleMask prompts"
             )
 
         was_training = self.training
         self.eval()
         try:
-            # trajectory_latent: [B, C_z, T_z, H_z, W_z]；本路径只供 Layerwise Progress 使用。
+            # trajectory_latent 始终是 RGB [B,C_z,T_z,H_z,W_z]。Joint RoleMask 模型还必须
+            # 提供同一次采样得到的 trajectory_role_latent，二者拼回 Stage 1 的真实联合状态。
             trajectory_latent = trajectory_latent.to(device=self.device, dtype=self.dtype)
+            if trajectory_latent.ndim != 5 or trajectory_latent.shape[1] != self.latent_channels:
+                raise ValueError(
+                    "trajectory_latent must contain the RGB VGM latent "
+                    f"[B,{self.latent_channels},T,H,W], got {tuple(trajectory_latent.shape)}"
+                )
+            model_trajectory_latent = trajectory_latent
+            if self.role_mask_fusion_mode == "latent_channel":
+                if trajectory_role_latent is None:
+                    raise ValueError(
+                        "Joint RoleMask Layerwise replay requires trajectory_role_latent from the "
+                        "same Stage 1 sampling run; regenerate the Progress cache with the joint VGM"
+                    )
+                trajectory_role_latent = trajectory_role_latent.to(
+                    device=self.device, dtype=self.dtype
+                )
+                if trajectory_role_latent.shape != trajectory_latent.shape:
+                    raise ValueError(
+                        "RGB and RoleMask trajectory latents must share [B,C,T,H,W], got "
+                        f"rgb={tuple(trajectory_latent.shape)} and "
+                        f"role={tuple(trajectory_role_latent.shape)}"
+                    )
+                model_trajectory_latent = torch.cat(
+                    [trajectory_latent, trajectory_role_latent], dim=1
+                )
+            elif trajectory_role_latent is not None:
+                raise ValueError(
+                    "trajectory_role_latent was provided for an RGB-only VGM checkpoint"
+                )
             # first_frame/last_frame 只搬到同一设备和精度，形状均保持 [B,C_img,H_img,W_img]。
             first_frame = first_frame.to(device=self.device, dtype=self.dtype)
             last_frame = last_frame.to(device=self.device, dtype=self.dtype)
@@ -1647,15 +1717,32 @@ class VGMBridgeStage1(nn.Module):
             )
             # 条件 VAE 路径输出 condition_latent: [B,C_z,T_z=14,H_z,W_z]；
             # first_frame_norm 单独编码，保证第一个 latent slice 是干净的单帧条件。
-            condition_latent = self._encode_condition_latent(
+            condition_rgb_latent = self._encode_condition_latent(
                 first_frame_norm=(first_frame * 2.0 - 1.0).unsqueeze(2),
                 condition_video=condition_video,
                 latent_template=trajectory_latent,
             )
-            if condition_latent.shape != trajectory_latent.shape:
+            if condition_rgb_latent.shape != trajectory_latent.shape:
                 raise ValueError(
                     "Cached trajectory latent is incompatible with the configured VGM: "
-                    f"trajectory={tuple(trajectory_latent.shape)}, condition={tuple(condition_latent.shape)}"
+                    f"trajectory={tuple(trajectory_latent.shape)}, "
+                    f"condition={tuple(condition_rgb_latent.shape)}"
+                )
+            if self.role_mask_fusion_mode == "latent_channel":
+                # Formal deployment has no external RoleMask. The role condition therefore uses
+                # exactly the same zero latent as RM2/RM3/RM4 sampling, while the clean generated
+                # role trajectory remains present in model_trajectory_latent.
+                condition_role_latent = torch.zeros_like(trajectory_role_latent)
+                condition_latent = torch.cat(
+                    [condition_rgb_latent, condition_role_latent], dim=1
+                )
+            else:
+                condition_latent = condition_rgb_latent
+            if condition_latent.shape != model_trajectory_latent.shape:
+                raise ValueError(
+                    "Joint trajectory and condition latent shapes differ: "
+                    f"trajectory={tuple(model_trajectory_latent.shape)}, "
+                    f"condition={tuple(condition_latent.shape)}"
                 )
 
             # known_mask: [B,1,T_z,1,1]；V1-proper 只有 temporal index 0 为 1。
@@ -1672,25 +1759,25 @@ class VGMBridgeStage1(nn.Module):
             # 把 clean trajectory_latent 当作当前 video latent，并拼接 condition/mask；
             # V1-proper model_input: [B,2*C_z+mask_channels,T_z,H_z,W_z]。
             model_input = self._build_model_input(
-                noisy_video_latent=trajectory_latent,
+                noisy_video_latent=model_trajectory_latent,
                 condition_latent=condition_latent,
                 frame_mask=frame_mask,
             )
             # seq_len 是 patchify 后的有效视频 token 数标量。
-            seq_len = self._wan_seq_len(trajectory_latent)
+            seq_len = self._wan_seq_len(model_trajectory_latent)
             # token_residual: [B,seq_len,D_video]，仍使用与 Stage 1 相同的 last-frame adapter。
             token_residual = self._endpoint_token_residual(
                 last_frame=last_frame,
                 last_role_mask=None,
-                target_latent=trajectory_latent,
+                target_latent=model_trajectory_latent,
                 seq_len=seq_len,
             )
             # 只做一次特征读取，不进行去噪循环；timestep: [B]，正式配置 feature_timestep=0。
-            timestep = trajectory_latent.new_full((batch_size,), float(feature_timestep))
+            timestep = model_trajectory_latent.new_full((batch_size,), float(feature_timestep))
             # timestep_tokens: [B,seq_len]，且 known 首帧 token 按 Stage 1 规则处理。
             timestep_tokens = self._timestep_tokens(
                 timestep=timestep,
-                latent=trajectory_latent,
+                latent=model_trajectory_latent,
                 known_mask=known_mask,
                 seq_len=seq_len,
             )
