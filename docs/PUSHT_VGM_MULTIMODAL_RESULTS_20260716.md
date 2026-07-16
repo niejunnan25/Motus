@@ -4,48 +4,41 @@ Date: 2026-07-16
 
 ## Executive Conclusion
 
-The experiment provides partial, but not yet sufficient, evidence for the VGM
-trajectory-memory story. Different initial-noise seeds produce visibly different
-pusher approaches for the same held-out first/goal frames, and these differences
-remain after 50 or 55 denoising steps. However, strict complete-path validity is
-0/32 at every solver setting because the small blue pusher often becomes blurry,
-fragments, or disappears in later frames.
+The data supports the premise that nearby PushT endpoint pairs admit multiple
+expert path modes, but the current 5K-step VGM does not reproduce that
+multimodality reliably.
 
-Under the explicitly weaker post-hoc task-level diagnostic, 50 and 55 steps each produce
-12/32 task-valid samples (37.5%). Three of four held-out endpoint conditions have
-two task-valid approach sectors. This supports the claim that the model contains
-candidate path diversity, but it does not yet establish a high-fidelity multimodal
-trajectory generator suitable for cached visual memory.
+For the four held-out endpoint conditions, the 32 nearest training endpoint
+neighbors contain an average of `3.75/4` contact-side modes. In contrast, the
+50-step VGM has `0/32` strict-valid samples. Under the weaker post-hoc task tier,
+`12/32` samples pass, but every held-out condition contains only one valid
+contact-side mode. Average valid-mode coverage is only `27.1%`.
 
-## Question and Decision Rule
+Official-simulator replay makes the failure clearer. The learned inverse
+dynamics recovers held-out real actions with only `0.54 px` coordinate RMSE, and
+full real pusher paths reach their conditioned final states in `28/28` episodes.
+No generated sample has a complete 17-frame pusher track. After allowing a
+relaxed interpolation of at most two consecutive missing detections, only
+`12/32` samples can be replayed, and `0/12` reaches the conditioned final state.
 
-The controlled question is:
-
-> For identical held-out first and goal frames, can one endpoint-conditioned VGM
-> produce at least two valid robot-object interaction paths by changing only the
-> initial latent-noise seed?
-
-Useful VGM multimodality requires both validity and diversity. Pixel differences,
-texture changes, broken geometry, temporal jumps, or failure to reach the goal do
-not count as alternative paths. The test is a prerequisite for the VGM-memory
-story, not a downstream proof that generated memory beats real trajectory memory.
-
-Here, validity is an image-space proxy: color masks measure visibility, centroid
-motion, contact distance, and endpoint agreement. It does not recover actions,
-replay a generated path in the simulator, or explicitly score T-block orientation.
+Therefore the current checkpoint shows seed-dependent variation inside one
+dominant path mode, not multiple physically valid successful paths. The proposed
+VGM trajectory-memory benefit remains a plausible research hypothesis, but this
+experiment does not yet establish it.
 
 ## Traceability
 
-- Repository worktree: `/Users/n/Documents/DreamZero/worktrees/Motus-pusht`
+- Repository: `/Users/n/Documents/DreamZero/worktrees/Motus-pusht`
 - Branch: `codex/pusht-vgm-diversity`
 - Experiment base commit: `946e1ad8a04d1c103474f1beaa1efe7ffd4fd984`
-- PushT implementation/evaluation commit: `a534033`
+- Initial PushT implementation commit: `a534033`
+- Initial report commit: `c4346ed`
+- Corrected validity/mode/physics code commit: `5e9f9b3`
 - Remote code: `/mnt/workspace1/users/niejunnan/codebase/Motus-pusht`
-- Training config: `configs/vgm_bridge_pusht_v1_proper_17f_7gpu_gbs14_5k.yaml`
-- Evaluation config: `configs/vgm_bridge_pusht_v1_proper_17f_eval.yaml`
-- Protocol: `docs/PUSHT_VGM_MULTIMODAL_VALIDATION.md`
+- Official simulator source: Diffusion Policy commit
+  `5ba07ac6661db573af695b419a7947ecb704690f`
 
-Final checkpoint:
+Training checkpoint:
 
 ```text
 /mnt/workspace1/users/niejunnan/codebase/Motus-pusht/checkpoints/
@@ -53,156 +46,242 @@ vgm_bridge_pusht_v1_proper_17f_7gpu_gbs14_5k/
 vgm_bridge_pusht_v1_proper_256x256_17f_7gpu_gbs14_5k/checkpoint_step_5000
 ```
 
-## Data
-
-- Official PushT replay dataset: 206 successful episodes, 25,650 frames.
-- Train/test split: 178/28 episodes; test is a held-out initial-pose cluster.
-- Each episode is sampled into 17 uniformly spaced frames, including true first
-  and last frames; training jitters the 15 interior bins.
-- Resolution: 256 x 256.
-- Full-dataset endpoint audit: all 206 eight-nearest endpoint neighborhoods have
-  at least two approach sectors; 174/206 have at least three.
-- Train-only audit: 177/178 training endpoint neighborhoods have at least two
-  sectors; 145/178 have at least three.
-- Held-out-to-train audit: all 28 test endpoint queries have at least two sectors
-  among their eight nearest training endpoints; 26/28 have at least three.
-- These are nearby endpoint pairs, not exactly pixel-identical endpoint conditions.
-
-Local dataset audit:
+The formal solver-step set is now exactly:
 
 ```text
-/Users/n/Documents/DreamZero/datasets/pusht_vgm_v1/audit
+1, 4, 10, 20, 50
 ```
 
-## Training
+The existing 55-step raw run is archival only and is excluded by
+`summary_max50/summary_manifest.json`.
 
-- Model: Wan2.2 TI2V 5B through Motus `V1-proper` mask-guided endpoint mode.
-- Conditions: first frame and last frame; no language or state condition.
-- Output: 17 frames, with 15 unknown interior frames.
+## Data Multimodality
+
+The converted dataset contains 206 demonstrations and 25,650 frames, split into
+178 training and 28 held-out episodes. These should not be called official
+PushT successes: recorded actions reproduce each demonstration's final state,
+but none of the 28 test trajectories crosses the official simulator's 95%
+coverage termination threshold.
+
+The training data nevertheless contains clear local path diversity:
+
+| Endpoint-neighborhood audit | Result |
+| --- | ---: |
+| Train episodes with at least 2 modes among 8 nearest train endpoints | 177/178 |
+| Train episodes with at least 3 modes among 8 nearest train endpoints | 145/178 |
+| Held-out queries with at least 2 train modes among 8 nearest endpoints | 28/28 |
+| Held-out queries with at least 3 train modes among 8 nearest endpoints | 26/28 |
+
+For the four generated conditions, using a larger 32-neighbor local reference:
+
+| Condition | Nearest-train modes | Effective train modes |
+| ---: | ---: | ---: |
+| 00 | 3/4 | 2.82 |
+| 01 | 4/4 | 3.60 |
+| 02 | 4/4 | 3.77 |
+| 03 | 4/4 | 3.34 |
+
+These are nearby, not exactly pixel-identical, endpoint pairs. They establish
+that the local dataset contains multiple routing/contact modes, not that every
+exact endpoint image pair has multiple demonstrations.
+
+## Training Health
+
+- Model: Wan2.2 TI2V 5B through Motus V1-proper endpoint conditioning.
+- Output: 17 frames, with 15 generated interior frames.
 - Trainable parameters: 5,001,044,160.
-- Hardware: cdf GPUs 0-6, seven H200 GPUs.
+- Hardware: seven H200 GPUs.
 - Per-GPU/global batch: 2/14.
-- Budget: 5,000 optimizer steps, BF16, learning rate 1e-5.
-- DDP gradient synchronization was explicitly verified across all seven ranks.
-- Duration: 2,461.91 seconds, about 41.0 minutes.
-- Median step time excluding the first step: 0.44 seconds.
+- Budget: 5,000 optimizer steps, BF16, learning rate `1e-5`.
+- Duration: 2,461.91 seconds, about 41 minutes.
 - Final instantaneous loss: 0.0517.
 - Final 100-step mean loss: 0.050171.
 
-Training artifacts:
+There was no NaN, OOM, DDP mismatch, or optimization divergence. Standard
+held-out full-image metrics also appear reasonable (`MSE=0.002956`,
+`PSNR=25.428 dB`). These global metrics are dominated by the static background
+and large T block and do not expose loss of the small blue pusher.
 
-```text
-/Users/n/Documents/DreamZero/artifacts/pusht_vgm_multimodal_20260716/training
-```
+## Corrected Solver Ablation
 
-The loss falls quickly and reaches a stable plateau after roughly 1,000 steps.
-There is no NaN, OOM, rank failure, or optimization divergence. The later pusher
-failure is therefore a visual-detail/fidelity limitation, not a failed optimizer.
+The previous report compared cardinal training modes with diagonal generated
+quadrants. Commit `5e9f9b3` rescored both sides with the same cardinal
+first-contact definition. This changes the interpretation materially.
 
-## Standard Held-Out Reconstruction
-
-The normal 50-step evaluator uses 16 held-out samples:
-
-| Metric | Result |
-| --- | ---: |
-| Flow-matching eval loss | 0.069529 +/- 0.040104 |
-| Generated MSE | 0.002956 |
-| Generated PSNR | 25.428 dB |
-| Generated MAE | 0.009954 |
-| Generated edge MSE | 0.007079 |
-| Generated interaction MSE | 0.006657 |
-| Generated motion MSE | 0.069903 |
-
-These full-image metrics look reasonable because the white background and large
-T block dominate the image. They do not expose the small-pusher disappearance,
-which is why entity-level validity is required.
-
-## Multiseed Solver Ablation
-
-Four fixed held-out endpoint conditions are each generated with seeds 0-7. The
-same seed is reused for every solver setting.
-
-| Steps | Strict valid | Post-hoc task valid | Mean pusher detection | Mean task-valid modes/condition | Task-valid pusher RMS |
+| Steps | Strict valid | Post-hoc task valid | Mean pusher detection | Mean task-valid modes/condition | Task-valid pusher APD |
 | ---: | ---: | ---: | ---: | ---: | ---: |
 | 1 | 0.0% | 0.0% | 9.2% | 0.00 | N/A |
 | 4 | 0.0% | 0.0% | 25.4% | 0.00 | N/A |
-| 10 | 0.0% | 12.5% | 51.5% | 0.75 | 0.0664 |
-| 20 | 0.0% | 25.0% | 57.4% | 1.00 | 0.1216 |
-| 50 | 0.0% | 37.5% | 60.8% | 1.75 | 0.1146 |
-| 55 | 0.0% | 37.5% | 61.0% | 1.75 | 0.1150 |
+| 10 | 0.0% | 12.5% | 51.5% | 0.75 | 0.0721 |
+| 20 | 0.0% | 25.0% | 57.4% | 0.75 | 0.1093 |
+| 50 | 0.0% | 37.5% | 60.8% | 1.00 | 0.1163 |
 
-At 50 steps, task-valid samples by condition are `4/8, 3/8, 1/8, 4/8`.
-Conditions 00, 01, and 03 each contain two task-valid approach sectors; condition
-02 contains only one task-valid sample and is the clearest failure case.
+At 50 steps, post-hoc task-valid sample counts are `4/8, 3/8, 1/8, 4/8`
+for conditions 00-03. In every condition, all passing samples share the same
+contact-side mode:
 
-Full local outputs:
+```text
+C00: up
+C01: up
+C02: left
+C03: left
+```
+
+The pusher APD is nonzero, so seeds do produce different curves. However, APD
+here measures variation within one contact mode and also remains sensitive to
+interpolated missing detections. It cannot be cited as successful multimodality.
+
+Mode-distribution diagnostics at 50 steps:
+
+| Condition | Train modes | Task-valid VGM modes | Mode coverage | Mode JS divergence |
+| ---: | ---: | ---: | ---: | ---: |
+| 00 | 3 | 1 | 33.3% | 0.233 |
+| 01 | 4 | 1 | 25.0% | 0.251 |
+| 02 | 4 | 1 | 25.0% | 0.406 |
+| 03 | 4 | 1 | 25.0% | 0.533 |
+
+## Physical Replay
+
+The official PushT action is an absolute 2D pusher target. A shared linear
+inverse-dynamics model is fitted on the 178 training trajectories. On all 28
+held-out trajectories it achieves:
+
+| Inverse-action metric | Result |
+| --- | ---: |
+| Coordinate RMSE | 0.541 px |
+| Coordinate MAE | 0.311 px |
+| Mean 2D vector error | 0.495 px |
+| 95th-percentile 2D vector error | 1.475 px |
+
+This is accurate enough to use as a replay diagnostic. The real-path controls
+show where the proxy loses information:
+
+| Replay source, 28 held-out episodes | Official success | Conditioned-goal reached | Mean max reward | Mean final goal position error |
+| --- | ---: | ---: | ---: | ---: |
+| Recorded actions | 0.0% | 100.0% | 0.8849 | approximately 0 px |
+| Inverse actions from full real pusher path | 0.0% | 100.0% | 0.8834 | 0.17 px |
+| Inverse actions from 17 real waypoints | 0.0% | 67.9% | 0.6933 | 31.28 px |
+
+The official-success column is zero even for recorded actions because this
+dataset's demonstration endpoints do not cross the environment's stricter 95%
+coverage termination threshold. Conditioned-goal arrival is therefore the fair
+primary endpoint metric for this dataset.
+
+Generated replay results:
+
+| Generated-path test | Result |
+| --- | ---: |
+| Complete pusher tracks, all 17 frames | 0/32 |
+| Relaxed recoverable tracks, gap at most 2 frames | 12/32 |
+| Conditioned-goal reached among recoverable | 0/12 |
+| Official success among recoverable | 0/12 |
+| Mean max official reward among recoverable | 0.2076 |
+| Mean final conditioned-goal position error | 165.95 px |
+| Simulator pusher vs generated pusher RMS | 0.00034 normalized |
+| Simulator block vs generated block RMS | 0.1503 normalized |
+
+The final two rows are especially informative. The replay controller follows the
+recovered generated pusher path closely, but the physically simulated T block
+does not follow the block motion shown by the generated video. This is direct
+evidence of interaction-dynamics inconsistency, not merely a weak inverse
+controller.
+
+## Visual Evidence
+
+Local root:
 
 ```text
 /Users/n/Documents/DreamZero/artifacts/pusht_vgm_multimodal_20260716/full
 ```
 
-The `summary/full_17f_overviews` directory contains one image per condition and
-solver setting. Each row contains all 17 frames, and every overview includes the
-ground truth followed by all eight seeds. Individual MP4, NPZ tracks, metrics,
-and 17-frame GT/generated sheets remain under each `steps_*` directory.
+Training distribution and four-condition mode summary:
 
-## Determinism and the One-Step Hypothesis
+```text
+mode_diagnostics_50step/training_and_inference_mode_atlas.png
+```
 
-For a fixed checkpoint, condition, seed, and deterministic scheduler, sampling is
-deterministic. Repeating the four-step smoke run for seeds 0 and 1 produced arrays
-that are byte-identical to the formal four-step run.
+All four inference path panels:
 
-Changing the seed changes the initial Gaussian latent. It is the seed, not a low
-solver-step count, that selects another candidate trajectory. A 55-step result is
-therefore deterministic conditional on its seed, but the distribution across
-seeds can remain multimodal.
+```text
+mode_diagnostics_50step/inference_50step_path_atlas.png
+```
 
-The measurements contradict the hypothesis that fewer undistilled steps preserve
-more useful modes:
+Per-condition detailed comparisons, including endpoint images, 32 nearest
+training paths, all eight generated paths, mode occupancy, PCA, and metrics:
 
-- Across-seed frame MSE rises from 0.000154 at one step to 0.001898 at 50 steps.
-- Secondary task validity rises from 0% at one/four steps to 37.5% at 50/55.
-- Same-seed 50-vs-55 frame MSE is only 0.00000242, showing solver convergence.
-- Same-seed 1-vs-50 frame MSE is 0.001172, showing substantial under-denoising
-  error rather than a clean uncertainty representation.
+```text
+mode_diagnostics_50step/by_condition/condition_00_mode_diagnostic.png
+mode_diagnostics_50step/by_condition/condition_01_mode_diagnostic.png
+mode_diagnostics_50step/by_condition/condition_02_mode_diagnostic.png
+mode_diagnostics_50step/by_condition/condition_03_mode_diagnostic.png
+```
 
-One Euler update from the maximum noise level to the clean endpoint is not a
-trained one-step generator. A genuine one-step model would require consistency
-training, reflow, or distillation. An early noisy latent may contain uncertainty,
-but it is not directly a clean trajectory-memory representation.
+Physical replay summary:
 
-## Failure Analysis
+```text
+physical_replay_50step/physical_replay_summary.png
+```
 
-The principal defect is the pusher, not the T block or the endpoint clamp:
+Every physical replay sheet retains all 17 temporal frames for the recorded
+trajectory, the real 17-waypoint replay, and each of eight generated seeds:
 
-- T-block detection is 100% in all solver settings and its mean final goal error
-  is approximately 0.013-0.016 in normalized image coordinates.
-- At 50/55 steps, pusher detection averages only about 61% of frames.
-- Human inspection confirms the tracker result: the blue pusher becomes faint,
-  splits into small blobs, or disappears, especially near the final frames.
-- Full-image latent loss underweights this small, task-critical object. The model
-  can obtain low global MSE while losing the manipulation agent.
+```text
+physical_replay_50step/by_condition/condition_00_physics_replay_17f.png
+physical_replay_50step/by_condition/condition_01_physics_replay_17f.png
+physical_replay_50step/by_condition/condition_02_physics_replay_17f.png
+physical_replay_50step/by_condition/condition_03_physics_replay_17f.png
+```
 
-This means the present checkpoint demonstrates a multimodal tendency but does not
-yet satisfy the original strict statement: multiple complete, physically usable
-paths for the same endpoints.
+Remote root:
 
-## Next Decisive Experiment
+```text
+/mnt/workspace1/users/niejunnan/codebase/Motus-pusht/eval_outputs/
+pusht_vgm_multimodal_step5000_20260716
+```
 
-Keep the endpoint split, four conditions, eight seeds, solver settings, and all
-thresholds unchanged. Retrain only the fidelity objective:
+## What This Says About VGM Necessity
 
-1. Add object-centric weighting from PushT's deterministic color masks, with
-   separate pusher and T-block weights instead of generic full-frame motion/edge
-   weighting.
-2. Report strict validity first; accept the multimodality claim only when at least
-   two strict-valid sectors occur for more than one held-out condition.
-3. Compare 50 and 55 steps; use 50 if quality remains equivalent.
-4. After strict validity succeeds, compare downstream memory sources: one real
-   demonstration, K retrieved real demonstrations, one generated trajectory, and
-   K generated trajectories. This is the control needed to establish that VGM
-   coverage, rather than trajectory matching alone, provides the benefit.
+The intended reviewer-facing reason for a VGM is not that it can encode a
+trajectory. A normal video encoder can already encode a provided trajectory.
+The VGM is useful only if it amortizes a conditional distribution over plausible
+trajectories and can synthesize several valid modes for a novel first/goal pair
+without storing demonstrations for every endpoint combination.
 
-For online Progress inference, cache K high-quality generated trajectories once
-and marginalize or select over them. Reducing an undistilled model to one or four
-steps is not supported by this experiment.
+This experiment separates the premise from the current implementation:
+
+1. The premise is plausible: local PushT endpoint neighborhoods contain several
+   real path modes.
+2. The current VGM does not realize it: generated valid paths collapse to one
+   contact mode and are not physically consistent.
+3. Therefore it is not yet defensible to claim that VGM memory is superior to a
+   retrieved real trajectory memory.
+
+Even after generation quality improves, the decisive downstream control remains:
+
+```text
+Real-1 vs Retrieved-K vs VGM-1 vs VGM-K vs Oracle same-episode memory
+```
+
+The VGM claim becomes convincing only if `VGM-K` improves unseen-endpoint mode
+coverage, Progress stability, or downstream reward while using less stored
+trajectory memory or lower online latency than `Retrieved-K`.
+
+## Next Experiment
+
+The immediate bottleneck is fidelity and physical interaction, not the number
+of denoising steps. The next training iteration should keep this exact split and
+evaluation protocol while changing only the trajectory model:
+
+1. Add deterministic object-centric supervision for the blue pusher and T block,
+   with substantially higher weight on the small pusher.
+2. Add an auxiliary pusher/block coordinate or mask prediction objective so the
+   model cannot reduce global latent loss by dropping the manipulator.
+3. Increase temporal resolution or predict a state/action-consistency signal;
+   even real 17-waypoint replay reaches only 67.9% of conditioned endpoints.
+4. Accept multimodality only after at least two strict-valid or physically
+   goal-reaching modes appear for more than one held-out endpoint condition.
+5. Then run the real-memory versus VGM-memory Progress ablation above.
+
+One-, four-, or ten-step sampling of this undistilled checkpoint is not a route
+to better multimodality. It mainly reduces rendering validity. The formal maximum
+remains 50 denoising steps.
