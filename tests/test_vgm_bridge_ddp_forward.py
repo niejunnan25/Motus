@@ -10,7 +10,12 @@ from torch.utils.data import RandomSampler
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from train import train_vgm_bridge_stage1
-from train.train_vgm_bridge_stage1 import VGMBridgeStage1Trainer, create_train_dataloader
+from train.train_vgm_bridge_stage1 import (
+    VGMBridgeStage1Trainer,
+    create_train_dataloader,
+    restore_scheduler_state,
+    save_scheduler_state,
+)
 
 
 class _InnerModel(torch.nn.Module):
@@ -64,6 +69,12 @@ class _CountingScheduler:
 
     def step(self) -> None:
         self.step_count += 1
+
+    def state_dict(self) -> dict[str, int]:
+        return {"step_count": self.step_count}
+
+    def load_state_dict(self, state: dict[str, int]) -> None:
+        self.step_count = int(state["step_count"])
 
 
 def test_trainer_forward_uses_distributed_wrapper(tmp_path: Path) -> None:
@@ -120,6 +131,24 @@ def test_scheduler_steps_only_on_synchronized_optimizer_updates(tmp_path: Path) 
     accelerator.sync_gradients = True
     trainer.train_step(batch)
     assert scheduler.step_count == 1
+
+
+def test_scheduler_sidecar_round_trip_and_legacy_reconstruction(tmp_path: Path) -> None:
+    checkpoint_dir = tmp_path / "checkpoint_step_7"
+    scheduler = _CountingScheduler()
+    for _ in range(7):
+        scheduler.step()
+
+    state_path = save_scheduler_state(scheduler, checkpoint_dir, global_step=7)
+    assert state_path is not None and state_path.exists()
+
+    restored = _CountingScheduler()
+    assert restore_scheduler_state(restored, checkpoint_dir, global_step=7) == "sidecar"
+    assert restored.step_count == 7
+
+    legacy = _CountingScheduler()
+    assert restore_scheduler_state(legacy, tmp_path / "checkpoint_step_5", global_step=5) == "reconstructed"
+    assert legacy.step_count == 5
 
 
 class _Dataset(torch.utils.data.Dataset):

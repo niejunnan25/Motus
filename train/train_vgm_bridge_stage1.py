@@ -38,6 +38,64 @@ from utils.scheduler import create_scheduler
 
 
 logger = logging.getLogger(__name__)
+SCHEDULER_STATE_FILENAME = "scheduler_state.pt"
+
+
+def save_scheduler_state(scheduler: Any, checkpoint_dir: Path, global_step: int) -> Optional[Path]:
+    """Persist custom scheduler state that Accelerator does not register."""
+    if scheduler is None:
+        return None
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    state_path = checkpoint_dir / SCHEDULER_STATE_FILENAME
+    optimizer = getattr(scheduler, "optimizer", None)
+    optimizer_lrs = None
+    if optimizer is not None:
+        optimizer_lrs = [float(group["lr"]) for group in optimizer.param_groups]
+    torch.save(
+        {
+            "global_step": int(global_step),
+            "scheduler": scheduler.state_dict(),
+            "optimizer_lrs": optimizer_lrs,
+        },
+        state_path,
+    )
+    return state_path
+
+
+def restore_scheduler_state(scheduler: Any, checkpoint_dir: Path, global_step: int) -> str:
+    """Restore a scheduler sidecar or deterministically reconstruct legacy state."""
+    if scheduler is None:
+        return "disabled"
+
+    state_path = checkpoint_dir / SCHEDULER_STATE_FILENAME
+    if state_path.exists():
+        payload = torch.load(state_path, map_location="cpu", weights_only=False)
+        saved_step = int(payload["global_step"])
+        if saved_step != int(global_step):
+            raise RuntimeError(
+                f"Scheduler checkpoint step mismatch: file={saved_step}, expected={global_step}"
+            )
+        scheduler.load_state_dict(payload["scheduler"])
+        optimizer_lrs = payload.get("optimizer_lrs")
+        optimizer = getattr(scheduler, "optimizer", None)
+        if optimizer_lrs is not None and optimizer is not None:
+            if len(optimizer_lrs) != len(optimizer.param_groups):
+                raise RuntimeError(
+                    "Scheduler optimizer group mismatch: "
+                    f"file={len(optimizer_lrs)}, current={len(optimizer.param_groups)}"
+                )
+            for group, learning_rate in zip(optimizer.param_groups, optimizer_lrs):
+                group["lr"] = float(learning_rate)
+        return "sidecar"
+
+    if global_step <= 0:
+        return "initial"
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        for _ in range(int(global_step)):
+            scheduler.step()
+    return "reconstructed"
 
 
 def setup_logging(rank: int = 0, log_level: str = "INFO") -> None:
@@ -189,9 +247,12 @@ class VGMBridgeStage1Trainer:
             )
 
         if self.rank == 0:
+            save_scheduler_state(self.scheduler, checkpoint_dir, self.global_step)
             if self.config is not None:
                 OmegaConf.save(self.config, checkpoint_dir / "config.yaml", resolve=True)
             logger.info("Checkpoint saved to %s", checkpoint_dir)
+        if self.accelerator is not None:
+            self.accelerator.wait_for_everyone()
 
     def load_checkpoint(self, checkpoint_path: str) -> None:
         """Load an accelerator checkpoint and recover global step from its name."""
@@ -206,6 +267,18 @@ class VGMBridgeStage1Trainer:
 
         if self.accelerator is not None:
             self.accelerator.load_state(checkpoint_path)
+            scheduler_source = restore_scheduler_state(
+                self.scheduler,
+                Path(checkpoint_path),
+                self.global_step,
+            )
+            if scheduler_source == "reconstructed":
+                logger.warning(
+                    "Scheduler sidecar missing; reconstructed scheduler at step %s",
+                    self.global_step,
+                )
+            elif scheduler_source == "sidecar":
+                logger.info("Scheduler state restored from %s", SCHEDULER_STATE_FILENAME)
         else:
             state = torch.load(checkpoint_path, map_location=self.device)
             self.model.load_state_dict(state["model"])
